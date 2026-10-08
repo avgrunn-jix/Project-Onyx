@@ -1,80 +1,81 @@
-﻿# Project Onyx: Machine Learning for Exoplanet Detection
+﻿# Project Onyx: Explainable Exoplanet Detection Pipeline
 
-## Abstract
-Project Onyx is a fully automated pipeline for detecting exoplanet candidates from photometric light curves obtained by the Kepler and TESS missions. We combine classical signal processing (Box-Least Squares periodograms) with modern machine learning techniques (XGBoost, RandomForest) to identify planetary transits and distinguish them from false positives (e.g., eclipsing binaries, stellar variability, and instrumental noise). On our evaluation dataset, the XGBoost model achieved robust performance (ROC-AUC > 0.95), successfully separating planetary candidates from various astrophysical and instrumental artifacts.
+Project Onyx is a modular, transparent, and explainable machine learning pipeline designed for the detection of exoplanet candidates from Kepler and TESS photometric light curves. 
 
-## Scientific Motivation
-The transit method is the most successful technique for discovering exoplanets, identifying planets by the characteristic dip in stellar brightness when a planet passes in front of its host star. However, parsing massive datasets like those from Kepler and TESS is challenging due to the abundance of false positives. Eclipsing binaries, background eclipsing systems, and instrumental anomalies can mimic planetary transits. This project aims to automate the vetting process by extracting physically meaningful features from light curves and applying supervised and unsupervised machine learning.
+Unlike black-box deep learning systems, Onyx focuses on **honest evaluation, feature explainability (SHAP), and robust anomaly detection**. It implements rigorous data leakage prevention, confidence-based abstention, and handles multi-planet systems.
 
-## Data
-The pipeline leverages raw FITS files from the Kepler and TESS missions, retrieved dynamically via the MAST archive using the lightkurve package. The labels (CONFIRMED, CANDIDATE, FALSE POSITIVE) are sourced from the NASA Exoplanet Archive (e.g., the cumulative KOI table for Kepler). We frame the problem as binary classification: CANDIDATE and CONFIRMED form the positive class, while FALSE POSITIVE forms the negative class.
+## Key Features & Extensions (v2)
 
-## Methodology
-1. **Preprocessing & Detrending**: Light curves are normalized, stitched, and cleared of NaNs/outliers. Long-term stellar variability and instrumental drifts are removed using a Savitzky-Golay filter (flattening).
-2. **Transit Search (BLS)**: We employ the Box-Least Squares (BLS) periodogram to detect periodic box-like signals.
-3. **Feature Engineering**: For each light curve, we extract 30 features, including:
-   - BLS statistics (period, duration, depth, Signal-to-Noise Ratio, Signal Detection Efficiency).
-   - Harmonic power ratio and Lomb-Scargle peak power.
-   - Folded phase metrics (odd/even transit depth differences to rule out eclipsing binaries, secondary eclipse depths).
-   - Statistical properties of the flux (scatter, skewness, kurtosis, CDPP).
-   - Stellar parameters (Teff, Radius, log(g)).
-4. **Clustering**: Gaussian Mixture Models (GMM) and K-Means group the signals without labels. The number of clusters is chosen via the Bayesian Information Criterion (BIC).
-5. **Dimensionality Reduction**: UMAP and PCA project the 30-dimensional feature space into 2D to visually inspect the separation of candidates and false positives.
-6. **Classification**: We train a Random Forest and an XGBoost classifier. To prevent data leakage, we use StratifiedGroupKFold grouped by 	arget_id. Hyperparameters are optimized via randomized search, and probability estimates are calibrated using Isotonic Regression.
+### 1. Robust Data Processing & Storage Efficiency
+* **Local Caching & Disk Saving:** Downloading Kepler short/long cadence data generates massive amounts of FITS files. Onyx downloads each star into isolated temporary directories and automatically removes them after feature extraction.
+* **Cadence-agnostic Flattening:** The detrending window length is defined in physical days (--flatten-days=3.0), rather than data points, ensuring transferability between Kepler (29.4 min) and TESS (2 min) cadence.
 
-## Results
-Our final model demonstrates excellent separability of transit candidates from false positives. The calibration curves and confusion matrix validate the reliability of the predicted probabilities.
-- Evaluation metrics (Accuracy, Precision, Recall, ROC-AUC, PR-AUC) can be found in outputs/metrics.json after a successful run.
-- Key feature importance confirms that BLS Depth SNR, Signal Detection Efficiency, and odd-even transit differences are primary drivers of classification.
+### 2. Multi-Signal Iterative Search
+Instead of finding only the strongest transit, Onyx iteratively masks out detected transits and re-runs the Box Least Squares (BLS) periodogram up to 4 times per star. 
+* Found signals are matched against the KOI/TOI catalogs. Matches are classified as MATCHED, HARMONIC (period ratio 0.5 or 2.0), or UNMATCHED. 
+* **Note:** UNMATCHED signals are NOT treated as false positives. They are excluded from supervised training to prevent contamination but are evaluated in the prediction and anomaly detection phases.
 
-Visualizations of the UMAP/PCA clusters, confusion matrix, ROC/PR curves, and feature importances are automatically saved to outputs/figures/.
+### 3. False Positive Classification (The "Why")
+When Onyx rejects a candidate, it predicts the *likely reason* using a multi-label One-Vs-Rest XGBoost classifier trained on known FP flags (
+t, ss, co, ec).
+* **Honest Disclaimer on Centroid Offset (co):** Centroid offset requires pixel-level positional data (which star moved during transit). Because Onyx relies solely on 1D light curve flux features, the prediction of co is inherently limited and performs close to random guessing. This limitation is intentional to highlight the boundary of pure photometric analysis.
 
-## Limitations and Threats to Validity
-- **Catalog Bias**: The NASA Exoplanet Archive labels are constantly evolving. Some "False Positives" may be reclassified, and vice versa.
-- **Class Imbalance**: True exoplanets are vastly outnumbered by instrumental noise and eclipsing binaries. We address this using class weights and scale_pos_weight.
-- **BLS Constraints**: The BLS algorithm assumes a box-like transit, which may struggle with grazing transits or very long-period planets (where only 1-2 transits are observed).
+### 4. Explainability (SHAP)
+Onyx employs TreeExplainer (Lundberg & Lee, 2017) to provide local and global interpretability.
+* For every new prediction, Onyx outputs the **Top 3 contributing factors** (e.g., secondary_depth_ppm=450 (negative) meaning a deep secondary eclipse strongly pushed the model to reject the candidate).
 
-## Installation and Execution
-Project Onyx is designed to run on Windows PowerShell with Python 3.10+.
+### 5. Confidence and Abstention (Right to Refuse)
+Onyx uses an ensemble of 20 XGBoost models trained on grouped bootstraps. It calculates p_mean and p_std. 
+* If a signal falls into an ambiguous zone, the pipeline flags it as REVIEW instead of forcing a binary choice. Thresholds are automatically tuned on a validation set to ensure >95% precision for confident CANDIDATE and FALSE_POSITIVE calls.
 
-1. Clone this repository:
-   `powershell
-   git clone https://github.com/<your_username>/Project-Onyx.git
-   cd "Project Onyx"
-   `
-2. Create and activate a virtual environment:
-   `powershell
-   python -m venv venv
-   .\venv\Scripts\Activate.ps1
-   `
-3. Install dependencies:
-   `powershell
-   pip install -r requirements.txt
-   `
-4. Run the full pipeline (data extraction + ML):
-   `powershell
-   python main.py --mission Kepler --limit 500 --workers 4
-   `
-   *Note: You can run the modules separately if needed: python 1_data_extractor.py ... followed by python 2_ml_pipeline.py.*
+### 6. Synthetic Transit Injections (Completeness Test)
+To evaluate the true sensitivity of the pipeline, Onyx includes an --inject mode. It takes "quiet" stars and mathematically injects trapezoidal transits varying in radius and period.
+* **Disclaimer:** Injections are idealized (no limb darkening, circular orbits, no transit starspots). Therefore, the resulting completeness heatmap (outputs/figures/injection_heatmap.png) represents an *upper bound* of the pipeline's true sensitivity.
 
-## Repository Structure
-- main.py: Orchestrator script.
-- 1_data_extractor.py: Downloads light curves, applies BLS, and extracts features.
-- 2_ml_pipeline.py: Trains clustering and classification models, outputs plots and metrics.
-- outputs/: Contains trained models (.joblib), metrics, and figures.
-- data/: Raw FITS files and NASA labels (ignored in version control to save space).
+### 7. Mission Transferability (Kepler → TESS)
+We tested the model's ability to generalize across missions:
+* **T1:** Direct transfer (All features).
+* **T2:** Robust transfer (Removing aseline_d, 	ransit_count, gap_fraction, which are heavily mission-biased).
+* **T3:** In-domain cross-validation on TESS.
+Onyx computes the Kolmogorov-Smirnov (K-S) shift for each feature (outputs/figures/ks_shift_by_feature.png) to identify covariate shift.
 
-## Reproducibility
-- All random processes use RANDOM_STATE = 42.
-- Data is fetched dynamically from NASA/MAST; no raw data is stored in the repository.
-- Package versions are strictly locked in equirements.txt.
+### 8. Unsupervised Anomaly Detection
+Using Isolation Forest (Liu, Ting & Zhou, 2008) and Local Outlier Factor, Onyx scans all signals (including UNMATCHED and HARMONIC) for weird behavior, filtering out confident known classes. 
+* **Disclaimer:** An anomaly in feature space is NOT equivalent to a physical discovery. In >90% of cases, anomalies are instrumental artifacts, extreme eclipsing binaries, or variable stars.
+
+## Pipeline Modes
+
+Onyx operates in several distinct modes via main.py --mode <MODE>:
+
+1. 	rain (Default): Extracts features, matches catalogs, trains models, outputs metrics and SHAP plots.
+   * python main.py --mode train --mission Kepler --limit 300
+2. predict: Runs extraction on unlabelled target IDs and uses the saved model to classify them.
+   * python main.py --mode predict --targets-file my_targets.txt
+3. score-file: Skips extraction and directly predicts on an existing CSV.
+   * python main.py --mode score-file --input-file custom.csv
+4. etrain: Retrains the model from scratch on combined data.
+5. inject: Runs the synthetic injection pipeline.
+   * python main.py --mode inject --injection-stars 50
+
+## Output Artifacts
+
+| File / Folder | Description |
+|---|---|
+| extracted_features.csv | Main feature matrix. Excluded from Git. |
+| outputs/models/ | Serialized pipeline_model.joblib. |
+| outputs/figures/ | All plots: ROC, SHAP, Coverage, Transfer KS, Heatmap, Anomalies. |
+| outputs/predictions.csv | Test set predictions with SHAP top factors. |
+| outputs/new_candidates.csv | Results from predict mode. |
+| outputs/folded_curves.npz | Compressed arrays of phase-folded curves (201 bins) for all signals. |
+| outputs/metrics.json | Final performance metrics. |
+
+## Limitations & Threats to Validity
+* **No Pixel-Level Data:** Lack of centroid tracking makes background eclipsing binaries (BEB) blending harder to detect.
+* **Trapezoidal Injections:** The injection module ignores stellar limb darkening, leading to slight overestimation of completeness.
+* **Hardware Constraints:** The requency_factor in BLS is capped to avoid OutOfMemory errors, which might slightly reduce period precision for very long Kepler baselines.
 
 ## References
-- Kovács, G., Zucker, S., & Mazeh, T. (2002). A box-fitting algorithm in the search for periodic transits. *Astronomy & Astrophysics*, 391(1), 369-377.
-- Lightkurve Collaboration (2018). Lightkurve: Kepler and TESS time series analysis in Python.
-- McInnes, L., Healy, J., & Melville, J. (2018). UMAP: Uniform Manifold Approximation and Projection for Dimension Reduction. *arXiv e-prints*.
-- Chen, T., & Guestrin, C. (2016). XGBoost: A scalable tree boosting system. *KDD*.
-- Thompson, S. E., et al. (2018). Planetary Candidates Observed by Kepler. VIII. A Fully Automated Catalog. *The Astrophysical Journal Supplement Series*, 235(2), 38.
-
-## License
-This project is licensed under the MIT License - see the LICENSE file for details.
+1. Shallue, C. J., & Vanderburg, A. (2018). Identifying Exoplanets with Deep Learning: A Five-planet Resonant Chain around Kepler-80 and an Eighth Planet around Kepler-90. *The Astronomical Journal*, 155(2), 94.
+2. Valizadegan, H., et al. (2022). ExoMiner: A Highly Accurate and Explainable Deep Learning Classifier that Validates 301 New Exoplanets. *The Astrophysical Journal*, 926(2), 120.
+3. Lundberg, S. M., & Lee, Su-In (2017). A Unified Approach to Interpreting Model Predictions. *NeurIPS*.
+4. Liu, F. T., Ting, K. M., & Zhou, Z.-H. (2008). Isolation Forest. *2008 Eighth IEEE International Conference on Data Mining*.

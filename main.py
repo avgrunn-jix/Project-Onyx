@@ -1,61 +1,76 @@
 import argparse
-import logging
-import os
 import subprocess
 import sys
-import json
-
-def setup_logger():
-    log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-    file_handler = logging.FileHandler('logs/main.log')
-    file_handler.setFormatter(log_formatter)
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(log_formatter)
-    logger = logging.getLogger('main')
-    logger.setLevel(logging.INFO)
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    return logger
+import logging
+import os
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mission', default='Kepler', choices=['Kepler', 'TESS'])
     parser.add_argument('--limit', type=int, default=500)
     parser.add_argument('--workers', type=int, default=1)
+    parser.add_argument('--keep-raw', action='store_true')
+    parser.add_argument('--min-free-gb', type=float, default=5.0)
+    parser.add_argument('--purge-lk-cache', action='store_true')
+    parser.add_argument('--flatten-days', type=float, default=3.0)
+    parser.add_argument('--max-signals', type=int, default=4)
+    parser.add_argument('--mode', default='train', choices=['train', 'predict', 'score-file', 'retrain', 'inject', 'transfer'])
+    parser.add_argument('--targets-file', default='')
+    parser.add_argument('--input-file', default='')
+    parser.add_argument('--injection-stars', type=int, default=100)
+    parser.add_argument('--injections-per-star', type=int, default=12)
+    parser.add_argument('--max-sectors', type=int, default=4)
     args = parser.parse_args()
-    logger = setup_logger()
-    logger.info('Starting Project Onyx pipeline')
-    cmd1 = [
-        sys.executable, '1_data_extractor.py',
-        '--mission', args.mission,
-        '--limit', str(args.limit),
-        '--workers', str(args.workers)
-    ]
-    logger.info('Running extractor')
-    res1 = subprocess.run(cmd1, check=False)
-    if res1.returncode != 0:
-        logger.error('Extractor failed with code ' + str(res1.returncode))
-        sys.exit(1)
-    if not os.path.exists('extracted_features.csv') or os.path.getsize('extracted_features.csv') == 0:
-        logger.error('No features extracted. Exiting.')
-        sys.exit(1)
-    logger.info('Extractor finished. Running ML pipeline.')
-    cmd2 = [sys.executable, '2_ml_pipeline.py', '--input', 'extracted_features.csv']
-    res2 = subprocess.run(cmd2, check=False)
-    if res2.returncode != 0:
-        logger.error('ML pipeline failed with code ' + str(res2.returncode))
-        sys.exit(1)
-    if os.path.exists('outputs/metrics.json'):
-        with open('outputs/metrics.json', 'r') as f:
-            metrics = json.load(f)
-        logger.info('Pipeline finished successfully. Metrics:')
-        for k, v in metrics.items():
-            logger.info(k + ': ' + str(round(v, 4)))
-    else:
-        logger.warning('Pipeline finished but no metrics.json found.')
-    with open('extracted_features.csv', 'r') as f:
-        count = sum(1 for _ in f) - 1
-    logger.info('Total stars processed and saved: ' + str(count))
+
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    logging.info(f'Starting Project Onyx pipeline in {args.mode} mode')
+
+    if args.mode == 'train' or args.mode == 'retrain':
+        out_csv = 'extracted_features.csv'
+        cmd1 = [sys.executable, '1_data_extractor.py', '--mission', args.mission, '--limit', str(args.limit), '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv]
+        if args.keep_raw: cmd1.append('--keep-raw')
+        if args.purge_lk_cache: cmd1.append('--purge-lk-cache')
+        logging.info('Running extractor')
+        ret1 = subprocess.run(cmd1)
+        if ret1.returncode != 0:
+            logging.error('Extractor failed with code ' + str(ret1.returncode))
+            sys.exit(ret1.returncode)
+        logging.info('Extractor finished. Running ML pipeline.')
+        cmd2 = [sys.executable, '2_ml_pipeline.py', '--mode', args.mode, '--input', out_csv]
+        ret2 = subprocess.run(cmd2)
+        if ret2.returncode != 0:
+            logging.error('ML pipeline failed with code ' + str(ret2.returncode))
+            sys.exit(ret2.returncode)
+
+    elif args.mode == 'predict':
+        if not args.targets_file:
+            logging.error('--targets-file required for predict mode')
+            sys.exit(1)
+        out_csv = 'outputs/predict_features.csv'
+        cmd1 = [sys.executable, '1_data_extractor.py', '--mission', args.mission, '--targets-file', args.targets_file, '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv]
+        if args.keep_raw: cmd1.append('--keep-raw')
+        logging.info('Running extractor for prediction targets')
+        ret1 = subprocess.run(cmd1)
+        if ret1.returncode != 0:
+            sys.exit(ret1.returncode)
+        logging.info('Running ML prediction')
+        cmd2 = [sys.executable, '2_ml_pipeline.py', '--mode', 'predict', '--input', out_csv]
+        subprocess.run(cmd2)
+
+    elif args.mode == 'score-file':
+        if not args.input_file:
+            logging.error('--input-file required for score-file mode')
+            sys.exit(1)
+        cmd2 = [sys.executable, '2_ml_pipeline.py', '--mode', 'score-file', '--input', args.input_file]
+        subprocess.run(cmd2)
+
+    elif args.mode == 'inject':
+        cmd1 = [sys.executable, '1_data_extractor.py', '--mission', args.mission, '--inject', '--injection-stars', str(args.injection_stars), '--injections-per-star', str(args.injections_per_star), '--workers', str(args.workers)]
+        logging.info('Running injection tests')
+        subprocess.run(cmd1)
+
+    elif args.mode == 'transfer':
+        pass
 
 if __name__ == '__main__':
     main()
