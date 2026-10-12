@@ -72,6 +72,14 @@ def run_ml(args, logger, is_retrain=False):
     X_raw = df_matched[feature_cols].values
     y = df_matched['target_bin'].values
     groups = df_matched['target_id'].values
+    unique_groups = np.unique(groups)
+    unique_classes = np.unique(y)
+    class_counts = {int(k): int(v) for k, v in pd.Series(y).value_counts().items()}
+    if len(df_matched) < 10 or len(unique_groups) < 5 or len(unique_classes) < 2 or min(class_counts.values()) < 2:
+        msg = f"Insufficient data for training: found {len(df_matched)} matched signals across {len(unique_groups)} stars with class distribution {class_counts}. StratifiedGroupKFold requires at least 5 stars and 2 examples per class. Run extraction on more targets or check your labels."
+        logger.error(msg)
+        print(f"ERROR: {msg}", flush=True)
+        return
     cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
     train_idx, test_idx = next(cv.split(X_raw, y, groups))
     X_train_raw, X_test_raw = X_raw[train_idx], X_raw[test_idx]
@@ -361,6 +369,12 @@ def predict_mode(args, logger):
     thresholds = model_dict['thresholds']
     explainer = model_dict.get('explainer', None)
     df = pd.read_csv(args.input)
+    missing_cols = [c for c in feature_cols if c not in df.columns]
+    if missing_cols:
+        msg = f"Input file {args.input} is missing {len(missing_cols)} feature columns required by trained model: {', '.join(missing_cols)}. Please re-extract features with the matching pipeline schema."
+        logger.error(msg)
+        print(f"ERROR: {msg}", flush=True)
+        return
     X = df[feature_cols].values
     X_scaled = scale_pipe.transform(X)
     preds = np.array([m.predict_proba(X_scaled)[:, 1] for m in ensemble_models])

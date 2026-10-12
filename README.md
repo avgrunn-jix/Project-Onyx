@@ -16,9 +16,10 @@ Instead of finding only the strongest transit, Onyx iteratively masks out detect
 * Found signals are matched against the KOI/TOI catalogs. Matches are classified as `MATCHED`, `HARMONIC` (period ratio 0.5 or 2.0), or `UNMATCHED`. 
 * **Note:** `UNMATCHED` signals are NOT treated as false positives. They are excluded from supervised training to prevent contamination but are evaluated in the prediction and anomaly detection phases.
 
-### 3. False Positive Classification (The "Why")
-When Onyx rejects a candidate, it predicts the *likely reason* using a multi-label One-Vs-Rest XGBoost classifier trained on known FP flags (`nt`, `ss`, `co`, `ec`).
-* **Honest Disclaimer on Centroid Offset (`co`):** Centroid offset requires pixel-level positional data (which star moved during transit). Because Onyx relies solely on 1D light curve flux features, the prediction of `co` is inherently limited and performs close to random guessing. This limitation is intentional to highlight the boundary of pure photometric analysis.
+### 3. Centroid Shift & False Positive Diagnostics
+Onyx computes in-transit versus out-of-transit centroid shifts from light curve positional data (`centroid_col`, `centroid_row`) detrended per observation segment.
+* Measures include `centroid_shift_col_sigma`, `centroid_shift_row_sigma`, `centroid_shift_total_sigma`, and physical displacement `centroid_shift_total_arcsec` (calibrated with Kepler ~3.98"/pixel and TESS ~21"/pixel scales).
+* When rejecting a candidate, Onyx predicts the *likely reason* using a multi-label One-Vs-Rest XGBoost classifier trained on known FP flags (`nt`, `ss`, `co`, `ec`).
 
 ### 4. Explainability (SHAP)
 Onyx employs `TreeExplainer` (Lundberg & Lee, 2017) to provide local and global interpretability.
@@ -52,19 +53,31 @@ Onyx operates in several distinct modes via `main.py --mode <MODE>`:
 
 1. `train` (Default): Extracts features, matches catalogs, trains models, outputs metrics and SHAP plots.
    * `python main.py --mode train --mission Kepler --limit 300`
-2. `predict`: Runs extraction on unlabelled target IDs and uses the saved model to classify them.
+2. `extract`: Runs standalone feature extraction without launching model training (useful for preparing dataset files or testing).
+   * `python main.py --mode extract --mission Kepler --limit 100 --output outputs/kepler_features.csv`
+   * `python main.py --mode extract --mission TESS --limit 50 --output outputs/tess_features.csv`
+3. `predict`: Runs extraction on unlabelled target IDs and uses the saved model to classify them.
    * `python main.py --mode predict --targets-file my_targets.txt --output outputs/my_predictions.csv`
    * Default output: `outputs/new_candidates.csv`
-3. `score-file`: Skips extraction and directly predicts on an existing CSV feature file.
+4. `score-file`: Skips extraction and directly predicts on an existing CSV feature file.
    * `python main.py --mode score-file --input-file custom_features.csv --output outputs/scored_file.csv`
    * Default output: `outputs/scored_file.csv`
-4. `retrain`: Retrains the model from scratch on combined data.
+5. `retrain`: Retrains the model from scratch on combined data.
    * `python main.py --mode retrain --mission Kepler --limit 50`
-5. `inject`: Runs the synthetic injection pipeline.
+6. `inject`: Runs the synthetic injection pipeline.
    * `python main.py --mode inject --injection-stars 100 --injections-per-star 12 --targets-file quiet_targets.txt`
    * Add `--quick` for rapid coarse-grid check (saves to `outputs/injection_results_quick.csv`).
-6. `transfer`: Runs Kepler to TESS domain shift experiments (T1, T2, T3).
+7. `transfer`: Runs Kepler to TESS domain shift experiments (T1, T2, T3).
    * `python main.py --mode transfer --train-csv extracted_features.csv --test-csv outputs/tess_features.csv`
+
+## Производительность (Performance)
+
+* **Реальные измерения времени обработки:**
+  * **Локальный ПК / ноутбук (1 ядро CPU, Kepler, стандартная сетка):** около 385 секунд (~6,4 минуты) на одну звезду при обработке полной 4-летней кривой (17 кварталов, ~65 000 точек).
+  * **Google Colab (бесплатный тариф, Linux, 2 vCPU):** около 17,5 минут на одну звезду. Замедление обусловлено сетевой задержкой и троттлингом пакетных запросов к MAST API, а также однопоточными вычислениями BLS на виртуализованных ядрах.
+  * **Быстрый режим (`--quick`):** около 1,5–2,5 минут на звезду за счёт огрубления шага BLS (`frequency_factor=5000`, 4 сетки длительностей).
+* **Оговорка:** Данные замеры являются ориентировочными и не представляют собой строгих гарантий: фактическое время зависит от пропускной способности сети до MAST, загруженности серверов архива и производительности процессора.
+* **Режим `--mode extract`:** Позволяет отделить этап длительного извлечения признаков от машинного обучения. Например, можно сначала извлечь признаки в фоновом режиме в файл `outputs/tess_features.csv`, а затем отдельно обучать или тестировать модели.
 
 ## Output Artifacts
 
@@ -72,16 +85,17 @@ Onyx operates in several distinct modes via `main.py --mode <MODE>`:
 |---|---|
 | `extracted_features.csv` | Main feature matrix. Excluded from Git. |
 | `outputs/models/` | Serialized `pipeline_model.joblib`. |
-| `outputs/figures/` | All plots: ROC, SHAP, Coverage, Transfer KS, Heatmap, Anomalies. |
+| `outputs/figures/` | All plots: ROC, SHAP, Coverage, Transfer KS, Heatmap, Anomalies. Excluded from Git. |
 | `outputs/predictions.csv` | Test set predictions with SHAP top factors. |
 | `outputs/new_candidates.csv` | Default output from `predict` mode. |
 | `outputs/scored_file.csv` | Default output from `score-file` mode. |
 | `outputs/injection_results.csv` | Transit injection completeness table (or `_quick.csv`). |
-| `outputs/folded_curves.npz` | Compressed arrays of phase-folded curves (201 bins) for all signals. |
+| `outputs/folded_curves.npz` | Compressed arrays of phase-folded curves (201 bins) for all signals. Excluded from Git. |
 | `outputs/metrics.json` | Final performance metrics. |
 
 ## Limitations & Threats to Validity
-* **No Pixel-Level Data:** Lack of centroid tracking makes background eclipsing binaries (BEB) blending harder to detect.
+* **Coarse Centroid Shift vs Pixel-Level PRF:** Onyx вычисляет смещение центроида во время транзита по столбцам координат центра пятна (`centroid_col`, `centroid_row`), выровненным по каждому кварталу/сектору отдельно и переведённым в угловые секунды (Kepler ~3.98", TESS ~21.0"). Это позволяет отсекать грубые фоновые затменные двойные (BEB), однако не заменяет полноценную пиксельную диагностику PRF (Pixel Response Function) по файлам TPF. Для слабых звёзд и мелких транзитов фотометрический центроид является зашумлённым.
+* **Несовместимость схем при обновлении признаков:** При изменении набора признаков (например, добавлении колонок центроида) старые CSV-файлы (`extracted_features.csv`) и сохранённые модели (`pipeline_model.joblib`) становятся несовместимыми. В экстрактор встроен контроль схемы заголовка: при несоответствии колонок выдаётся предупреждение о необходимости запуска с `--no-resume` или указания нового файла `--output`.
 * **Trapezoidal Injections:** The injection module ignores stellar limb darkening, leading to slight overestimation of completeness.
 * **BLS Resolution vs Speed:** To avoid memory exhaustion and multi-hour processing per star on long 4-year baselines, frequency factor is bounded. Full evaluation requires adequate CPU core allocation.
 
@@ -97,19 +111,28 @@ drive.mount('/content/drive')
 
 ### 2. Клонирование и установка зависимостей
 ```bash
-!git clone https://github.com/<username>/Project-Onyx.git
+!git clone https://github.com/avgrunn-jix/Project-Onyx.git
 %cd Project-Onyx
 !pip install -r requirements.txt
 ```
 
 ### 3. Запуск экстрактора с сохранением на Google Drive
 ```bash
-!python main.py --mode train --mission Kepler --workers 2 \
+!python main.py --mode extract --mission Kepler --workers 2 \
   --output /content/drive/MyDrive/onyx/extracted_features.csv \
   --cache-dir /tmp/fits_cache
 ```
 
-### 4. Поведение при обрыве сессии (Возобновление)
+### 4. Автономный запуск обучения по готовому CSV
+Если файл с признаками уже готов или сохранён на Google Drive, машинное обучение можно запустить отдельно без обращения к MAST и без повторной экстракции:
+```bash
+!python 2_ml_pipeline.py --mode train --input /content/drive/MyDrive/onyx/extracted_features.csv
+```
+
+> [!IMPORTANT]
+> При запуске в Google Colab папки `outputs/` и `logs/` хранятся во временной файловой системе сессии и безвозвратно удаляются при её перезапуске. Обязательно передавайте путь на Google Drive в аргумент `--output` или сохраняйте результаты (`!cp -r outputs logs /content/drive/MyDrive/onyx/`).
+
+### 5. Поведение при обрыве сессии (Возобновление)
 Сессия Colab может завершиться в любой момент. В Project Onyx встроена отказоустойчивость:
 * **Автосохранение:** строки каждой обработанной звезды сбрасываются на диск (`flush` + `fsync`) сразу по завершении анализа звезды.
 * **Автовозобновление:** при повторном запуске той же команды скрипт считывает список уже готовых звёзд из `--output` и обрабатывает только оставшиеся.

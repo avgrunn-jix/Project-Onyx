@@ -15,7 +15,7 @@ def main():
     parser.add_argument('--purge-lk-cache', action='store_true')
     parser.add_argument('--flatten-days', type=float, default=3.0)
     parser.add_argument('--max-signals', type=int, default=4)
-    parser.add_argument('--mode', default='train', choices=['train', 'predict', 'score-file', 'retrain', 'inject', 'transfer'])
+    parser.add_argument('--mode', default='train', choices=['train', 'predict', 'score-file', 'retrain', 'inject', 'transfer', 'extract'])
     parser.add_argument('--targets-file', default='')
     parser.add_argument('--input-file', default='')
     parser.add_argument('--output', default='')
@@ -30,6 +30,18 @@ def main():
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
     args = parser.parse_args()
 
+    logical_cores = os.cpu_count() or 1
+    print(f"Detected CPU cores: {logical_cores} logical (physical core count requires external psutil; using os.cpu_count()). Default workers: {args.workers}.", flush=True)
+
+    os.makedirs('outputs', exist_ok=True)
+    os.makedirs(os.path.join('outputs', 'figures'), exist_ok=True)
+    os.makedirs(os.path.join('outputs', 'models'), exist_ok=True)
+    os.makedirs(os.path.join('outputs', 'explanations'), exist_ok=True)
+    os.makedirs('logs', exist_ok=True)
+    os.makedirs(args.cache_dir, exist_ok=True)
+    if args.output:
+        os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
+
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     logging.info(f'Starting Project Onyx pipeline in {args.mode} mode')
 
@@ -39,7 +51,8 @@ def main():
 
     if args.mode == 'train' or args.mode == 'retrain':
         out_csv = args.output if args.output else ('extracted_features_quick.csv' if args.quick else 'extracted_features.csv')
-        cmd1 = [sys.executable, extractor_script, '--mission', args.mission, '--limit', str(args.limit), '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv, '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir]
+        cmd1 = [sys.executable, extractor_script, '--mission', args.mission, '--limit', str(args.limit), '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv, '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--max-sectors', str(args.max_sectors)]
+        if args.targets_file: cmd1.extend(['--targets-file', args.targets_file])
         if args.keep_raw: cmd1.append('--keep-raw')
         if args.purge_lk_cache: cmd1.append('--purge-lk-cache')
         if args.quick: cmd1.append('--quick')
@@ -56,12 +69,27 @@ def main():
             logging.error('ML pipeline failed with code ' + str(ret2.returncode))
             sys.exit(ret2.returncode)
 
+    elif args.mode == 'extract':
+        out_csv = args.output if args.output else (os.path.join('outputs', 'tess_features.csv') if args.mission == 'TESS' else ('extracted_features_quick.csv' if args.quick else 'extracted_features.csv'))
+        cmd1 = [sys.executable, extractor_script, '--mission', args.mission, '--limit', str(args.limit), '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv, '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--max-sectors', str(args.max_sectors)]
+        if args.targets_file: cmd1.extend(['--targets-file', args.targets_file])
+        if args.keep_raw: cmd1.append('--keep-raw')
+        if args.purge_lk_cache: cmd1.append('--purge-lk-cache')
+        if args.quick: cmd1.append('--quick')
+        if args.no_resume: cmd1.append('--no-resume')
+        logging.info('Running extractor in extract-only mode')
+        ret1 = subprocess.run(cmd1)
+        if ret1.returncode != 0:
+            logging.error('Extractor failed with code ' + str(ret1.returncode))
+            sys.exit(ret1.returncode)
+        logging.info(f'Feature extraction completed. Output saved to {out_csv}')
+
     elif args.mode == 'predict':
         if not args.targets_file:
             logging.error('--targets-file required for predict mode')
             sys.exit(1)
         out_csv = os.path.join('outputs', 'predict_features.csv')
-        cmd1 = [sys.executable, extractor_script, '--mission', args.mission, '--targets-file', args.targets_file, '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv, '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir]
+        cmd1 = [sys.executable, extractor_script, '--mission', args.mission, '--targets-file', args.targets_file, '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv, '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--max-sectors', str(args.max_sectors)]
         if args.keep_raw: cmd1.append('--keep-raw')
         if args.quick: cmd1.append('--quick')
         if args.no_resume: cmd1.append('--no-resume')
@@ -83,7 +111,7 @@ def main():
         subprocess.run(cmd2)
 
     elif args.mode == 'inject':
-        cmd1 = [sys.executable, extractor_script, '--mission', args.mission, '--inject', '--injection-stars', str(args.injection_stars), '--injections-per-star', str(args.injections_per_star), '--workers', str(args.workers), '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir]
+        cmd1 = [sys.executable, extractor_script, '--mission', args.mission, '--inject', '--injection-stars', str(args.injection_stars), '--injections-per-star', str(args.injections_per_star), '--workers', str(args.workers), '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--max-sectors', str(args.max_sectors)]
         if args.targets_file: cmd1.extend(['--targets-file', args.targets_file])
         if args.output: cmd1.extend(['--injection-output', args.output])
         if args.quick: cmd1.append('--quick')

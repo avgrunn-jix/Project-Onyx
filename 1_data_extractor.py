@@ -7,9 +7,17 @@ import sys
 import tempfile
 import time
 import warnings
+
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 import numpy as np
 import pandas as pd
 import scipy.stats as st
+import astropy.units as u
 import lightkurve as lk
 from astroquery.ipac.nexsci.nasa_exoplanet_archive import NasaExoplanetArchive
 import concurrent.futures
@@ -114,7 +122,7 @@ def inject_transit(time, flux, period, epoch, rp_rs, duration):
         model[ing_mask] = 1.0 - depth * (dist / ingress)
     return flux * model
 
-def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, quick_mode=False, cache_dir=None, star_timeout=1800.0):
+def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0):
     free_bytes = shutil.disk_usage(os.path.abspath('.')).free
     if free_bytes < min_free_gb * 1024**3: return None, tid, 'Disk space below threshold'
     start_t = time.time()
@@ -124,16 +132,19 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
     os.makedirs(tmp_dir, exist_ok=True)
     try:
         author = 'Kepler' if mission == 'Kepler' else 'SPOC'
+        search_target = f"TIC {tid}" if mission == 'TESS' and not str(tid).startswith('TIC') else tid
         for attempt in range(3):
             if time.time() > deadline:
                 return None, tid, f'TimeoutError: Exceeded {star_timeout}s'
             try:
-                search_result = lk.search_lightcurve(tid, author=author, cadence='long')
+                search_result = lk.search_lightcurve(search_target, author=author, cadence='long')
                 break
             except Exception:
                 time.sleep(2 ** attempt)
         else: return None, tid, 'Download failed'
         if len(search_result) == 0: return None, tid, 'No lightcurves found'
+        if max_sectors > 0 and len(search_result) > max_sectors:
+            search_result = search_result[:max_sectors]
         if time.time() > deadline:
             return None, tid, f'TimeoutError: Exceeded {star_timeout}s'
         lc_col = search_result.download_all(download_dir=tmp_dir)
@@ -143,38 +154,35 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
         if len(lc) < 500: return None, tid, 'Not enough points'
         times = np.asarray(lc.time.value, dtype=float)
         flux_val = np.asarray(lc.flux.value, dtype=float)
-        baseline_d = float(np.nanmax(times) - np.nanmin(times))
-        star_radius = float(lc.meta.get('RADIUS', 1.0))
-        if np.isnan(star_radius): star_radius = 1.0
-        star_logg = float(lc.meta.get('LOGG', 4.438))
-        if np.isnan(star_logg): star_logg = 4.438
-        rho_star_sun = (star_radius**-3) * (10**(star_logg - 4.438)) * (star_radius**2) 
-        freq_factor = 5000 if quick_mode else 500
-        dur_grid = np.linspace(0.05, 0.40, 4) if quick_mode else np.linspace(0.04, 0.45, 10)
+        baseline = float(np.nanmax(times) - np.nanmin(times))
+        star_radius = float(lc.meta.get('RADIUS', 1.0)) if lc.meta.get('RADIUS') is not None and not np.isnan(lc.meta.get('RADIUS')) else 1.0
         results = []
         features = []
-        for i in range(injections_per_star):
+        freq_factor = 5000 if quick_mode else 500
+        dur_grid = np.linspace(0.05, 0.40, 4) if quick_mode else np.linspace(0.04, 0.45, 10)
+        for inj_idx in range(injections_per_star):
             if time.time() > deadline:
                 break
-            inj_period = np.exp(np.random.uniform(np.log(0.8), np.log(min(100.0, baseline_d/2.0))))
-            inj_rad_earth = np.exp(np.random.uniform(np.log(0.5), np.log(15.0)))
-            rp_rs = inj_rad_earth * 0.009168 / star_radius
-            b = np.random.uniform(0, 0.8)
-            duration = (13.0 / 24.0) * ((inj_period/365.0)**(1/3)) * (rho_star_sun**(-1/3)) * np.sqrt(1 - b**2)
-            epoch = np.nanmin(times) + np.random.uniform(0, inj_period)
+            inj_period = float(np.random.uniform(1.0, 30.0))
+            inj_rad_earth = float(np.random.uniform(0.8, 15.0))
+            rp_rs = (inj_rad_earth * 0.009168) / star_radius
+            duration = float(np.random.uniform(0.05, 0.3))
+            epoch = float(np.random.uniform(times[0], times[0] + inj_period))
+            b = float(np.random.uniform(0.0, 0.8))
             inj_flux = inject_transit(times, flux_val, inj_period, epoch, rp_rs, duration)
-            lc_inj = lc.copy()
-            lc_inj.flux = inj_flux * lc_inj.flux.unit
+            inj_lc = lk.LightCurve(time=lc.time, flux=inj_flux)
             med_diff = np.nanmedian(np.diff(times))
             wl = int(flatten_days / med_diff) if med_diff > 0 else 101
             if wl % 2 == 0: wl -= 1
             if wl < 3: wl = 3
-            if wl > len(lc_inj): wl = len(lc_inj) if len(lc_inj) % 2 != 0 else len(lc_inj) - 1
-            lc_flat = lc_inj.flatten(window_length=wl, polyorder=2, break_tolerance=5)
-            bls = lc_flat.to_periodogram(method='bls', minimum_period=0.5, maximum_period=min(100.0, baseline_d/2.0), frequency_factor=freq_factor, duration=dur_grid)
+            if wl > len(inj_lc): wl = len(inj_lc) if len(inj_lc) % 2 != 0 else len(inj_lc) - 1
+            inj_flat = inj_lc.flatten(window_length=wl, polyorder=2, break_tolerance=5)
+            bls = inj_flat.to_periodogram(method='bls', minimum_period=0.5, maximum_period=min(100.0, baseline/2.0), frequency_factor=freq_factor, duration=dur_grid)
+            if len(bls.power) == 0: continue
             rec_period = float(bls.period_at_max_power.value)
             rec_epoch = float(bls.transit_time_at_max_power.value)
-            sde = float((np.nanmax(bls.power.value) - np.nanmean(bls.power.value)) / np.nanstd(bls.power.value))
+            p_vals = np.array(bls.power.value)
+            sde = float((np.nanmax(p_vals) - np.nanmean(p_vals)) / np.nanstd(p_vals))
             snr = float(np.nanmax(bls.snr))
             recovered = 0
             alias_type = 'none'
@@ -196,7 +204,7 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
             results.append(res)
             if recovered:
                 rem_timeout = max(10.0, deadline - time.time())
-                feat, _, _, _, _ = process_single_star(tid, mission, [{'catalog_period': inj_period, 'label': 'INJECTED'}], True, 0, flatten_days, 1, quick_mode=quick_mode, cache_dir=cache_dir, star_timeout=rem_timeout)
+                feat, _, _, _, _, _ = process_single_star(tid, mission, [{'catalog_period': inj_period, 'label': 'INJECTED'}], True, 0, flatten_days, 1, quick_mode=quick_mode, cache_dir=cache_dir, star_timeout=rem_timeout, max_sectors=max_sectors)
                 if feat and len(feat) > 0:
                     features.append(feat[0])
         return results, features, tid, None
@@ -206,10 +214,10 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0):
+def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0):
     free_bytes = shutil.disk_usage(os.path.abspath('.')).free
     if free_bytes < min_free_gb * 1024**3:
-        return None, None, tid, 'Disk space below threshold', 0
+        return None, None, tid, 'Disk space below threshold', 0, None
     start_t = time.time()
     deadline = start_t + star_timeout
     base_cache = cache_dir if cache_dir else tempfile.gettempdir()
@@ -217,34 +225,72 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
     os.makedirs(tmp_dir, exist_ok=True)
     dl_size = 0
     try:
+        t_dl_start = time.time()
         author = 'Kepler' if mission == 'Kepler' else 'SPOC'
+        search_target = f"TIC {tid}" if mission == 'TESS' and not str(tid).startswith('TIC') else tid
         for attempt in range(3):
             if time.time() > deadline:
-                return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size
+                return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
             try:
-                search_result = lk.search_lightcurve(tid, author=author, cadence='long')
+                search_result = lk.search_lightcurve(search_target, author=author, cadence='long')
                 break
             except Exception:
                 time.sleep(2 ** attempt)
         else:
-            return None, None, tid, 'Download failed', dl_size
+            return None, None, tid, 'Download failed', dl_size, None
         if len(search_result) == 0:
-            return None, None, tid, 'No lightcurves found', dl_size
+            return None, None, tid, 'No lightcurves found', dl_size, None
+        if max_sectors > 0 and len(search_result) > max_sectors:
+            search_result = search_result[:max_sectors]
         if time.time() > deadline:
-            return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size
+            return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
         lc_col = search_result.download_all(download_dir=tmp_dir)
         dl_size = get_dir_size(tmp_dir)
+        t_dl_end = time.time()
+        timing_dl = t_dl_end - t_dl_start
+
         if lc_col is None or len(lc_col) == 0:
-            return None, None, tid, 'No lightcurves found', dl_size
+            return None, None, tid, 'No lightcurves found', dl_size, None
+
+        t_stitch_start = time.time()
+        for seg in lc_col:
+            seg_times = np.asarray(seg.time.value, dtype=float)
+            dt_seg = np.nanmedian(np.diff(seg_times)) if len(seg_times) > 1 else 0.0
+            wl_seg = int(flatten_days / dt_seg) if dt_seg > 0 else 101
+            if wl_seg % 2 == 0: wl_seg -= 1
+            if wl_seg < 3: wl_seg = 3
+            if wl_seg > len(seg): wl_seg = len(seg) if len(seg) % 2 != 0 else len(seg) - 1
+
+            has_col = 'centroid_col' in seg.columns and not np.all(np.isnan(seg.centroid_col.value))
+            if has_col and wl_seg >= 3:
+                try:
+                    c_dummy = lk.LightCurve(time=seg.time, flux=seg.centroid_col.value)
+                    _, c_trend = c_dummy.flatten(window_length=wl_seg, polyorder=2, break_tolerance=5, return_trend=True)
+                    seg['centroid_col_detrended'] = u.Quantity(seg.centroid_col.value - c_trend.flux.value, u.pixel)
+                except Exception:
+                    seg['centroid_col_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
+            else:
+                seg['centroid_col_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
+
+            has_row = 'centroid_row' in seg.columns and not np.all(np.isnan(seg.centroid_row.value))
+            if has_row and wl_seg >= 3:
+                try:
+                    r_dummy = lk.LightCurve(time=seg.time, flux=seg.centroid_row.value)
+                    _, r_trend = r_dummy.flatten(window_length=wl_seg, polyorder=2, break_tolerance=5, return_trend=True)
+                    seg['centroid_row_detrended'] = u.Quantity(seg.centroid_row.value - r_trend.flux.value, u.pixel)
+                except Exception:
+                    seg['centroid_row_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
+            else:
+                seg['centroid_row_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
+
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
         lc = lc.remove_nans().remove_outliers(sigma=5)
         if len(lc) < 500:
-            return None, None, tid, 'Not enough valid points', dl_size
+            return None, None, tid, 'Not enough valid points', dl_size, None
         times = np.asarray(lc.time.value, dtype=float)
-        flux_val = np.asarray(lc.flux.value, dtype=float)
         baseline_d = float(np.nanmax(times) - np.nanmin(times))
         if baseline_d <= 0:
-            return None, None, tid, 'Invalid baseline', dl_size
+            return None, None, tid, 'Invalid baseline', dl_size, None
         med_diff = np.nanmedian(np.diff(times))
         if med_diff > 0:
             wl = int(flatten_days / med_diff)
@@ -253,11 +299,13 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         else:
             wl = 101
         if wl > len(lc): wl = len(lc) if len(lc) % 2 != 0 else len(lc) - 1
-        if wl < 3: return None, None, tid, 'Time series too short for flatten', dl_size
+        if wl < 3: return None, None, tid, 'Time series too short for flatten', dl_size, None
         if time.time() > deadline:
-            return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size
+            return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
         lc_flat = lc.flatten(window_length=wl, polyorder=2, break_tolerance=5)
-        times_flat = np.asarray(lc_flat.time.value, dtype=float)
+        t_stitch_end = time.time()
+        timing_stitch = t_stitch_end - t_stitch_start
+
         flux_flat = np.asarray(lc_flat.flux.value, dtype=float)
         flux_std_ppm = float(np.nanstd(flux_flat) * 1e6)
         flux_mad_ppm = float(np.nanmedian(np.abs(flux_flat - np.nanmedian(flux_flat))) * 1e6)
@@ -281,12 +329,18 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         curves_dict = {}
         freq_factor = 5000 if quick_mode else 500
         dur_grid = np.linspace(0.05, 0.40, 4) if quick_mode else np.linspace(0.04, 0.45, 10)
+        timing_bls = []
+        timing_feats = []
+
         for sig_idx in range(max_signals):
             if time.time() > deadline:
                 break
             if max_p <= 0.5 or len(lc_search) < 100:
                 break
+            t_bls_start = time.time()
             bls = lc_search.to_periodogram(method='bls', minimum_period=0.5, maximum_period=max_p, frequency_factor=freq_factor, duration=dur_grid)
+            t_bls_end = time.time()
+            timing_bls.append(t_bls_end - t_bls_start)
             if len(bls.power) == 0 or np.isnan(bls.power).all():
                 break
             power_values = np.array(bls.power.value)
@@ -298,34 +352,44 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             bls_period_d = float(bls.period_at_max_power.value)
             bls_epoch = float(bls.transit_time_at_max_power.value)
             bls_duration_d = float(bls.duration_at_max_power.value)
-            bls_depth_fraction = float(bls.depth_at_max_power.value)
-            bls_depth_ppm = bls_depth_fraction * 1e6
-            transit_count = max(1, int(baseline_d / bls_period_d))
-            duty_cycle = bls_duration_d / bls_period_d
+            bls_depth_ppm = float(bls.depth_at_max_power.value * 1e6)
+            transit_count = int(baseline_d / bls_period_d)
+            duty_cycle = float(bls_duration_d / bls_period_d)
+
+            t_feat_start = time.time()
             folded = lc_search.fold(period=bls_period_d, epoch_time=bls_epoch, normalize_phase=False)
-            folded_time_val = np.asarray(folded.time.value, dtype=float)
-            folded_flux_val = np.asarray(folded.flux.value, dtype=float)
-            phase_time = folded_time_val / bls_period_d
-            dur_time = folded_time_val / bls_duration_d
-            phase_curve = bin_folded_curve(phase_time, folded_flux_val, 201, -0.5, 0.5)
-            dur_curve = bin_folded_curve(dur_time, folded_flux_val, 201, -3.0, 3.0)
-            sig_id = f"{tid}_{sig_idx}"
-            curves_dict[sig_id] = np.vstack([phase_curve, dur_curve])
+            phase_times = np.asarray(folded.time.value, dtype=float)
+            fold_flux = np.asarray(folded.flux.value, dtype=float)
+            norm_phase = phase_times / bls_period_d
+            norm_phase = (norm_phase + 0.5) % 1.0 - 0.5
+            binned_phase = bin_folded_curve(norm_phase, fold_flux)
+            sig_id = f'{tid}_{sig_idx}'
+            zoom_mask = np.abs(phase_times) <= (bls_duration_d * 2.0)
+            if np.any(zoom_mask):
+                zoom_phase = phase_times[zoom_mask] / (bls_duration_d * 2.0)
+                zoom_phase = (zoom_phase + 0.5) % 1.0 - 0.5
+                binned_zoom = bin_folded_curve(zoom_phase, fold_flux[zoom_mask])
+            else:
+                binned_zoom = np.ones(201)
+            curves_dict[sig_id] = np.stack([binned_phase, binned_zoom])
             match_status = 'UNMATCHED'
             match_label = 'UNMATCHED'
             match_flags = {'koi_fpflag_nt': 0, 'koi_fpflag_ss': 0, 'koi_fpflag_co': 0, 'koi_fpflag_ec': 0}
-            for row in row_dicts:
-                cat_p = row.get('catalog_period', np.nan)
-                if pd.isna(cat_p): continue
-                ratio = bls_period_d / cat_p
+            for r in row_dicts:
+                cat_p = r.get('catalog_period', np.nan)
+                if pd.isna(cat_p):
+                    continue
+                ratio = bls_period_d / float(cat_p)
                 if abs(ratio - 1.0) < 0.01:
                     match_status = 'MATCHED'
-                    match_label = row.get('label', 'UNMATCHED')
+                    match_label = r.get('label', 'UNMATCHED')
                     if mission == 'Kepler':
-                        match_flags['koi_fpflag_nt'] = row.get('koi_fpflag_nt', 0)
-                        match_flags['koi_fpflag_ss'] = row.get('koi_fpflag_ss', 0)
-                        match_flags['koi_fpflag_co'] = row.get('koi_fpflag_co', 0)
-                        match_flags['koi_fpflag_ec'] = row.get('koi_fpflag_ec', 0)
+                        match_flags = {
+                            'koi_fpflag_nt': r.get('koi_fpflag_nt', 0),
+                            'koi_fpflag_ss': r.get('koi_fpflag_ss', 0),
+                            'koi_fpflag_co': r.get('koi_fpflag_co', 0),
+                            'koi_fpflag_ec': r.get('koi_fpflag_ec', 0)
+                        }
                     break
                 elif abs(ratio - 0.5) < 0.01 or abs(ratio - 2.0) < 0.01:
                     match_status = 'HARMONIC'
@@ -367,6 +431,37 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
                 if np.any(mask):
                     transit_depths.append(1.0 - np.nanmean(flux_search[mask]))
             depth_scatter_ppm = float(np.nanstd(transit_depths) * 1e6) if len(transit_depths) > 0 else 0.0
+
+            col_det = np.asarray(lc_search['centroid_col_detrended'].value, dtype=float) if 'centroid_col_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
+            row_det = np.asarray(lc_search['centroid_row_detrended'].value, dtype=float) if 'centroid_row_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
+            phase_c = ((times_search - bls_epoch + bls_period_d / 2.0) % bls_period_d) - bls_period_d / 2.0
+            in_c_mask = np.abs(phase_c) <= (bls_duration_d / 2.0)
+            out_c_mask = (np.abs(phase_c) > (bls_duration_d / 2.0)) & (np.abs(phase_c) <= (3.0 * bls_duration_d))
+            valid_c = ~np.isnan(col_det) & ~np.isnan(row_det)
+            in_c_pts = np.where(in_c_mask & valid_c)[0]
+            out_c_pts = np.where(out_c_mask & valid_c)[0]
+            if len(in_c_pts) >= 3 and len(out_c_pts) >= 3:
+                in_col_vals = col_det[in_c_pts]
+                out_col_vals = col_det[out_c_pts]
+                in_row_vals = row_det[in_c_pts]
+                out_row_vals = row_det[out_c_pts]
+                d_col = float(np.nanmean(in_col_vals) - np.nanmean(out_col_vals))
+                d_row = float(np.nanmean(in_row_vals) - np.nanmean(out_row_vals))
+                s_col = float(np.nanstd(out_col_vals, ddof=1))
+                s_row = float(np.nanstd(out_row_vals, ddof=1))
+                se_col = s_col / np.sqrt(len(in_c_pts)) if s_col > 0 else 0.0
+                se_row = s_row / np.sqrt(len(in_c_pts)) if s_row > 0 else 0.0
+                c_shift_col_sig = float(abs(d_col) / se_col) if se_col > 0 else 0.0
+                c_shift_row_sig = float(abs(d_row) / se_row) if se_row > 0 else 0.0
+                c_shift_tot_sig = float(np.sqrt(c_shift_col_sig**2 + c_shift_row_sig**2))
+                px_scale = 3.98 if mission == 'Kepler' else 21.0
+                c_shift_tot_arcsec = float(np.sqrt(d_col**2 + d_row**2) * px_scale)
+            else:
+                c_shift_col_sig = np.nan
+                c_shift_row_sig = np.nan
+                c_shift_tot_sig = np.nan
+                c_shift_tot_arcsec = np.nan
+
             feat = {
                 'signal_id': sig_id, 'target_id': tid, 'signal_index': sig_idx, 
                 'mission': mission, 'label': match_label, 'match_status': match_status,
@@ -382,18 +477,35 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
                 'cdpp_ppm': cdpp_ppm, 'pointwise_scatter_ppm': pointwise_scatter_ppm,
                 'autocorr_max': autocorr_max, 'ls_peak_power': ls_peak_power, 'gap_fraction': gap_fraction,
                 'baseline_d': baseline_d, 'star_teff': star_teff, 'star_radius': star_radius,
-                'star_logg': star_logg
+                'star_logg': star_logg,
+                'centroid_shift_col_sigma': c_shift_col_sig,
+                'centroid_shift_row_sigma': c_shift_row_sig,
+                'centroid_shift_total_sigma': c_shift_tot_sig,
+                'centroid_shift_total_arcsec': c_shift_tot_arcsec
             }
             if mission == 'Kepler':
                 feat.update(match_flags)
             features_list.append(feat)
+            t_feat_end = time.time()
+            timing_feats.append(t_feat_end - t_feat_start)
+
             transit_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=bls_epoch, duration=bls_duration_d * 1.5)
             lc_search = lc_search[~transit_mask]
+
         for f in features_list:
             f['n_signals_star'] = len(features_list)
-        return features_list, curves_dict, tid, None, dl_size
+        timing_total = time.time() - start_t
+        timings = {
+            'dl': timing_dl,
+            'stitch': timing_stitch,
+            'bls': sum(timing_bls),
+            'bls_list': timing_bls,
+            'feats': sum(timing_feats),
+            'total': timing_total
+        }
+        return features_list, curves_dict, tid, None, dl_size, timings
     except Exception as e:
-        return None, None, tid, str(type(e).__name__) + ' - ' + str(e), dl_size
+        return None, None, tid, str(type(e).__name__) + ' - ' + str(e), dl_size, None
     finally:
         if not keep_raw and os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -414,7 +526,7 @@ def log_failure(failed_path, tid_str, err_msg, attempts_dict):
     att = attempts_dict.get(tid_str, 0) + 1
     attempts_dict[tid_str] = att
     df_err = pd.DataFrame([{'target_id': tid_str, 'error': str(err_msg), 'attempts': att}])
-    append_to_csv_flush(failed_path, df_fail) if 'df_fail' in locals() else append_to_csv_flush(failed_path, df_err)
+    append_to_csv_flush(failed_path, df_err)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -437,8 +549,12 @@ def main():
     parser.add_argument('--no-resume', action='store_true')
     parser.add_argument('--star-timeout', type=float, default=1800.0)
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
+    parser.add_argument('--max-sectors', type=int, default=0)
     args = parser.parse_args()
     logger = setup_logger()
+
+    logical_cores = os.cpu_count() or 1
+    print(f"Detected CPU cores: {logical_cores} logical (physical core count requires external psutil; using os.cpu_count()). Default workers: {args.workers}.", flush=True)
 
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     os.makedirs('outputs', exist_ok=True)
@@ -457,6 +573,23 @@ def main():
     base_out, ext_out = os.path.splitext(args.output)
     failed_csv = f"{base_out}_failed{ext_out if ext_out else '.csv'}"
     resume = not args.no_resume
+
+    if resume and os.path.exists(args.output) and os.path.getsize(args.output) > 0:
+        try:
+            with open(args.output, 'r', encoding='utf-8') as f_chk:
+                hdr_line = f_chk.readline().strip()
+            exist_cols = [c.strip() for c in hdr_line.split(',') if c.strip()]
+            required_cols = ['centroid_shift_col_sigma', 'centroid_shift_row_sigma', 'centroid_shift_total_sigma', 'centroid_shift_total_arcsec']
+            missing_in_hdr = [c for c in required_cols if c not in exist_cols]
+            if missing_in_hdr:
+                err_msg = f"Schema mismatch in existing {args.output}! Existing file is missing current schema columns: {', '.join(missing_in_hdr)}. Use --no-resume to recompute with the new schema, or specify a different --output file."
+                logger.error(err_msg)
+                print(f"ERROR: {err_msg}", flush=True)
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
 
     if not resume:
         if os.path.exists(args.output):
@@ -498,6 +631,7 @@ def main():
         elif args.quick and not inj_out.endswith('_quick.csv'):
             inj_out = inj_out.replace('.csv', '_quick.csv')
 
+        os.makedirs(os.path.dirname(inj_out) or '.', exist_ok=True)
         inj_feat_out = 'outputs/injection_features_quick.csv' if args.quick else 'outputs/injection_features.csv'
 
         if not resume:
@@ -519,12 +653,17 @@ def main():
 
         tasks = []
         for tid in quiet_stars:
-            if str(tid) not in completed_inj_stars:
-                tasks.append((tid, args.mission, args.injections_per_star, args.min_free_gb, args.flatten_days, args.quick, args.cache_dir, args.star_timeout))
+            tid_str = str(tid)
+            if tid_str in completed_inj_stars:
+                continue
+            tasks.append((tid_str, args.mission, args.injections_per_star, args.min_free_gb, args.flatten_days, args.quick, args.cache_dir, args.star_timeout, args.max_sectors))
 
         total_inj = len(tasks)
         done_inj = 0
         durations_inj = []
+        print(f"Injection tasks: {total_inj} stars to process (already completed: {len(completed_inj_stars)})", flush=True)
+        logger.info(f"Injection tasks: {total_inj} stars to process (already completed: {len(completed_inj_stars)})")
+
         with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
             task_iter = iter(tasks)
             active_futures = {}
@@ -545,18 +684,18 @@ def main():
                     durations_inj.append(elapsed)
                     done_inj += 1
                     try:
-                        res, feats, r_tid, err = f.result()
+                        res, feat, r_tid, err = f.result()
                     except Exception as exc:
                         err = f"{type(exc).__name__}: {str(exc)}"
-                        res, feats = None, None
+                        res, feat = None, None
 
                     if err:
                         logger.error(f"Injection error on {tid_str}: {err}")
                     else:
                         if res:
                             append_to_csv_flush(inj_out, pd.DataFrame(res))
-                        if feats:
-                            append_to_csv_flush(inj_feat_out, pd.DataFrame(feats))
+                        if feat:
+                            append_to_csv_flush(inj_feat_out, pd.DataFrame(feat))
 
                     avg_t = sum(durations_inj) / len(durations_inj)
                     rem_stars = total_inj - done_inj
@@ -621,7 +760,7 @@ def main():
         target_ids = read_targets_file(args.targets_file)
     else:
         labels_df = labels_df.dropna(subset=['label'])
-        target_ids = labels_df['target_id'].unique().tolist()
+        target_ids = sorted(labels_df['target_id'].dropna().astype(str).unique().tolist())
     np.random.seed(42)
     np.random.shuffle(target_ids)
     target_ids = target_ids[:args.limit]
@@ -652,13 +791,14 @@ def main():
         if tid_str in failed_attempts and failed_attempts[tid_str] >= 2:
             continue
         rows = labels_df[labels_df['target_id'] == tid_str].to_dict('records')
-        tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout))
+        tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout, args.max_sectors))
 
     total_tasks = len(tasks)
     completed_stars = 0
     success_count = 0
     skip_count = 0
     durations = []
+    stage_timings = []
     match_stats = {'MATCHED': 0, 'HARMONIC': 0, 'UNMATCHED': 0}
     npz_path = os.path.join(os.path.dirname(args.output) or 'outputs', 'folded_curves.npz')
 
@@ -685,10 +825,10 @@ def main():
                 durations.append(elapsed)
                 completed_stars += 1
                 try:
-                    feats, curves, r_tid, err, dl_size = f.result()
+                    feats, curves, r_tid, err, dl_size, timings = f.result()
                 except Exception as exc:
                     err = f"{type(exc).__name__}: {str(exc)}"
-                    feats, curves, dl_size = None, None, 0
+                    feats, curves, dl_size, timings = None, None, 0, None
 
                 if err:
                     logger.error(f"Error on {tid_str}: {err}")
@@ -696,6 +836,9 @@ def main():
                     skip_count += 1
                 else:
                     success_count += 1
+                    if timings:
+                        stage_timings.append(timings)
+                        logger.info(f"Star {tid_str} breakdown: total={timings['total']:.1f}s | dl={timings['dl']:.1f}s | stitch={timings['stitch']:.1f}s | bls={timings['bls']:.1f}s | feats={timings['feats']:.1f}s")
                     if feats:
                         append_to_csv_flush(args.output, pd.DataFrame(feats))
                         for item in feats:
@@ -754,6 +897,16 @@ def main():
     logger.info(f'Total processed: {success_count}')
     logger.info(f'Total skipped: {skip_count}')
     logger.info(f'Match stats: {match_stats}')
+    if stage_timings:
+        avg_dl = float(np.mean([t['dl'] for t in stage_timings]))
+        avg_stitch = float(np.mean([t['stitch'] for t in stage_timings]))
+        avg_bls = float(np.mean([t['bls'] for t in stage_timings]))
+        avg_feats = float(np.mean([t['feats'] for t in stage_timings]))
+        avg_tot = float(np.mean([t['total'] for t in stage_timings]))
+        avg_report = f"Stage averages per star:\n  Download: {avg_dl:.1f}s\n  Stitch & detrend: {avg_stitch:.1f}s\n  BLS periodogram: {avg_bls:.1f}s\n  Feature computation: {avg_feats:.1f}s\n  Total per star: {avg_tot:.1f}s"
+        print(avg_report, flush=True)
+        logger.info(avg_report)
+
     if args.purge_lk_cache:
         purge_cache()
 

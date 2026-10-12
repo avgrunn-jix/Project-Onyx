@@ -1,4 +1,4 @@
-﻿venv/
+venv/
 .venv/
 __pycache__/
 *.py[cod]
@@ -11,11 +11,18 @@ __pycache__/
 data/raw/
 data/labels/
 *.csv
-extracted_features.csv
-outputs/models/
+*.npz
 *.joblib
 *.pkl
-logs/
+*.png
+outputs/models/*
+!outputs/models/.gitkeep
+outputs/figures/*
+!outputs/figures/.gitkeep
+outputs/explanations/*
+!outputs/explanations/.gitkeep
+logs/*
+!logs/.gitkeep
 .lightkurve-cache/
 .DS_Store
 Thumbs.db
