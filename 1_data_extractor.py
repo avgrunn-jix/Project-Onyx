@@ -59,6 +59,25 @@ def fetch_labels(mission):
         df.to_csv('data/labels/tess_labels.csv', index=False)
         return df
 
+def read_targets_file(filepath):
+    if not filepath or not os.path.exists(filepath):
+        return []
+    with open(filepath, 'rb') as f:
+        raw = f.read()
+    if not raw:
+        return []
+    encodings = ['utf-8-sig', 'utf-16', 'utf-16-le', 'utf-16-be', 'utf-8', 'latin-1']
+    for enc in encodings:
+        try:
+            text = raw.decode(enc)
+            lines = [l.strip().replace('\x00', '') for l in text.splitlines()]
+            cleaned = [l for l in lines if l]
+            if cleaned:
+                return cleaned
+        except Exception:
+            continue
+    return []
+
 def bin_folded_curve(time_array, flux_array, bins=201, range_min=-0.5, range_max=0.5):
     bins_edges = np.linspace(range_min, range_max, bins + 1)
     binned_flux = np.zeros(bins)
@@ -76,7 +95,6 @@ def bin_folded_curve(time_array, flux_array, bins=201, range_min=-0.5, range_max
         binned_flux[:] = 1.0
     return binned_flux
 
-
 def inject_transit(time, flux, period, epoch, rp_rs, duration):
     phase = ((time - epoch) % period) / period
     phase[phase > 0.5] -= 1.0
@@ -93,7 +111,7 @@ def inject_transit(time, flux, period, epoch, rp_rs, duration):
         model[ing_mask] = 1.0 - depth * (dist / ingress)
     return flux * model
 
-def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days):
+def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, quick_mode=False):
     free_bytes = shutil.disk_usage(os.path.abspath('.')).free
     if free_bytes < min_free_gb * 1024**3: return None, tid, 'Disk space'
     tmp_dir = f'data/raw/tmp_inj_{tid}_{os.getpid()}'
@@ -121,6 +139,8 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days):
         star_logg = float(lc.meta.get('LOGG', 4.438))
         if np.isnan(star_logg): star_logg = 4.438
         rho_star_sun = (star_radius**-3) * (10**(star_logg - 4.438)) * (star_radius**2) 
+        freq_factor = 5000 if quick_mode else 500
+        dur_grid = np.linspace(0.05, 0.40, 4) if quick_mode else np.linspace(0.04, 0.45, 10)
         results = []
         features = []
         for i in range(injections_per_star):
@@ -139,7 +159,7 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days):
             if wl < 3: wl = 3
             if wl > len(lc_inj): wl = len(lc_inj) if len(lc_inj) % 2 != 0 else len(lc_inj) - 1
             lc_flat = lc_inj.flatten(window_length=wl, polyorder=2, break_tolerance=5)
-            bls = lc_flat.to_periodogram(method='bls', minimum_period=0.5, maximum_period=min(100.0, baseline_d/2.0), frequency_factor=500)
+            bls = lc_flat.to_periodogram(method='bls', minimum_period=0.5, maximum_period=min(100.0, baseline_d/2.0), frequency_factor=freq_factor, duration=dur_grid)
             rec_period = float(bls.period_at_max_power.value)
             rec_epoch = float(bls.transit_time_at_max_power.value)
             sde = float((np.nanmax(bls.power.value) - np.nanmean(bls.power.value)) / np.nanstd(bls.power.value))
@@ -163,7 +183,7 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days):
             }
             results.append(res)
             if recovered:
-                feat, _, _, _, _ = process_single_star(tid, mission, [{'catalog_period': inj_period, 'label': 'INJECTED'}], True, 0, flatten_days, 1)
+                feat, _, _, _, _ = process_single_star(tid, mission, [{'catalog_period': inj_period, 'label': 'INJECTED'}], True, 0, flatten_days, 1, quick_mode=quick_mode)
                 if feat and len(feat) > 0:
                     features.append(feat[0])
         return results, features, tid, None
@@ -173,7 +193,7 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days):
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals):
+def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False):
     free_bytes = shutil.disk_usage(os.path.abspath('.')).free
     if free_bytes < min_free_gb * 1024**3:
         return None, None, tid, 'Disk space below threshold', 0
@@ -238,11 +258,12 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         lc_search = lc_flat.copy()
         features_list = []
         curves_dict = {}
+        freq_factor = 5000 if quick_mode else 500
+        dur_grid = np.linspace(0.05, 0.40, 4) if quick_mode else np.linspace(0.04, 0.45, 10)
         for sig_idx in range(max_signals):
             if max_p <= 0.5 or len(lc_search) < 100:
                 break
-            duration_grid = np.linspace(0.04, 0.45, 10)
-            bls = lc_search.to_periodogram(method='bls', minimum_period=0.5, maximum_period=max_p, frequency_factor=500, duration=duration_grid)
+            bls = lc_search.to_periodogram(method='bls', minimum_period=0.5, maximum_period=max_p, frequency_factor=freq_factor, duration=dur_grid)
             if len(bls.power) == 0 or np.isnan(bls.power).all():
                 break
             power_values = np.array(bls.power.value)
@@ -372,10 +393,17 @@ def main():
     parser.add_argument('--injection-stars', type=int, default=100)
     parser.add_argument('--injections-per-star', type=int, default=12)
     parser.add_argument('--injection-output', default='outputs/injection_results.csv')
+    parser.add_argument('--quick', action='store_true')
     args = parser.parse_args()
     logger = setup_logger()
     os.makedirs(args.raw_dir, exist_ok=True)
     os.makedirs('outputs', exist_ok=True)
+    os.makedirs('outputs/figures', exist_ok=True)
+    if args.quick:
+        logger.warning('WARNING: Quick mode enabled. Using coarse BLS grid (frequency_factor=5000, 4 duration steps). Outputs will have _quick suffix.')
+        print('WARNING: Quick mode enabled. Using coarse BLS grid (frequency_factor=5000, 4 duration steps). Outputs will have _quick suffix.')
+        if args.output == 'extracted_features.csv':
+            args.output = 'extracted_features_quick.csv'
     def purge_cache():
         cache_dir = os.path.expanduser('~/.lightkurve/cache')
         if os.path.exists(cache_dir):
@@ -390,19 +418,21 @@ def main():
     with open('logs/disk_usage.log', 'a') as f:
         f.write(f'Start: {free_start / 1024**3:.2f} GB free\n')
 
+    labels_df = fetch_labels(args.mission)
+    target_ids = []
+    
     if args.inject:
-        os.makedirs('outputs', exist_ok=True)
         all_tids = labels_df['target_id'].unique().tolist()
         quiet_stars = []
         if args.targets_file and os.path.exists(args.targets_file):
-            with open(args.targets_file, 'r') as f:
-                quiet_stars = [line.strip() for line in f if line.strip() not in all_tids]
+            tids_from_file = read_targets_file(args.targets_file)
+            quiet_stars = [tid for tid in tids_from_file if tid not in all_tids]
         else:
             logger.error("Please provide --targets-file with a list of target IDs for injection (which will be filtered to exclude KOIs).")
             return
         np.random.shuffle(quiet_stars)
         quiet_stars = quiet_stars[:args.injection_stars]
-        tasks = [(tid, args.mission, args.injections_per_star, args.min_free_gb, args.flatten_days) for tid in quiet_stars]
+        tasks = [(tid, args.mission, args.injections_per_star, args.min_free_gb, args.flatten_days, args.quick) for tid in quiet_stars]
         all_results = []
         all_features = []
         with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
@@ -415,10 +445,16 @@ def main():
                     all_results.extend(res)
                     all_features.extend(feats)
         df_res = pd.DataFrame(all_results)
-        df_res.to_csv(args.injection_output, index=False)
+        inj_out = args.injection_output
+        if args.quick and inj_out == 'outputs/injection_results.csv':
+            inj_out = 'outputs/injection_results_quick.csv'
+        elif args.quick and not inj_out.endswith('_quick.csv'):
+            inj_out = inj_out.replace('.csv', '_quick.csv')
+        df_res.to_csv(inj_out, index=False)
+        inj_feat_out = 'outputs/injection_features_quick.csv' if args.quick else 'outputs/injection_features.csv'
         if all_features:
             df_feat = pd.DataFrame(all_features)
-            df_feat.to_csv('outputs/injection_features.csv', index=False)
+            df_feat.to_csv(inj_feat_out, index=False)
         import matplotlib.pyplot as plt
         import seaborn as sns
         plt.figure(figsize=(10, 8))
@@ -438,16 +474,15 @@ def main():
         sns.heatmap(rec_grid, cmap='viridis', xticklabels=np.round(10**p_bins[:-1], 1), yticklabels=np.round(10**r_bins[:-1], 1))
         plt.xlabel('Period (days)')
         plt.ylabel('Radius (Earth)')
-        plt.title('Completeness Heatmap')
-        plt.savefig('outputs/figures/injection_heatmap.png')
+        title_str = 'Completeness Heatmap (Quick Mode)' if args.quick else 'Completeness Heatmap'
+        plt.title(title_str)
+        heatmap_out = 'outputs/figures/injection_heatmap_quick.png' if args.quick else 'outputs/figures/injection_heatmap.png'
+        plt.savefig(heatmap_out)
         plt.close()
         return
 
-    labels_df = fetch_labels(args.mission)
-    target_ids = []
     if args.targets_file and os.path.exists(args.targets_file):
-        with open(args.targets_file, 'r') as f:
-            target_ids = [line.strip() for line in f if line.strip()]
+        target_ids = read_targets_file(args.targets_file)
     else:
         labels_df = labels_df.dropna(subset=['label'])
         target_ids = labels_df['target_id'].unique().tolist()
@@ -462,7 +497,7 @@ def main():
     for tid in target_ids:
         if str(tid) not in processed_ids:
             rows = labels_df[labels_df['target_id'] == str(tid)].to_dict('records')
-            tasks.append((str(tid), args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals))
+            tasks.append((str(tid), args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick))
     success_count = 0
     skip_count = 0
     total_dl_size = 0

@@ -385,8 +385,15 @@ def predict_mode(args, logger):
     if explainer is not None:
         df['top_factors'] = get_explanations(df, X_scaled, explainer, feature_cols)
     df.sort_values(by='p_mean', ascending=False, inplace=True)
-    df.to_csv('outputs/new_candidates.csv', index=False)
-    logger.info('Prediction completed. Saved to outputs/new_candidates.csv')
+    out_file = args.output
+    if not out_file:
+        if args.mode == 'score-file':
+            out_file = 'outputs/scored_file.csv'
+        else:
+            out_file = 'outputs/new_candidates.csv'
+    os.makedirs(os.path.dirname(out_file) or '.', exist_ok=True)
+    df.to_csv(out_file, index=False)
+    logger.info(f'Prediction completed. Saved to {out_file}')
 
 def score_file_mode(args, logger):
     predict_mode(args, logger)
@@ -394,6 +401,7 @@ def score_file_mode(args, logger):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', default='extracted_features.csv')
+    parser.add_argument('--output', default='')
     parser.add_argument('--train-csv', default='')
     parser.add_argument('--test-csv', default='')
     parser.add_argument('--mode', default='train', choices=['train', 'predict', 'score-file', 'retrain', 'transfer'])
@@ -408,7 +416,6 @@ def main():
         predict_mode(args, logger)
     elif args.mode == 'transfer':
         transfer_mode(args, logger)
-        predict_mode(args, logger)
 
 if __name__ == '__main__':
     main()

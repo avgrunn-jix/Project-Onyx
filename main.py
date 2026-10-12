@@ -17,6 +17,10 @@ def main():
     parser.add_argument('--mode', default='train', choices=['train', 'predict', 'score-file', 'retrain', 'inject', 'transfer'])
     parser.add_argument('--targets-file', default='')
     parser.add_argument('--input-file', default='')
+    parser.add_argument('--output', default='')
+    parser.add_argument('--train-csv', default='')
+    parser.add_argument('--test-csv', default='')
+    parser.add_argument('--quick', action='store_true')
     parser.add_argument('--injection-stars', type=int, default=100)
     parser.add_argument('--injections-per-star', type=int, default=12)
     parser.add_argument('--max-sectors', type=int, default=4)
@@ -26,10 +30,11 @@ def main():
     logging.info(f'Starting Project Onyx pipeline in {args.mode} mode')
 
     if args.mode == 'train' or args.mode == 'retrain':
-        out_csv = 'extracted_features.csv'
+        out_csv = args.output if args.output else ('extracted_features_quick.csv' if args.quick else 'extracted_features.csv')
         cmd1 = [sys.executable, '1_data_extractor.py', '--mission', args.mission, '--limit', str(args.limit), '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv]
         if args.keep_raw: cmd1.append('--keep-raw')
         if args.purge_lk_cache: cmd1.append('--purge-lk-cache')
+        if args.quick: cmd1.append('--quick')
         logging.info('Running extractor')
         ret1 = subprocess.run(cmd1)
         if ret1.returncode != 0:
@@ -49,28 +54,37 @@ def main():
         out_csv = 'outputs/predict_features.csv'
         cmd1 = [sys.executable, '1_data_extractor.py', '--mission', args.mission, '--targets-file', args.targets_file, '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv]
         if args.keep_raw: cmd1.append('--keep-raw')
+        if args.quick: cmd1.append('--quick')
         logging.info('Running extractor for prediction targets')
         ret1 = subprocess.run(cmd1)
         if ret1.returncode != 0:
             sys.exit(ret1.returncode)
         logging.info('Running ML prediction')
-        cmd2 = [sys.executable, '2_ml_pipeline.py', '--mode', 'predict', '--input', out_csv]
+        out_pred = args.output if args.output else 'outputs/new_candidates.csv'
+        cmd2 = [sys.executable, '2_ml_pipeline.py', '--mode', 'predict', '--input', out_csv, '--output', out_pred]
         subprocess.run(cmd2)
 
     elif args.mode == 'score-file':
         if not args.input_file:
             logging.error('--input-file required for score-file mode')
             sys.exit(1)
-        cmd2 = [sys.executable, '2_ml_pipeline.py', '--mode', 'score-file', '--input', args.input_file]
+        out_score = args.output if args.output else 'outputs/scored_file.csv'
+        cmd2 = [sys.executable, '2_ml_pipeline.py', '--mode', 'score-file', '--input', args.input_file, '--output', out_score]
         subprocess.run(cmd2)
 
     elif args.mode == 'inject':
         cmd1 = [sys.executable, '1_data_extractor.py', '--mission', args.mission, '--inject', '--injection-stars', str(args.injection_stars), '--injections-per-star', str(args.injections_per_star), '--workers', str(args.workers)]
+        if args.targets_file: cmd1.extend(['--targets-file', args.targets_file])
+        if args.output: cmd1.extend(['--injection-output', args.output])
+        if args.quick: cmd1.append('--quick')
         logging.info('Running injection tests')
         subprocess.run(cmd1)
 
     elif args.mode == 'transfer':
-        pass
+        train_csv = args.train_csv if args.train_csv else (args.input_file if args.input_file else 'extracted_features.csv')
+        test_csv = args.test_csv if args.test_csv else (args.output if args.output else 'outputs/tess_features.csv')
+        cmd = [sys.executable, '2_ml_pipeline.py', '--mode', 'transfer', '--train-csv', train_csv, '--test-csv', test_csv]
+        subprocess.run(cmd)
 
 if __name__ == '__main__':
     main()
