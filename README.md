@@ -85,6 +85,39 @@ Onyx operates in several distinct modes via `main.py --mode <MODE>`:
 * **Trapezoidal Injections:** The injection module ignores stellar limb darkening, leading to slight overestimation of completeness.
 * **BLS Resolution vs Speed:** To avoid memory exhaustion and multi-hour processing per star on long 4-year baselines, frequency factor is bounded. Full evaluation requires adequate CPU core allocation.
 
+## Запуск в Google Colab
+
+Для запуска проекта в среде Google Colab (Linux, 2 vCPU, риск обрыва сессии) рекомендуется сохранять выходные данные на примонтированный Google Drive:
+
+### 1. Подключение Google Drive
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+### 2. Клонирование и установка зависимостей
+```bash
+!git clone https://github.com/<username>/Project-Onyx.git
+%cd Project-Onyx
+!pip install -r requirements.txt
+```
+
+### 3. Запуск экстрактора с сохранением на Google Drive
+```bash
+!python main.py --mode train --mission Kepler --workers 2 \
+  --output /content/drive/MyDrive/onyx/extracted_features.csv \
+  --cache-dir /tmp/fits_cache
+```
+
+### 4. Поведение при обрыве сессии (Возобновление)
+Сессия Colab может завершиться в любой момент. В Project Onyx встроена отказоустойчивость:
+* **Автосохранение:** строки каждой обработанной звезды сбрасываются на диск (`flush` + `fsync`) сразу по завершении анализа звезды.
+* **Автовозобновление:** при повторном запуске той же команды скрипт считывает список уже готовых звёзд из `--output` и обрабатывает только оставшиеся.
+* **Флаги управления отказоустойчивостью:**
+  * `--no-resume`: принудительно начать обработку с нуля (перезаписать выходной CSV). По умолчанию возобновление включено.
+  * `--star-timeout <СЕКУНДЫ>`: предел времени на одну звезду (по умолчанию `1800` с). Если загрузка или расчет зависает, звезда отправляется в файл `_failed.csv`, а конвейер переходит к следующей звезде. При повторном запуске упавшие звёзды повторяются один раз.
+  * `--cache-dir <ПУТЬ>`: путь для скачивания временных FITS-файлов (по умолчанию `/tmp` через `tempfile.gettempdir()`). FITS автоматически удаляются сразу после извлечения признаков.
+
 ## References
 1. Shallue, C. J., & Vanderburg, A. (2018). Identifying Exoplanets with Deep Learning: A Five-planet Resonant Chain around Kepler-80 and an Eighth Planet around Kepler-90. *The Astronomical Journal*, 155(2), 94.
 2. Valizadegan, H., et al. (2022). ExoMiner: A Highly Accurate and Explainable Deep Learning Classifier that Validates 301 New Exoplanets. *The Astrophysical Journal*, 926(2), 120.

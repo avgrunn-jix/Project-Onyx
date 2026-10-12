@@ -1,7 +1,10 @@
 import argparse
+import datetime
 import logging
 import os
 import shutil
+import sys
+import tempfile
 import time
 import warnings
 import numpy as np
@@ -18,9 +21,9 @@ logging.getLogger('astroquery').setLevel(logging.ERROR)
 def setup_logger():
     os.makedirs('logs', exist_ok=True)
     log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-    file_handler = logging.FileHandler('logs/extractor_errors.log')
+    file_handler = logging.FileHandler(os.path.join('logs', 'extractor_errors.log'), encoding='utf-8')
     file_handler.setFormatter(log_formatter)
-    console_handler = logging.StreamHandler()
+    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(log_formatter)
     logger = logging.getLogger('extractor')
     logger.setLevel(logging.INFO)
@@ -43,20 +46,20 @@ def get_dir_size(path):
     return total
 
 def fetch_labels(mission):
-    os.makedirs('data/labels', exist_ok=True)
+    os.makedirs(os.path.join('data', 'labels'), exist_ok=True)
     if mission == 'Kepler':
         labels_table = NasaExoplanetArchive.query_criteria(table='cumulative', select='kepid,koi_disposition,koi_period,koi_fpflag_nt,koi_fpflag_ss,koi_fpflag_co,koi_fpflag_ec')
         df = labels_table.to_pandas()
         df.rename(columns={'kepid': 'target_id', 'koi_disposition': 'label', 'koi_period': 'catalog_period'}, inplace=True)
         df['target_id'] = df['target_id'].astype(str)
-        df.to_csv('data/labels/kepler_labels.csv', index=False)
+        df.to_csv(os.path.join('data', 'labels', 'kepler_labels.csv'), index=False, encoding='utf-8')
         return df
     else:
         labels_table = NasaExoplanetArchive.query_criteria(table='toi', select='tic_id,tfopwg_disp,pl_orbper')
         df = labels_table.to_pandas()
         df.rename(columns={'tic_id': 'target_id', 'tfopwg_disp': 'label', 'pl_orbper': 'catalog_period'}, inplace=True)
         df['target_id'] = df['target_id'].astype(str)
-        df.to_csv('data/labels/tess_labels.csv', index=False)
+        df.to_csv(os.path.join('data', 'labels', 'tess_labels.csv'), index=False, encoding='utf-8')
         return df
 
 def read_targets_file(filepath):
@@ -111,14 +114,19 @@ def inject_transit(time, flux, period, epoch, rp_rs, duration):
         model[ing_mask] = 1.0 - depth * (dist / ingress)
     return flux * model
 
-def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, quick_mode=False):
+def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, quick_mode=False, cache_dir=None, star_timeout=1800.0):
     free_bytes = shutil.disk_usage(os.path.abspath('.')).free
-    if free_bytes < min_free_gb * 1024**3: return None, tid, 'Disk space'
-    tmp_dir = f'data/raw/tmp_inj_{tid}_{os.getpid()}'
+    if free_bytes < min_free_gb * 1024**3: return None, tid, 'Disk space below threshold'
+    start_t = time.time()
+    deadline = start_t + star_timeout
+    base_cache = cache_dir if cache_dir else tempfile.gettempdir()
+    tmp_dir = os.path.join(base_cache, f'onyx_inj_{tid}_{os.getpid()}_{int(time.time()*1000)}')
     os.makedirs(tmp_dir, exist_ok=True)
     try:
         author = 'Kepler' if mission == 'Kepler' else 'SPOC'
         for attempt in range(3):
+            if time.time() > deadline:
+                return None, tid, f'TimeoutError: Exceeded {star_timeout}s'
             try:
                 search_result = lk.search_lightcurve(tid, author=author, cadence='long')
                 break
@@ -126,6 +134,8 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
                 time.sleep(2 ** attempt)
         else: return None, tid, 'Download failed'
         if len(search_result) == 0: return None, tid, 'No lightcurves found'
+        if time.time() > deadline:
+            return None, tid, f'TimeoutError: Exceeded {star_timeout}s'
         lc_col = search_result.download_all(download_dir=tmp_dir)
         if lc_col is None or len(lc_col) == 0: return None, tid, 'No lightcurves found'
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
@@ -144,6 +154,8 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
         results = []
         features = []
         for i in range(injections_per_star):
+            if time.time() > deadline:
+                break
             inj_period = np.exp(np.random.uniform(np.log(0.8), np.log(min(100.0, baseline_d/2.0))))
             inj_rad_earth = np.exp(np.random.uniform(np.log(0.5), np.log(15.0)))
             rp_rs = inj_rad_earth * 0.009168 / star_radius
@@ -183,7 +195,8 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
             }
             results.append(res)
             if recovered:
-                feat, _, _, _, _ = process_single_star(tid, mission, [{'catalog_period': inj_period, 'label': 'INJECTED'}], True, 0, flatten_days, 1, quick_mode=quick_mode)
+                rem_timeout = max(10.0, deadline - time.time())
+                feat, _, _, _, _ = process_single_star(tid, mission, [{'catalog_period': inj_period, 'label': 'INJECTED'}], True, 0, flatten_days, 1, quick_mode=quick_mode, cache_dir=cache_dir, star_timeout=rem_timeout)
                 if feat and len(feat) > 0:
                     features.append(feat[0])
         return results, features, tid, None
@@ -193,17 +206,21 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False):
+def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0):
     free_bytes = shutil.disk_usage(os.path.abspath('.')).free
     if free_bytes < min_free_gb * 1024**3:
         return None, None, tid, 'Disk space below threshold', 0
-
-    tmp_dir = f'data/raw/tmp_{tid}_{os.getpid()}'
+    start_t = time.time()
+    deadline = start_t + star_timeout
+    base_cache = cache_dir if cache_dir else tempfile.gettempdir()
+    tmp_dir = os.path.join(base_cache, f'onyx_raw_{tid}_{os.getpid()}_{int(time.time()*1000)}')
     os.makedirs(tmp_dir, exist_ok=True)
     dl_size = 0
     try:
         author = 'Kepler' if mission == 'Kepler' else 'SPOC'
         for attempt in range(3):
+            if time.time() > deadline:
+                return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size
             try:
                 search_result = lk.search_lightcurve(tid, author=author, cadence='long')
                 break
@@ -213,6 +230,8 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             return None, None, tid, 'Download failed', dl_size
         if len(search_result) == 0:
             return None, None, tid, 'No lightcurves found', dl_size
+        if time.time() > deadline:
+            return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size
         lc_col = search_result.download_all(download_dir=tmp_dir)
         dl_size = get_dir_size(tmp_dir)
         if lc_col is None or len(lc_col) == 0:
@@ -235,6 +254,8 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             wl = 101
         if wl > len(lc): wl = len(lc) if len(lc) % 2 != 0 else len(lc) - 1
         if wl < 3: return None, None, tid, 'Time series too short for flatten', dl_size
+        if time.time() > deadline:
+            return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size
         lc_flat = lc.flatten(window_length=wl, polyorder=2, break_tolerance=5)
         times_flat = np.asarray(lc_flat.time.value, dtype=float)
         flux_flat = np.asarray(lc_flat.flux.value, dtype=float)
@@ -261,6 +282,8 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         freq_factor = 5000 if quick_mode else 500
         dur_grid = np.linspace(0.05, 0.40, 4) if quick_mode else np.linspace(0.04, 0.45, 10)
         for sig_idx in range(max_signals):
+            if time.time() > deadline:
+                break
             if max_p <= 0.5 or len(lc_search) < 100:
                 break
             bls = lc_search.to_periodogram(method='bls', minimum_period=0.5, maximum_period=max_p, frequency_factor=freq_factor, duration=dur_grid)
@@ -317,7 +340,6 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             odd_even_depth_diff_ppm = abs(med_odd - med_even) * 1e6
             combined_std = np.nanstd(folded_double.flux.value)
             odd_even_sigma = float(abs(med_odd - med_even) / combined_std) if combined_std > 0 else 0.0
-            sec_mask = np.abs(folded.time.value) < (bls_period_d / 2)
             sec_mask = (np.abs(folded.time.value - bls_period_d/2) < (bls_duration_d / 2))
             flux_sec = folded.flux.value[sec_mask]
             sec_depth = 1.0 - np.nanmedian(flux_sec) if len(flux_sec) > 0 else 0.0
@@ -376,6 +398,24 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         if not keep_raw and os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+def append_to_csv_flush(filepath, df_rows):
+    if df_rows is None or len(df_rows) == 0:
+        return
+    hdr = not os.path.exists(filepath) or os.path.getsize(filepath) == 0
+    with open(filepath, 'a', encoding='utf-8', newline='') as f:
+        df_rows.to_csv(f, header=hdr, index=False)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+
+def log_failure(failed_path, tid_str, err_msg, attempts_dict):
+    att = attempts_dict.get(tid_str, 0) + 1
+    attempts_dict[tid_str] = att
+    df_err = pd.DataFrame([{'target_id': tid_str, 'error': str(err_msg), 'attempts': att}])
+    append_to_csv_flush(failed_path, df_fail) if 'df_fail' in locals() else append_to_csv_flush(failed_path, df_err)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mission', default='Kepler', choices=['Kepler', 'TESS'])
@@ -383,7 +423,7 @@ def main():
     parser.add_argument('--raw-dir', default='data/raw')
     parser.add_argument('--output', default='extracted_features.csv')
     parser.add_argument('--targets-file', default='')
-    parser.add_argument('--workers', type=int, default=1)
+    parser.add_argument('--workers', type=int, default=os.cpu_count() or 1)
     parser.add_argument('--keep-raw', action='store_true')
     parser.add_argument('--min-free-gb', type=float, default=5.0)
     parser.add_argument('--purge-lk-cache', action='store_true')
@@ -394,33 +434,52 @@ def main():
     parser.add_argument('--injections-per-star', type=int, default=12)
     parser.add_argument('--injection-output', default='outputs/injection_results.csv')
     parser.add_argument('--quick', action='store_true')
+    parser.add_argument('--no-resume', action='store_true')
+    parser.add_argument('--star-timeout', type=float, default=1800.0)
+    parser.add_argument('--cache-dir', default=tempfile.gettempdir())
     args = parser.parse_args()
     logger = setup_logger()
-    os.makedirs(args.raw_dir, exist_ok=True)
+
+    os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     os.makedirs('outputs', exist_ok=True)
-    os.makedirs('outputs/figures', exist_ok=True)
+    os.makedirs(os.path.join('outputs', 'figures'), exist_ok=True)
+    os.makedirs(os.path.join('outputs', 'models'), exist_ok=True)
+    os.makedirs(os.path.join('outputs', 'explanations'), exist_ok=True)
+    os.makedirs('logs', exist_ok=True)
+    os.makedirs(args.cache_dir, exist_ok=True)
+
     if args.quick:
         logger.warning('WARNING: Quick mode enabled. Using coarse BLS grid (frequency_factor=5000, 4 duration steps). Outputs will have _quick suffix.')
-        print('WARNING: Quick mode enabled. Using coarse BLS grid (frequency_factor=5000, 4 duration steps). Outputs will have _quick suffix.')
+        print('WARNING: Quick mode enabled. Using coarse BLS grid (frequency_factor=5000, 4 duration steps). Outputs will have _quick suffix.', flush=True)
         if args.output == 'extracted_features.csv':
             args.output = 'extracted_features_quick.csv'
+
+    base_out, ext_out = os.path.splitext(args.output)
+    failed_csv = f"{base_out}_failed{ext_out if ext_out else '.csv'}"
+    resume = not args.no_resume
+
+    if not resume:
+        if os.path.exists(args.output):
+            os.remove(args.output)
+        if os.path.exists(failed_csv):
+            os.remove(failed_csv)
+        npz_del = os.path.join(os.path.dirname(args.output) or 'outputs', 'folded_curves.npz')
+        if os.path.exists(npz_del):
+            os.remove(npz_del)
+
     def purge_cache():
         cache_dir = os.path.expanduser('~/.lightkurve/cache')
         if os.path.exists(cache_dir):
             shutil.rmtree(cache_dir, ignore_errors=True)
     if args.purge_lk_cache:
         purge_cache()
-    for item in os.listdir(args.raw_dir):
-        if item.startswith('tmp_'):
-            shutil.rmtree(os.path.join(args.raw_dir, item), ignore_errors=True)
 
     free_start = shutil.disk_usage(os.path.abspath('.')).free
-    with open('logs/disk_usage.log', 'a') as f:
+    with open(os.path.join('logs', 'disk_usage.log'), 'a', encoding='utf-8') as f:
         f.write(f'Start: {free_start / 1024**3:.2f} GB free\n')
 
     labels_df = fetch_labels(args.mission)
-    target_ids = []
-    
+
     if args.inject:
         all_tids = labels_df['target_id'].unique().tolist()
         quiet_stars = []
@@ -432,55 +491,132 @@ def main():
             return
         np.random.shuffle(quiet_stars)
         quiet_stars = quiet_stars[:args.injection_stars]
-        tasks = [(tid, args.mission, args.injections_per_star, args.min_free_gb, args.flatten_days, args.quick) for tid in quiet_stars]
-        all_results = []
-        all_features = []
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
-            futures = {executor.submit(run_injection, *t): t for t in tasks}
-            for future in concurrent.futures.as_completed(futures):
-                res, feats, tid, err = future.result()
-                if err:
-                    logger.error(f"Injection error on {tid}: {err}")
-                else:
-                    all_results.extend(res)
-                    all_features.extend(feats)
-        df_res = pd.DataFrame(all_results)
+
         inj_out = args.injection_output
         if args.quick and inj_out == 'outputs/injection_results.csv':
             inj_out = 'outputs/injection_results_quick.csv'
         elif args.quick and not inj_out.endswith('_quick.csv'):
             inj_out = inj_out.replace('.csv', '_quick.csv')
-        df_res.to_csv(inj_out, index=False)
+
         inj_feat_out = 'outputs/injection_features_quick.csv' if args.quick else 'outputs/injection_features.csv'
-        if all_features:
-            df_feat = pd.DataFrame(all_features)
-            df_feat.to_csv(inj_feat_out, index=False)
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        plt.figure(figsize=(10, 8))
-        df_res['log_p'] = np.log10(df_res['period_d'])
-        df_res['log_r'] = np.log10(df_res['radius_earth'])
-        p_bins = np.linspace(np.log10(0.8), np.log10(100), 10)
-        r_bins = np.linspace(np.log10(0.5), np.log10(15), 10)
-        rec_grid = np.zeros((9, 9))
-        tot_grid = np.zeros((9, 9))
-        for i in range(9):
-            for j in range(9):
-                mask = (df_res['log_p'] >= p_bins[i]) & (df_res['log_p'] < p_bins[i+1]) & (df_res['log_r'] >= r_bins[j]) & (df_res['log_r'] < r_bins[j+1])
-                tot = np.sum(mask)
-                rec = np.sum(df_res[mask]['recovered'])
-                tot_grid[j, i] = tot
-                rec_grid[j, i] = rec / tot if tot >= 5 else np.nan
-        sns.heatmap(rec_grid, cmap='viridis', xticklabels=np.round(10**p_bins[:-1], 1), yticklabels=np.round(10**r_bins[:-1], 1))
-        plt.xlabel('Period (days)')
-        plt.ylabel('Radius (Earth)')
-        title_str = 'Completeness Heatmap (Quick Mode)' if args.quick else 'Completeness Heatmap'
-        plt.title(title_str)
-        heatmap_out = 'outputs/figures/injection_heatmap_quick.png' if args.quick else 'outputs/figures/injection_heatmap.png'
-        plt.savefig(heatmap_out)
-        plt.close()
+
+        if not resume:
+            if os.path.exists(inj_out):
+                os.remove(inj_out)
+            if os.path.exists(inj_feat_out):
+                os.remove(inj_feat_out)
+
+        completed_inj_stars = set()
+        if resume and os.path.exists(inj_out) and os.path.getsize(inj_out) > 0:
+            try:
+                df_prev_inj = pd.read_csv(inj_out, usecols=['target_id'], dtype=str)
+                counts = df_prev_inj['target_id'].value_counts()
+                for c_tid, count_val in counts.items():
+                    if count_val >= args.injections_per_star:
+                        completed_inj_stars.add(str(c_tid))
+            except Exception:
+                pass
+
+        tasks = []
+        for tid in quiet_stars:
+            if str(tid) not in completed_inj_stars:
+                tasks.append((tid, args.mission, args.injections_per_star, args.min_free_gb, args.flatten_days, args.quick, args.cache_dir, args.star_timeout))
+
+        total_inj = len(tasks)
+        done_inj = 0
+        durations_inj = []
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
+            task_iter = iter(tasks)
+            active_futures = {}
+            for _ in range(min(args.workers * 2, total_inj)):
+                try:
+                    t = next(task_iter)
+                    f = executor.submit(run_injection, *t)
+                    active_futures[f] = (t[0], time.time())
+                except StopIteration:
+                    break
+
+            while active_futures:
+                done, _ = concurrent.futures.wait(active_futures.keys(), timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
+                now = time.time()
+                for f in done:
+                    tid_str, start_t = active_futures.pop(f)
+                    elapsed = now - start_t
+                    durations_inj.append(elapsed)
+                    done_inj += 1
+                    try:
+                        res, feats, r_tid, err = f.result()
+                    except Exception as exc:
+                        err = f"{type(exc).__name__}: {str(exc)}"
+                        res, feats = None, None
+
+                    if err:
+                        logger.error(f"Injection error on {tid_str}: {err}")
+                    else:
+                        if res:
+                            append_to_csv_flush(inj_out, pd.DataFrame(res))
+                        if feats:
+                            append_to_csv_flush(inj_feat_out, pd.DataFrame(feats))
+
+                    avg_t = sum(durations_inj) / len(durations_inj)
+                    rem_stars = total_inj - done_inj
+                    eta_sec = int((rem_stars * avg_t) / max(1, args.workers))
+                    eta_str = str(datetime.timedelta(seconds=eta_sec))
+                    p_msg = f"[{done_inj}/{total_inj}] Injection on {tid_str} ({elapsed:.1f}s) | Avg: {avg_t:.1f}s/star | ETA: {eta_str}"
+                    print(p_msg, flush=True)
+                    logger.info(p_msg)
+                    sys.stdout.flush()
+
+                    try:
+                        next_t = next(task_iter)
+                        next_f = executor.submit(run_injection, *next_t)
+                        active_futures[next_f] = (next_t[0], time.time())
+                    except StopIteration:
+                        pass
+
+                for f, (tid_str, start_t) in list(active_futures.items()):
+                    if now - start_t > args.star_timeout:
+                        active_futures.pop(f)
+                        f.cancel()
+                        done_inj += 1
+                        durations_inj.append(args.star_timeout)
+                        logger.error(f"Injection TIMEOUT on {tid_str}")
+                        try:
+                            next_t = next(task_iter)
+                            next_f = executor.submit(run_injection, *next_t)
+                            active_futures[next_f] = (next_t[0], time.time())
+                        except StopIteration:
+                            pass
+
+        if os.path.exists(inj_out) and os.path.getsize(inj_out) > 0:
+            df_res = pd.read_csv(inj_out)
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            plt.figure(figsize=(10, 8))
+            df_res['log_p'] = np.log10(df_res['period_d'])
+            df_res['log_r'] = np.log10(df_res['radius_earth'])
+            p_bins = np.linspace(np.log10(0.8), np.log10(100), 10)
+            r_bins = np.linspace(np.log10(0.5), np.log10(15), 10)
+            rec_grid = np.zeros((9, 9))
+            tot_grid = np.zeros((9, 9))
+            for i in range(9):
+                for j in range(9):
+                    mask = (df_res['log_p'] >= p_bins[i]) & (df_res['log_p'] < p_bins[i+1]) & (df_res['log_r'] >= r_bins[j]) & (df_res['log_r'] < r_bins[j+1])
+                    tot = np.sum(mask)
+                    rec = np.sum(df_res[mask]['recovered'])
+                    tot_grid[j, i] = tot
+                    rec_grid[j, i] = rec / tot if tot >= 5 else np.nan
+            sns.heatmap(rec_grid, cmap='viridis', xticklabels=np.round(10**p_bins[:-1], 1), yticklabels=np.round(10**r_bins[:-1], 1))
+            plt.xlabel('Period (days)')
+            plt.ylabel('Radius (Earth)')
+            title_str = 'Completeness Heatmap (Quick Mode)' if args.quick else 'Completeness Heatmap'
+            plt.title(title_str)
+            heatmap_out = 'outputs/figures/injection_heatmap_quick.png' if args.quick else 'outputs/figures/injection_heatmap.png'
+            plt.savefig(heatmap_out)
+            plt.close()
         return
 
+    target_ids = []
     if args.targets_file and os.path.exists(args.targets_file):
         target_ids = read_targets_file(args.targets_file)
     else:
@@ -489,75 +625,132 @@ def main():
     np.random.seed(42)
     np.random.shuffle(target_ids)
     target_ids = target_ids[:args.limit]
+
     processed_ids = set()
-    if os.path.exists(args.output):
-        df_exist = pd.read_csv(args.output)
-        processed_ids = set(df_exist['target_id'].astype(str))
+    if resume and os.path.exists(args.output) and os.path.getsize(args.output) > 0:
+        try:
+            df_exist = pd.read_csv(args.output, usecols=['target_id'], dtype=str)
+            processed_ids = set(df_exist['target_id'].dropna().astype(str))
+        except Exception:
+            pass
+
+    failed_attempts = {}
+    if resume and os.path.exists(failed_csv) and os.path.getsize(failed_csv) > 0:
+        try:
+            df_failed = pd.read_csv(failed_csv, dtype={'target_id': str, 'attempts': int})
+            for _, r in df_failed.iterrows():
+                tid_str = str(r['target_id'])
+                failed_attempts[tid_str] = max(failed_attempts.get(tid_str, 0), int(r.get('attempts', 1)))
+        except Exception:
+            pass
+
     tasks = []
     for tid in target_ids:
-        if str(tid) not in processed_ids:
-            rows = labels_df[labels_df['target_id'] == str(tid)].to_dict('records')
-            tasks.append((str(tid), args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick))
+        tid_str = str(tid)
+        if tid_str in processed_ids:
+            continue
+        if tid_str in failed_attempts and failed_attempts[tid_str] >= 2:
+            continue
+        rows = labels_df[labels_df['target_id'] == tid_str].to_dict('records')
+        tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout))
+
+    total_tasks = len(tasks)
+    completed_stars = 0
     success_count = 0
     skip_count = 0
-    total_dl_size = 0
-    processed_since_log = 0
-    all_features = []
-    all_curves = {}
+    durations = []
     match_stats = {'MATCHED': 0, 'HARMONIC': 0, 'UNMATCHED': 0}
+    npz_path = os.path.join(os.path.dirname(args.output) or 'outputs', 'folded_curves.npz')
+
+    logger.info(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= 2)} | To process: {total_tasks}")
+    print(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= 2)} | To process: {total_tasks}", flush=True)
+
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_single_star, *t): t for t in tasks}
-        for future in concurrent.futures.as_completed(futures):
-            feats, curves, tid, err, dl_size = future.result()
-            total_dl_size += dl_size
-            processed_since_log += 1
-            if err:
-                logger.error(f'Error on {tid}: {err}')
-                if err == 'Disk space below threshold':
-                    logger.error('Disk space critical. Stopping early.')
-                    for f in futures: f.cancel()
-                    break
-                skip_count += 1
-            else:
-                success_count += 1
-                if feats:
-                    all_features.extend(feats)
-                    all_curves.update(curves)
-                    for f in feats:
-                        match_stats[f['match_status']] = match_stats.get(f['match_status'], 0) + 1
-            if processed_since_log >= 25:
-                free_now = shutil.disk_usage(os.path.abspath('.')).free
-                deleted_size = total_dl_size if not args.keep_raw else 0
-                with open('logs/disk_usage.log', 'a') as f:
-                    f.write(f'Processed 25: DL {total_dl_size / 1024**2:.1f}MB, Del {deleted_size / 1024**2:.1f}MB, Free {free_now / 1024**3:.2f}GB\n')
-                total_dl_size = 0
-                processed_since_log = 0
-            if len(all_features) >= 10:
-                df_out = pd.DataFrame(all_features)
-                hdr = not os.path.exists(args.output)
-                df_out.to_csv(args.output, mode='a', header=hdr, index=False)
-                npz_path = 'outputs/folded_curves.npz'
-                if os.path.exists(npz_path):
-                    with np.load(npz_path) as data:
-                        existing = dict(data)
-                    existing.update(all_curves)
-                    np.savez_compressed(npz_path, **existing)
+        task_iter = iter(tasks)
+        active_futures = {}
+        for _ in range(min(args.workers * 2, total_tasks)):
+            try:
+                t = next(task_iter)
+                f = executor.submit(process_single_star, *t)
+                active_futures[f] = (t[0], time.time())
+            except StopIteration:
+                break
+
+        while active_futures:
+            done, _ = concurrent.futures.wait(active_futures.keys(), timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
+            now = time.time()
+            for f in done:
+                tid_str, start_t = active_futures.pop(f)
+                elapsed = now - start_t
+                durations.append(elapsed)
+                completed_stars += 1
+                try:
+                    feats, curves, r_tid, err, dl_size = f.result()
+                except Exception as exc:
+                    err = f"{type(exc).__name__}: {str(exc)}"
+                    feats, curves, dl_size = None, None, 0
+
+                if err:
+                    logger.error(f"Error on {tid_str}: {err}")
+                    log_failure(failed_csv, tid_str, err, failed_attempts)
+                    skip_count += 1
                 else:
-                    np.savez_compressed(npz_path, **all_curves)
-                all_features = []
-                all_curves = {}
-    if len(all_features) > 0:
-        df_out = pd.DataFrame(all_features)
-        hdr = not os.path.exists(args.output)
-        df_out.to_csv(args.output, mode='a', header=hdr, index=False)
-        npz_path = 'outputs/folded_curves.npz'
-        if os.path.exists(npz_path):
-            with np.load(npz_path) as data:
-                existing = dict(data)
-            existing.update(all_curves)
-            np.savez_compressed(npz_path, **existing)
-        else:
-            np.savez_compressed(npz_path, **all_curves)
+                    success_count += 1
+                    if feats:
+                        append_to_csv_flush(args.output, pd.DataFrame(feats))
+                        for item in feats:
+                            m_st = item.get('match_status', 'UNMATCHED')
+                            match_stats[m_st] = match_stats.get(m_st, 0) + 1
+                    if curves:
+                        if os.path.exists(npz_path):
+                            with np.load(npz_path) as data:
+                                existing = dict(data)
+                            existing.update(curves)
+                            np.savez_compressed(npz_path, **existing)
+                        else:
+                            np.savez_compressed(npz_path, **curves)
+
+                avg_time = sum(durations) / len(durations)
+                remaining_stars = total_tasks - completed_stars
+                est_rem_sec = int((remaining_stars * avg_time) / max(1, args.workers))
+                eta_str = str(datetime.timedelta(seconds=est_rem_sec))
+                progress_msg = f"[{completed_stars}/{total_tasks}] Star {tid_str} ({elapsed:.1f}s) | Avg: {avg_time:.1f}s/star | ETA: {eta_str}"
+                print(progress_msg, flush=True)
+                logger.info(progress_msg)
+                sys.stdout.flush()
+
+                try:
+                    next_t = next(task_iter)
+                    next_f = executor.submit(process_single_star, *next_t)
+                    active_futures[next_f] = (next_t[0], time.time())
+                except StopIteration:
+                    pass
+
+            for f, (tid_str, start_t) in list(active_futures.items()):
+                if now - start_t > args.star_timeout:
+                    active_futures.pop(f)
+                    f.cancel()
+                    err = f"TimeoutError: Exceeded {args.star_timeout}s"
+                    logger.error(f"Error on {tid_str}: {err}")
+                    log_failure(failed_csv, tid_str, err, failed_attempts)
+                    skip_count += 1
+                    completed_stars += 1
+                    durations.append(args.star_timeout)
+                    avg_time = sum(durations) / len(durations)
+                    remaining_stars = total_tasks - completed_stars
+                    est_rem_sec = int((remaining_stars * avg_time) / max(1, args.workers))
+                    eta_str = str(datetime.timedelta(seconds=est_rem_sec))
+                    progress_msg = f"[{completed_stars}/{total_tasks}] Star {tid_str} TIMEOUT ({args.star_timeout:.1f}s) | Avg: {avg_time:.1f}s/star | ETA: {eta_str}"
+                    print(progress_msg, flush=True)
+                    logger.info(progress_msg)
+                    sys.stdout.flush()
+                    try:
+                        next_t = next(task_iter)
+                        next_f = executor.submit(process_single_star, *next_t)
+                        active_futures[next_f] = (next_t[0], time.time())
+                    except StopIteration:
+                        pass
+
     logger.info(f'Total processed: {success_count}')
     logger.info(f'Total skipped: {skip_count}')
     logger.info(f'Match stats: {match_stats}')
