@@ -24,14 +24,16 @@ def main():
     parser.add_argument('--quick', action='store_true')
     parser.add_argument('--injection-stars', type=int, default=100)
     parser.add_argument('--injections-per-star', type=int, default=12)
-    parser.add_argument('--max-sectors', type=int, default=4)
+    parser.add_argument('--max-sectors', type=int, default=0, help='[DEBUG ONLY] Limit the number of sectors/quarters downloaded. Warning: alters baseline, features, and detection results; not for production training.')
     parser.add_argument('--no-resume', action='store_true')
     parser.add_argument('--star-timeout', type=float, default=1800.0)
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
+    parser.add_argument('--features-file', default='', help='[Optional] Precomputed features CSV to train/retrain ML model directly without feature extraction.')
     args = parser.parse_args()
 
     logical_cores = os.cpu_count() or 1
-    print(f"Detected CPU cores: {logical_cores} logical (physical core count requires external psutil; using os.cpu_count()). Default workers: {args.workers}.", flush=True)
+    cpu_msg = f"Detected CPU cores: {logical_cores} logical. Default workers: {args.workers}. Note: on systems with Hyper-Threading (SMT), the optimal number of worker processes for CPU-bound BLS computation is typically equal to the number of physical cores."
+    print(cpu_msg, flush=True)
 
     os.makedirs('outputs', exist_ok=True)
     os.makedirs(os.path.join('outputs', 'figures'), exist_ok=True)
@@ -50,7 +52,27 @@ def main():
     ml_script = os.path.join(base_dir, '2_ml_pipeline.py')
 
     if args.mode == 'train' or args.mode == 'retrain':
+        if args.features_file:
+            if not os.path.exists(args.features_file):
+                logging.error(f'Features file {args.features_file} not found')
+                sys.exit(1)
+            logging.info(f'Skipping extraction, running ML training directly on {args.features_file}')
+            cmd2 = [sys.executable, ml_script, '--mode', args.mode, '--input', args.features_file]
+            ret2 = subprocess.run(cmd2)
+            if ret2.returncode != 0:
+                logging.error('ML pipeline failed with code ' + str(ret2.returncode))
+                sys.exit(ret2.returncode)
+            return
+
         out_csv = args.output if args.output else ('extracted_features_quick.csv' if args.quick else 'extracted_features.csv')
+        if args.max_sectors > 0:
+            logging.warning(f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active. This alters baseline and features. Output files MUST NOT be used for primary model training!")
+            print(f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active. This alters baseline and features. Output files MUST NOT be used for primary model training!", flush=True)
+            if out_csv == 'extracted_features.csv':
+                out_csv = f'extracted_features_sec{args.max_sectors}.csv'
+            elif not f'_sec{args.max_sectors}' in out_csv and not '_sec' in out_csv:
+                b_o, e_o = os.path.splitext(out_csv)
+                out_csv = f"{b_o}_sec{args.max_sectors}{e_o if e_o else '.csv'}"
         cmd1 = [sys.executable, extractor_script, '--mission', args.mission, '--limit', str(args.limit), '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv, '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--max-sectors', str(args.max_sectors)]
         if args.targets_file: cmd1.extend(['--targets-file', args.targets_file])
         if args.keep_raw: cmd1.append('--keep-raw')
@@ -71,6 +93,14 @@ def main():
 
     elif args.mode == 'extract':
         out_csv = args.output if args.output else (os.path.join('outputs', 'tess_features.csv') if args.mission == 'TESS' else ('extracted_features_quick.csv' if args.quick else 'extracted_features.csv'))
+        if args.max_sectors > 0:
+            logging.warning(f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active. This alters baseline and features. Output files MUST NOT be used for primary model training!")
+            print(f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active. This alters baseline and features. Output files MUST NOT be used for primary model training!", flush=True)
+            if out_csv == 'extracted_features.csv':
+                out_csv = f'extracted_features_sec{args.max_sectors}.csv'
+            elif not f'_sec{args.max_sectors}' in out_csv and not '_sec' in out_csv:
+                b_o, e_o = os.path.splitext(out_csv)
+                out_csv = f"{b_o}_sec{args.max_sectors}{e_o if e_o else '.csv'}"
         cmd1 = [sys.executable, extractor_script, '--mission', args.mission, '--limit', str(args.limit), '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv, '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--max-sectors', str(args.max_sectors)]
         if args.targets_file: cmd1.extend(['--targets-file', args.targets_file])
         if args.keep_raw: cmd1.append('--keep-raw')

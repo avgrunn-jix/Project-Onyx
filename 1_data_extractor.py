@@ -122,6 +122,63 @@ def inject_transit(time, flux, period, epoch, rp_rs, duration):
         model[ing_mask] = 1.0 - depth * (dist / ingress)
     return flux * model
 
+def detrend_centroids(lc_col, flatten_days):
+    for seg in lc_col:
+        seg_times = np.asarray(seg.time.value, dtype=float)
+        dt_seg = np.nanmedian(np.diff(seg_times)) if len(seg_times) > 1 else 0.0
+        wl_seg = int(flatten_days / dt_seg) if dt_seg > 0 else 101
+        if wl_seg % 2 == 0: wl_seg -= 1
+        if wl_seg < 3: wl_seg = 3
+        if wl_seg > len(seg): wl_seg = len(seg) if len(seg) % 2 != 0 else len(seg) - 1
+
+        has_col = 'centroid_col' in seg.columns and not np.all(np.isnan(seg.centroid_col.value))
+        if has_col and wl_seg >= 3:
+            try:
+                c_dummy = lk.LightCurve(time=seg.time, flux=seg.centroid_col.value)
+                _, c_trend = c_dummy.flatten(window_length=wl_seg, polyorder=2, break_tolerance=5, return_trend=True)
+                seg['centroid_col_detrended'] = u.Quantity(seg.centroid_col.value - c_trend.flux.value, u.pixel)
+            except Exception:
+                seg['centroid_col_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
+        else:
+            seg['centroid_col_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
+
+        has_row = 'centroid_row' in seg.columns and not np.all(np.isnan(seg.centroid_row.value))
+        if has_row and wl_seg >= 3:
+            try:
+                r_dummy = lk.LightCurve(time=seg.time, flux=seg.centroid_row.value)
+                _, r_trend = r_dummy.flatten(window_length=wl_seg, polyorder=2, break_tolerance=5, return_trend=True)
+                seg['centroid_row_detrended'] = u.Quantity(seg.centroid_row.value - r_trend.flux.value, u.pixel)
+            except Exception:
+                seg['centroid_row_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
+        else:
+            seg['centroid_row_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
+
+def compute_centroid_shift(times, col_det, row_det, period, epoch, duration, mission):
+    phase_c = ((times - epoch + period / 2.0) % period) - period / 2.0
+    in_c_mask = np.abs(phase_c) <= (duration / 2.0)
+    out_c_mask = (np.abs(phase_c) > (duration / 2.0)) & (np.abs(phase_c) <= (3.0 * duration))
+    valid_c = ~np.isnan(col_det) & ~np.isnan(row_det)
+    in_c_pts = np.where(in_c_mask & valid_c)[0]
+    out_c_pts = np.where(out_c_mask & valid_c)[0]
+    if len(in_c_pts) >= 3 and len(out_c_pts) >= 3:
+        in_col_vals = col_det[in_c_pts]
+        out_col_vals = col_det[out_c_pts]
+        in_row_vals = row_det[in_c_pts]
+        out_row_vals = row_det[out_c_pts]
+        d_col = float(np.nanmean(in_col_vals) - np.nanmean(out_col_vals))
+        d_row = float(np.nanmean(in_row_vals) - np.nanmean(out_row_vals))
+        s_col = float(np.nanstd(out_col_vals, ddof=1))
+        s_row = float(np.nanstd(out_row_vals, ddof=1))
+        se_col = s_col / np.sqrt(len(in_c_pts)) if s_col > 0 else 0.0
+        se_row = s_row / np.sqrt(len(in_c_pts)) if s_row > 0 else 0.0
+        c_shift_col_sig = float(abs(d_col) / se_col) if se_col > 0 else 0.0
+        c_shift_row_sig = float(abs(d_row) / se_row) if se_row > 0 else 0.0
+        c_shift_tot_sig = float(np.sqrt(c_shift_col_sig**2 + c_shift_row_sig**2))
+        px_scale = 3.98 if mission == 'Kepler' else 21.0
+        c_shift_tot_arcsec = float(np.sqrt(d_col**2 + d_row**2) * px_scale)
+        return c_shift_col_sig, c_shift_row_sig, c_shift_tot_sig, c_shift_tot_arcsec
+    return np.nan, np.nan, np.nan, np.nan
+
 def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0):
     free_bytes = shutil.disk_usage(os.path.abspath('.')).free
     if free_bytes < min_free_gb * 1024**3: return None, tid, 'Disk space below threshold'
@@ -149,11 +206,14 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
             return None, tid, f'TimeoutError: Exceeded {star_timeout}s'
         lc_col = search_result.download_all(download_dir=tmp_dir)
         if lc_col is None or len(lc_col) == 0: return None, tid, 'No lightcurves found'
+        detrend_centroids(lc_col, flatten_days)
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
         lc = lc.remove_nans().remove_outliers(sigma=5)
         if len(lc) < 500: return None, tid, 'Not enough points'
         times = np.asarray(lc.time.value, dtype=float)
         flux_val = np.asarray(lc.flux.value, dtype=float)
+        col_det = np.asarray(lc['centroid_col_detrended'].value, dtype=float) if 'centroid_col_detrended' in lc.columns else np.full(len(lc), np.nan)
+        row_det = np.asarray(lc['centroid_row_detrended'].value, dtype=float) if 'centroid_row_detrended' in lc.columns else np.full(len(lc), np.nan)
         baseline = float(np.nanmax(times) - np.nanmin(times))
         star_radius = float(lc.meta.get('RADIUS', 1.0)) if lc.meta.get('RADIUS') is not None and not np.isnan(lc.meta.get('RADIUS')) else 1.0
         results = []
@@ -195,17 +255,26 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
                 recovered = 1
             elif (abs(ratio - 0.5) < 0.01 or abs(ratio - 2.0) < 0.01 or abs(ratio - 3.0) < 0.01) and epoch_match(rec_epoch, epoch, inj_period, duration):
                 alias_type = 'alias'
+            c_col_sig, c_row_sig, c_tot_sig, c_tot_arcsec = compute_centroid_shift(times, col_det, row_det, inj_period, epoch, duration, mission)
             res = {
                 'target_id': tid, 'period_d': inj_period, 'radius_earth': inj_rad_earth,
                 'depth_ppm': (rp_rs**2)*1e6, 'duration_d': duration, 'impact_b': b,
                 'recovered': recovered, 'alias_type': alias_type,
-                'bls_sde': sde, 'bls_depth_snr': snr, 'star_radius': star_radius
+                'bls_sde': sde, 'bls_depth_snr': snr, 'star_radius': star_radius,
+                'centroid_shift_col_sigma': c_col_sig,
+                'centroid_shift_row_sigma': c_row_sig,
+                'centroid_shift_total_sigma': c_tot_sig,
+                'centroid_shift_total_arcsec': c_tot_arcsec
             }
             results.append(res)
             if recovered:
                 rem_timeout = max(10.0, deadline - time.time())
                 feat, _, _, _, _, _ = process_single_star(tid, mission, [{'catalog_period': inj_period, 'label': 'INJECTED'}], True, 0, flatten_days, 1, quick_mode=quick_mode, cache_dir=cache_dir, star_timeout=rem_timeout, max_sectors=max_sectors)
                 if feat and len(feat) > 0:
+                    feat[0]['centroid_shift_col_sigma'] = c_col_sig
+                    feat[0]['centroid_shift_row_sigma'] = c_row_sig
+                    feat[0]['centroid_shift_total_sigma'] = c_tot_sig
+                    feat[0]['centroid_shift_total_arcsec'] = c_tot_arcsec
                     features.append(feat[0])
         return results, features, tid, None
     except Exception as e:
@@ -253,36 +322,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             return None, None, tid, 'No lightcurves found', dl_size, None
 
         t_stitch_start = time.time()
-        for seg in lc_col:
-            seg_times = np.asarray(seg.time.value, dtype=float)
-            dt_seg = np.nanmedian(np.diff(seg_times)) if len(seg_times) > 1 else 0.0
-            wl_seg = int(flatten_days / dt_seg) if dt_seg > 0 else 101
-            if wl_seg % 2 == 0: wl_seg -= 1
-            if wl_seg < 3: wl_seg = 3
-            if wl_seg > len(seg): wl_seg = len(seg) if len(seg) % 2 != 0 else len(seg) - 1
-
-            has_col = 'centroid_col' in seg.columns and not np.all(np.isnan(seg.centroid_col.value))
-            if has_col and wl_seg >= 3:
-                try:
-                    c_dummy = lk.LightCurve(time=seg.time, flux=seg.centroid_col.value)
-                    _, c_trend = c_dummy.flatten(window_length=wl_seg, polyorder=2, break_tolerance=5, return_trend=True)
-                    seg['centroid_col_detrended'] = u.Quantity(seg.centroid_col.value - c_trend.flux.value, u.pixel)
-                except Exception:
-                    seg['centroid_col_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
-            else:
-                seg['centroid_col_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
-
-            has_row = 'centroid_row' in seg.columns and not np.all(np.isnan(seg.centroid_row.value))
-            if has_row and wl_seg >= 3:
-                try:
-                    r_dummy = lk.LightCurve(time=seg.time, flux=seg.centroid_row.value)
-                    _, r_trend = r_dummy.flatten(window_length=wl_seg, polyorder=2, break_tolerance=5, return_trend=True)
-                    seg['centroid_row_detrended'] = u.Quantity(seg.centroid_row.value - r_trend.flux.value, u.pixel)
-                except Exception:
-                    seg['centroid_row_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
-            else:
-                seg['centroid_row_detrended'] = u.Quantity(np.full(len(seg), np.nan), u.pixel)
-
+        detrend_centroids(lc_col, flatten_days)
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
         lc = lc.remove_nans().remove_outliers(sigma=5)
         if len(lc) < 500:
@@ -330,6 +370,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         freq_factor = 5000 if quick_mode else 500
         dur_grid = np.linspace(0.05, 0.40, 4) if quick_mode else np.linspace(0.04, 0.45, 10)
         timing_bls = []
+        timing_bls_details = []
         timing_feats = []
 
         for sig_idx in range(max_signals):
@@ -340,13 +381,31 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             t_bls_start = time.time()
             bls = lc_search.to_periodogram(method='bls', minimum_period=0.5, maximum_period=max_p, frequency_factor=freq_factor, duration=dur_grid)
             t_bls_end = time.time()
-            timing_bls.append(t_bls_end - t_bls_start)
+            bls_iter_time = t_bls_end - t_bls_start
+            timing_bls.append(bls_iter_time)
             if len(bls.power) == 0 or np.isnan(bls.power).all():
+                timing_bls_details.append({
+                    'iter': sig_idx + 1,
+                    'time': bls_iter_time,
+                    'n_freqs': len(bls.frequency) if hasattr(bls, 'frequency') else 0,
+                    'period': 0.0,
+                    'sde': 0.0,
+                    'snr': 0.0
+                })
                 break
             power_values = np.array(bls.power.value)
             bls_power_peak = float(np.nanmax(power_values))
             bls_sde = float((bls_power_peak - np.nanmean(power_values)) / np.nanstd(power_values))
             bls_depth_snr = float(np.nanmax(bls.snr))
+            bls_period_d = float(bls.period_at_max_power.value)
+            timing_bls_details.append({
+                'iter': sig_idx + 1,
+                'time': bls_iter_time,
+                'n_freqs': len(bls.frequency),
+                'period': bls_period_d,
+                'sde': bls_sde,
+                'snr': bls_depth_snr
+            })
             if bls_sde < 7.0 or bls_depth_snr < 7.1:
                 break
             bls_period_d = float(bls.period_at_max_power.value)
@@ -434,33 +493,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
 
             col_det = np.asarray(lc_search['centroid_col_detrended'].value, dtype=float) if 'centroid_col_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
             row_det = np.asarray(lc_search['centroid_row_detrended'].value, dtype=float) if 'centroid_row_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
-            phase_c = ((times_search - bls_epoch + bls_period_d / 2.0) % bls_period_d) - bls_period_d / 2.0
-            in_c_mask = np.abs(phase_c) <= (bls_duration_d / 2.0)
-            out_c_mask = (np.abs(phase_c) > (bls_duration_d / 2.0)) & (np.abs(phase_c) <= (3.0 * bls_duration_d))
-            valid_c = ~np.isnan(col_det) & ~np.isnan(row_det)
-            in_c_pts = np.where(in_c_mask & valid_c)[0]
-            out_c_pts = np.where(out_c_mask & valid_c)[0]
-            if len(in_c_pts) >= 3 and len(out_c_pts) >= 3:
-                in_col_vals = col_det[in_c_pts]
-                out_col_vals = col_det[out_c_pts]
-                in_row_vals = row_det[in_c_pts]
-                out_row_vals = row_det[out_c_pts]
-                d_col = float(np.nanmean(in_col_vals) - np.nanmean(out_col_vals))
-                d_row = float(np.nanmean(in_row_vals) - np.nanmean(out_row_vals))
-                s_col = float(np.nanstd(out_col_vals, ddof=1))
-                s_row = float(np.nanstd(out_row_vals, ddof=1))
-                se_col = s_col / np.sqrt(len(in_c_pts)) if s_col > 0 else 0.0
-                se_row = s_row / np.sqrt(len(in_c_pts)) if s_row > 0 else 0.0
-                c_shift_col_sig = float(abs(d_col) / se_col) if se_col > 0 else 0.0
-                c_shift_row_sig = float(abs(d_row) / se_row) if se_row > 0 else 0.0
-                c_shift_tot_sig = float(np.sqrt(c_shift_col_sig**2 + c_shift_row_sig**2))
-                px_scale = 3.98 if mission == 'Kepler' else 21.0
-                c_shift_tot_arcsec = float(np.sqrt(d_col**2 + d_row**2) * px_scale)
-            else:
-                c_shift_col_sig = np.nan
-                c_shift_row_sig = np.nan
-                c_shift_tot_sig = np.nan
-                c_shift_tot_arcsec = np.nan
+            c_shift_col_sig, c_shift_row_sig, c_shift_tot_sig, c_shift_tot_arcsec = compute_centroid_shift(times_search, col_det, row_det, bls_period_d, bls_epoch, bls_duration_d, mission)
 
             feat = {
                 'signal_id': sig_id, 'target_id': tid, 'signal_index': sig_idx, 
@@ -500,6 +533,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'stitch': timing_stitch,
             'bls': sum(timing_bls),
             'bls_list': timing_bls,
+            'bls_details': timing_bls_details,
             'feats': sum(timing_feats),
             'total': timing_total
         }
@@ -549,12 +583,14 @@ def main():
     parser.add_argument('--no-resume', action='store_true')
     parser.add_argument('--star-timeout', type=float, default=1800.0)
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
-    parser.add_argument('--max-sectors', type=int, default=0)
+    parser.add_argument('--max-sectors', type=int, default=0, help='[DEBUG ONLY] Limit the number of sectors/quarters downloaded. Warning: alters baseline, features, and detection results; not for production training.')
     args = parser.parse_args()
     logger = setup_logger()
 
     logical_cores = os.cpu_count() or 1
-    print(f"Detected CPU cores: {logical_cores} logical (physical core count requires external psutil; using os.cpu_count()). Default workers: {args.workers}.", flush=True)
+    cpu_msg = f"Detected CPU cores: {logical_cores} logical. Default workers: {args.workers}. Note: on systems with Hyper-Threading (SMT), the optimal number of worker processes for CPU-bound BLS computation is typically equal to the number of physical cores."
+    print(cpu_msg, flush=True)
+    logger.info(cpu_msg)
 
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     os.makedirs('outputs', exist_ok=True)
@@ -569,6 +605,16 @@ def main():
         print('WARNING: Quick mode enabled. Using coarse BLS grid (frequency_factor=5000, 4 duration steps). Outputs will have _quick suffix.', flush=True)
         if args.output == 'extracted_features.csv':
             args.output = 'extracted_features_quick.csv'
+
+    if args.max_sectors > 0:
+        sec_warn = f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active. This alters the observation baseline, features, and detection results. Output files MUST NOT be used for primary model training!"
+        logger.warning(sec_warn)
+        print(sec_warn, flush=True)
+        if args.output == 'extracted_features.csv':
+            args.output = f'extracted_features_sec{args.max_sectors}.csv'
+        elif not f'_sec{args.max_sectors}' in args.output and not '_sec' in args.output:
+            b_o, e_o = os.path.splitext(args.output)
+            args.output = f"{b_o}_sec{args.max_sectors}{e_o if e_o else '.csv'}"
 
     base_out, ext_out = os.path.splitext(args.output)
     failed_csv = f"{base_out}_failed{ext_out if ext_out else '.csv'}"
@@ -630,6 +676,14 @@ def main():
             inj_out = 'outputs/injection_results_quick.csv'
         elif args.quick and not inj_out.endswith('_quick.csv'):
             inj_out = inj_out.replace('.csv', '_quick.csv')
+
+        if args.max_sectors > 0:
+            sec_warn = f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active in injection mode. This alters observation baselines. Outputs are for testing only!"
+            logger.warning(sec_warn)
+            print(sec_warn, flush=True)
+            if not f'_sec{args.max_sectors}' in inj_out:
+                b_i, e_i = os.path.splitext(inj_out)
+                inj_out = f"{b_i}_sec{args.max_sectors}{e_i if e_i else '.csv'}"
 
         os.makedirs(os.path.dirname(inj_out) or '.', exist_ok=True)
         inj_feat_out = 'outputs/injection_features_quick.csv' if args.quick else 'outputs/injection_features.csv'
@@ -839,6 +893,12 @@ def main():
                     if timings:
                         stage_timings.append(timings)
                         logger.info(f"Star {tid_str} breakdown: total={timings['total']:.1f}s | dl={timings['dl']:.1f}s | stitch={timings['stitch']:.1f}s | bls={timings['bls']:.1f}s | feats={timings['feats']:.1f}s")
+                        print(f"Star {tid_str} breakdown: total={timings['total']:.1f}s | dl={timings['dl']:.1f}s | stitch={timings['stitch']:.1f}s | bls={timings['bls']:.1f}s | feats={timings['feats']:.1f}s", flush=True)
+                        if 'bls_details' in timings and timings['bls_details']:
+                            for b_d in timings['bls_details']:
+                                detail_msg = f"  BLS iter {b_d['iter']}: {b_d['time']:.2f}s (grid: {b_d['n_freqs']} freqs) -> P={b_d.get('period', 0):.4f}d, SDE={b_d.get('sde', 0):.1f}, SNR={b_d.get('snr', 0):.1f}"
+                                logger.info(detail_msg)
+                                print(detail_msg, flush=True)
                     if feats:
                         append_to_csv_flush(args.output, pd.DataFrame(feats))
                         for item in feats:
