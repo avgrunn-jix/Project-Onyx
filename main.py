@@ -31,7 +31,7 @@ def main():
     parser.add_argument('--purge-lk-cache', action='store_true')
     parser.add_argument('--flatten-days', type=float, default=3.0)
     parser.add_argument('--max-signals', type=int, default=4)
-    parser.add_argument('--mode', default='train', choices=['train', 'predict', 'score-file', 'retrain', 'inject', 'transfer', 'extract'])
+    parser.add_argument('--mode', default='train', choices=['train', 'predict', 'score-file', 'retrain', 'inject', 'transfer', 'extract', 'demo'])
     parser.add_argument('--targets-file', default='')
     parser.add_argument('--input-file', default='')
     parser.add_argument('--output', default='')
@@ -46,6 +46,12 @@ def main():
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
     parser.add_argument('--features-file', default='', help='[Optional] Precomputed features CSV to train/retrain ML model directly without feature extraction.')
     parser.add_argument('--smoke-test', action='store_true', help='[TEST ONLY] Run pipeline in isolated smoke test mode, writing all outputs to outputs/_smoke_test/')
+    parser.add_argument('--marked-stars', type=int, default=120)
+    parser.add_argument('--unmarked-stars', type=int, default=120)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--showcase-star', default='4852528')
+    parser.add_argument('--unmarked-file', default='')
+    parser.add_argument('--output-dir', default='')
     args = parser.parse_args()
 
     logical_cores = os.cpu_count() or 1
@@ -182,6 +188,23 @@ def main():
         cmd = [sys.executable, ml_script, '--mode', 'transfer', '--train-csv', train_csv, '--test-csv', test_csv]
         if args.smoke_test: cmd.append('--smoke-test')
         subprocess.run(cmd)
+
+    elif args.mode == 'demo':
+        demo_script = os.path.join(base_dir, '3_demo_pipeline.py')
+        cmd = [sys.executable, demo_script, '--marked-stars', str(args.marked_stars), '--unmarked-stars', str(args.unmarked_stars), '--seed', str(args.seed), '--showcase-star', str(args.showcase_star), '--workers', str(args.workers), '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals)]
+        if args.output_dir:
+            cmd.extend(['--output-dir', args.output_dir])
+        if args.unmarked_file:
+            cmd.extend(['--unmarked-file', args.unmarked_file])
+        if args.quick:
+            cmd.append('--quick')
+        if args.smoke_test:
+            cmd.append('--smoke-test')
+        logging.info('Running demonstration pipeline')
+        ret = subprocess.run(cmd)
+        if ret.returncode != 0:
+            logging.error('Demo pipeline failed with code ' + str(ret.returncode))
+            sys.exit(ret.returncode)
 
 if __name__ == '__main__':
     main()
