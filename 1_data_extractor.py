@@ -535,7 +535,9 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'bls_list': timing_bls,
             'bls_details': timing_bls_details,
             'feats': sum(timing_feats),
-            'total': timing_total
+            'total': timing_total,
+            'n_quarters': len(lc_col) if 'lc_col' in locals() and lc_col is not None else 0,
+            'baseline_d': baseline_d if 'baseline_d' in locals() else 0.0
         }
         return features_list, curves_dict, tid, None, dl_size, timings
     except Exception as e:
@@ -629,6 +631,7 @@ def main():
 
     base_out, ext_out = os.path.splitext(args.output)
     failed_csv = f"{base_out}_failed{ext_out if ext_out else '.csv'}"
+    diag_csv = f"{base_out}_diagnostics{ext_out if ext_out else '.csv'}"
     resume = not args.no_resume
 
     if resume and os.path.exists(args.output) and os.path.getsize(args.output) > 0:
@@ -653,6 +656,8 @@ def main():
             os.remove(args.output)
         if os.path.exists(failed_csv):
             os.remove(failed_csv)
+        if os.path.exists(diag_csv):
+            os.remove(diag_csv)
         npz_del = os.path.join(os.path.dirname(args.output) or base_outputs, 'folded_curves.npz')
         if os.path.exists(npz_del):
             os.remove(npz_del)
@@ -832,12 +837,19 @@ def main():
     target_ids = target_ids[:args.limit]
 
     processed_ids = set()
-    if resume and os.path.exists(args.output) and os.path.getsize(args.output) > 0:
-        try:
-            df_exist = pd.read_csv(args.output, usecols=['target_id'], dtype=str)
-            processed_ids = set(df_exist['target_id'].dropna().astype(str))
-        except Exception:
-            pass
+    if resume:
+        if os.path.exists(diag_csv) and os.path.getsize(diag_csv) > 0:
+            try:
+                df_diag = pd.read_csv(diag_csv, usecols=['target_id', 'status'], dtype=str)
+                processed_ids.update(df_diag[df_diag['status'] == 'OK']['target_id'].dropna().astype(str))
+            except Exception:
+                pass
+        if os.path.exists(args.output) and os.path.getsize(args.output) > 0:
+            try:
+                df_exist = pd.read_csv(args.output, usecols=['target_id'], dtype=str)
+                processed_ids.update(df_exist['target_id'].dropna().astype(str))
+            except Exception:
+                pass
 
     failed_attempts = {}
     if resume and os.path.exists(failed_csv) and os.path.getsize(failed_csv) > 0:
@@ -900,8 +912,53 @@ def main():
                     logger.error(f"Error on {tid_str}: {err}")
                     log_failure(failed_csv, tid_str, err, failed_attempts)
                     skip_count += 1
+                    diag_row = {
+                        'target_id': tid_str,
+                        'n_quarters': 0,
+                        'baseline_d': 0.0,
+                        'signals_found': 0,
+                        'matched_count': 0,
+                        'harmonic_count': 0,
+                        'unmatched_count': 0,
+                        'status': f'FAILED: {err}',
+                        'max_sde': 0.0,
+                        'max_snr': 0.0,
+                        'time_dl_s': 0.0,
+                        'time_stitch_s': 0.0,
+                        'time_bls_s': 0.0,
+                        'time_feats_s': 0.0,
+                        'time_total_s': round(elapsed, 2)
+                    }
+                    append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                 else:
                     success_count += 1
+                    n_q = timings.get('n_quarters', 0) if timings else 0
+                    b_d = timings.get('baseline_d', 0.0) if timings else 0.0
+                    n_sig = len(feats) if feats else 0
+                    m_cnt = sum(1 for item in feats if item.get('match_status') == 'MATCHED') if feats else 0
+                    h_cnt = sum(1 for item in feats if item.get('match_status') == 'HARMONIC') if feats else 0
+                    u_cnt = sum(1 for item in feats if item.get('match_status') == 'UNMATCHED') if feats else 0
+                    b_details = timings.get('bls_details', []) if timings else []
+                    m_sde = max([d.get('sde', 0.0) for d in b_details]) if b_details else 0.0
+                    m_snr = max([d.get('snr', 0.0) for d in b_details]) if b_details else 0.0
+                    diag_row = {
+                        'target_id': tid_str,
+                        'n_quarters': n_q,
+                        'baseline_d': round(b_d, 2),
+                        'signals_found': n_sig,
+                        'matched_count': m_cnt,
+                        'harmonic_count': h_cnt,
+                        'unmatched_count': u_cnt,
+                        'status': 'OK',
+                        'max_sde': round(m_sde, 2),
+                        'max_snr': round(m_snr, 2),
+                        'time_dl_s': round(timings['dl'], 2) if timings else 0.0,
+                        'time_stitch_s': round(timings['stitch'], 2) if timings else 0.0,
+                        'time_bls_s': round(timings['bls'], 2) if timings else 0.0,
+                        'time_feats_s': round(timings['feats'], 2) if timings else 0.0,
+                        'time_total_s': round(timings['total'], 2) if timings else round(elapsed, 2)
+                    }
+                    append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     if timings:
                         stage_timings.append(timings)
                         logger.info(f"Star {tid_str} breakdown: total={timings['total']:.1f}s | dl={timings['dl']:.1f}s | stitch={timings['stitch']:.1f}s | bls={timings['bls']:.1f}s | feats={timings['feats']:.1f}s")
