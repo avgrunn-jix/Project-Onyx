@@ -24,6 +24,7 @@ outputs/explanations/*
 logs/*
 !logs/.gitkeep
 outputs/_smoke_test/
+legacy/
 .lightkurve-cache/
 .DS_Store
 Thumbs.db

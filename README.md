@@ -89,13 +89,15 @@ Onyx operates in several distinct modes via `main.py --mode <MODE>`:
 * **Режим `--mode extract`:** Позволяет отделить длительное фотометрическое извлечение признаков от обучения моделей.
 * **Отладочный флаг `--max-sectors`:** Предназначен исключительно для локальной отладки и тестирования кода. Он искусственно обрезает наблюдательный интервал (baseline), искажает признаки и астрофизические параметры сигналов. Файлы, полученные с данным флагом, **нельзя использовать для обучения основной модели** (при его указании скрипт выводит предупреждение и автоматически добавляет к имени файла суффикс `_sec{N}`).
 * **Изолированный тестовый режим (`--smoke-test`):** Все результаты тестовых прогонов направляются в отдельную папку `outputs/_smoke_test/`, исключённую из Git, не затрагивая основные рабочие артефакты в `outputs/`.
-* **Показательные примеры и демонстрации:** В качестве демонстрационной системы со статусом `CONFIRMED` используется **Kepler-80 (KIC 4852528 / KOI-500)** — 5-планетная подтверждённая резонансная система. Звезда KIC 10801249 (KOI-4611) является затменной ложной тревогой (`FALSE POSITIVE`, `koi_fpflag_ec=1`) и для демонстрации экзопланетных открытий не используется.
+* **Показательные примеры и демонстрации:** Демонстрационный режим добавляется; **Kepler-80 (KIC 4852528, KOI-500, подтверждённая многопланетная система)** выбрана показательной звездой. Звезда KIC 10801249 (KOI-4611) является затменной ложной тревогой (`FALSE POSITIVE`, `koi_fpflag_ec=1`) и для демонстрации экзопланетных открытий не используется.
 
 ## Output Artifacts
 
 | File / Folder | Description |
 |---|---|
-| `extracted_features.csv` | Main feature matrix. Excluded from Git. |
+| `extracted_features.csv` | Main feature matrix produced by extractor on real stars. Excluded from Git. |
+| `test_features.csv` | Синтетический тестовый файл (случайные числа). Нужен исключительно для проверки работоспособности кода (`--smoke-test`) и никаких научных результатов не даёт. |
+| `legacy/` | Архив устаревших файлов (включая `legacy_mixed_features.csv`). Исключён из Git. |
 | `outputs/models/` | Serialized `pipeline_model.joblib`. |
 | `outputs/figures/` | All plots: ROC, SHAP, Coverage, Transfer KS, Heatmap, Anomalies. Excluded from Git. |
 | `outputs/predictions.csv` | Test set predictions with SHAP top factors. |
@@ -103,7 +105,10 @@ Onyx operates in several distinct modes via `main.py --mode <MODE>`:
 | `outputs/scored_file.csv` | Default output from `score-file` mode. |
 | `outputs/injection_results.csv` | Transit injection completeness table (or `_quick.csv`). |
 | `outputs/folded_curves.npz` | Compressed arrays of phase-folded curves (201 bins) for all signals. Excluded from Git. |
-| `outputs/metrics.json` | Final performance metrics. |
+| `outputs/demo/` | Артефакты демонстрационного режима (`--mode demo`). |
+
+> [!NOTE]
+> Метрики и графики из ранних коммитов истории репозитория (включая коммит `7f62b38`: Accuracy 0.678, ROC-AUC 0.750) относились к черновым запускам на синтетических/пробных данных и в актуальном проекте не используются. Папка `outputs/` очищена перед боевым прогоном.
 
 ## Limitations & Threats to Validity
 * **Coarse Centroid Shift vs Pixel-Level PRF:** Onyx вычисляет смещение центроида во время транзита по столбцам координат центра светового пятна (`centroid_col`, `centroid_row`), выровненным по каждому кварталу/сектору отдельно и переведённым в угловые секунды (Kepler ~3.98", TESS ~21.0"). Это позволяет выявлять фоновые затменные двойные (BEB), однако не заменяет пиксельную диагностику PRF по файлам TPF. Для слабых звёзд и мелких транзитов фотометрический центроид подвержен шуму. В режиме синтетического вшивания (`inject`) центроидные признаки рассчитываются по реальному выровненному центроиду звезды в моменты вшитых транзитов (что сохраняет естественный инструментальный шум и исключает искусственное завышение полноты).
