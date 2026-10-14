@@ -584,6 +584,7 @@ def main():
     parser.add_argument('--star-timeout', type=float, default=1800.0)
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
     parser.add_argument('--max-sectors', type=int, default=0, help='[DEBUG ONLY] Limit the number of sectors/quarters downloaded. Warning: alters baseline, features, and detection results; not for production training.')
+    parser.add_argument('--smoke-test', action='store_true', help='[TEST ONLY] Run extractor in isolated smoke test mode, writing outputs to outputs/_smoke_test/')
     args = parser.parse_args()
     logger = setup_logger()
 
@@ -592,27 +593,37 @@ def main():
     print(cpu_msg, flush=True)
     logger.info(cpu_msg)
 
+    base_outputs = os.path.join('outputs', '_smoke_test') if args.smoke_test else 'outputs'
+    if args.smoke_test:
+        if args.output == 'extracted_features.csv':
+            args.output = os.path.join(base_outputs, 'extracted_features.csv')
+        elif not '_smoke_test' in args.output:
+            args.output = os.path.join(base_outputs, os.path.basename(args.output))
+        if args.injection_output == 'outputs/injection_results.csv':
+            args.injection_output = os.path.join(base_outputs, 'injection_results.csv')
+        elif not '_smoke_test' in args.injection_output:
+            args.injection_output = os.path.join(base_outputs, os.path.basename(args.injection_output))
+
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
-    os.makedirs('outputs', exist_ok=True)
-    os.makedirs(os.path.join('outputs', 'figures'), exist_ok=True)
-    os.makedirs(os.path.join('outputs', 'models'), exist_ok=True)
-    os.makedirs(os.path.join('outputs', 'explanations'), exist_ok=True)
+    os.makedirs(base_outputs, exist_ok=True)
+    os.makedirs(os.path.join(base_outputs, 'figures'), exist_ok=True)
+    os.makedirs(os.path.join(base_outputs, 'models'), exist_ok=True)
+    os.makedirs(os.path.join(base_outputs, 'explanations'), exist_ok=True)
     os.makedirs('logs', exist_ok=True)
     os.makedirs(args.cache_dir, exist_ok=True)
 
     if args.quick:
         logger.warning('WARNING: Quick mode enabled. Using coarse BLS grid (frequency_factor=5000, 4 duration steps). Outputs will have _quick suffix.')
         print('WARNING: Quick mode enabled. Using coarse BLS grid (frequency_factor=5000, 4 duration steps). Outputs will have _quick suffix.', flush=True)
-        if args.output == 'extracted_features.csv':
-            args.output = 'extracted_features_quick.csv'
+        if not '_quick' in args.output:
+            b_o, e_o = os.path.splitext(args.output)
+            args.output = f"{b_o}_quick{e_o if e_o else '.csv'}"
 
     if args.max_sectors > 0:
         sec_warn = f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active. This alters the observation baseline, features, and detection results. Output files MUST NOT be used for primary model training!"
         logger.warning(sec_warn)
         print(sec_warn, flush=True)
-        if args.output == 'extracted_features.csv':
-            args.output = f'extracted_features_sec{args.max_sectors}.csv'
-        elif not f'_sec{args.max_sectors}' in args.output and not '_sec' in args.output:
+        if not f'_sec{args.max_sectors}' in args.output and not '_sec' in args.output:
             b_o, e_o = os.path.splitext(args.output)
             args.output = f"{b_o}_sec{args.max_sectors}{e_o if e_o else '.csv'}"
 
@@ -642,7 +653,7 @@ def main():
             os.remove(args.output)
         if os.path.exists(failed_csv):
             os.remove(failed_csv)
-        npz_del = os.path.join(os.path.dirname(args.output) or 'outputs', 'folded_curves.npz')
+        npz_del = os.path.join(os.path.dirname(args.output) or base_outputs, 'folded_curves.npz')
         if os.path.exists(npz_del):
             os.remove(npz_del)
 
@@ -672,21 +683,21 @@ def main():
         quiet_stars = quiet_stars[:args.injection_stars]
 
         inj_out = args.injection_output
-        if args.quick and inj_out == 'outputs/injection_results.csv':
-            inj_out = 'outputs/injection_results_quick.csv'
-        elif args.quick and not inj_out.endswith('_quick.csv'):
-            inj_out = inj_out.replace('.csv', '_quick.csv')
+        if args.quick and not '_quick' in inj_out:
+            b_i, e_i = os.path.splitext(inj_out)
+            inj_out = f"{b_i}_quick{e_i if e_i else '.csv'}"
 
         if args.max_sectors > 0:
             sec_warn = f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active in injection mode. This alters observation baselines. Outputs are for testing only!"
             logger.warning(sec_warn)
             print(sec_warn, flush=True)
-            if not f'_sec{args.max_sectors}' in inj_out:
+            if not f'_sec{args.max_sectors}' in inj_out and not '_sec' in inj_out:
                 b_i, e_i = os.path.splitext(inj_out)
                 inj_out = f"{b_i}_sec{args.max_sectors}{e_i if e_i else '.csv'}"
 
         os.makedirs(os.path.dirname(inj_out) or '.', exist_ok=True)
-        inj_feat_out = 'outputs/injection_features_quick.csv' if args.quick else 'outputs/injection_features.csv'
+        inj_feat_name = 'injection_features_quick.csv' if args.quick else 'injection_features.csv'
+        inj_feat_out = os.path.join(base_outputs, inj_feat_name)
 
         if not resume:
             if os.path.exists(inj_out):
@@ -804,7 +815,8 @@ def main():
             plt.ylabel('Radius (Earth)')
             title_str = 'Completeness Heatmap (Quick Mode)' if args.quick else 'Completeness Heatmap'
             plt.title(title_str)
-            heatmap_out = 'outputs/figures/injection_heatmap_quick.png' if args.quick else 'outputs/figures/injection_heatmap.png'
+            heatmap_name = 'injection_heatmap_quick.png' if args.quick else 'injection_heatmap.png'
+            heatmap_out = os.path.join(base_outputs, 'figures', heatmap_name)
             plt.savefig(heatmap_out)
             plt.close()
         return
@@ -854,7 +866,7 @@ def main():
     durations = []
     stage_timings = []
     match_stats = {'MATCHED': 0, 'HARMONIC': 0, 'UNMATCHED': 0}
-    npz_path = os.path.join(os.path.dirname(args.output) or 'outputs', 'folded_curves.npz')
+    npz_path = os.path.join(os.path.dirname(args.output) or base_outputs, 'folded_curves.npz')
 
     logger.info(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= 2)} | To process: {total_tasks}")
     print(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= 2)} | To process: {total_tasks}", flush=True)

@@ -58,6 +58,7 @@ def get_explanations(df, X_scaled, explainer, feature_cols, top_n=3):
     return factors
 
 def run_ml(args, logger, is_retrain=False):
+    base_outputs = getattr(args, 'base_outputs', os.path.join('outputs', '_smoke_test') if getattr(args, 'smoke_test', False) else 'outputs')
     if not os.path.exists(args.input):
         logger.error(f'Input file {args.input} not found')
         return
@@ -111,11 +112,11 @@ def run_ml(args, logger, is_retrain=False):
     shap_values = explainer.shap_values(X_test_scaled)
     plt.figure(figsize=(10, 8))
     shap.summary_plot(shap_values, X_test_scaled, feature_names=feature_cols, show=False)
-    plt.savefig(os.path.join('outputs', 'figures', 'shap_summary.png'), bbox_inches='tight')
+    plt.savefig(os.path.join(base_outputs, 'figures', 'shap_summary.png'), bbox_inches='tight')
     plt.close()
     plt.figure(figsize=(10, 8))
     shap.summary_plot(shap_values, X_test_scaled, feature_names=feature_cols, plot_type='bar', show=False)
-    plt.savefig(os.path.join('outputs', 'figures', 'shap_bar.png'), bbox_inches='tight')
+    plt.savefig(os.path.join(base_outputs, 'figures', 'shap_bar.png'), bbox_inches='tight')
     plt.close()
     ensemble_models = []
     n_models = 20
@@ -171,7 +172,7 @@ def run_ml(args, logger, is_retrain=False):
     plt.plot(covs, precs, marker='o')
     plt.xlabel('Coverage')
     plt.ylabel('Precision on Accepted')
-    plt.savefig(os.path.join('outputs', 'figures', 'coverage_vs_precision.png'))
+    plt.savefig(os.path.join(base_outputs, 'figures', 'coverage_vs_precision.png'))
     plt.close()
     df_fp = df_matched[df_matched['target_bin'] == 0].copy()
     fp_flags = ['koi_fpflag_nt', 'koi_fpflag_ss', 'koi_fpflag_co', 'koi_fpflag_ec']
@@ -193,7 +194,7 @@ def run_ml(args, logger, is_retrain=False):
                     }
                 else:
                     logger.info(f'Skipping {flag}: not enough positive/negative examples ({np.sum(y_flag)})')
-    with open(os.path.join('outputs', 'metrics_fp_reasons.json'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(base_outputs, 'metrics_fp_reasons.json'), 'w', encoding='utf-8') as f:
         json.dump(fp_metrics, f, indent=4)
     joblib.dump({
         'scale_pipe': scale_pipe,
@@ -204,7 +205,7 @@ def run_ml(args, logger, is_retrain=False):
         'feature_cols': feature_cols,
         'thresholds': {'t_high': t_high, 't_low': t_low, 's_max': s_max},
         'explainer': explainer
-    }, os.path.join('outputs', 'models', 'pipeline_model.joblib'))
+    }, os.path.join(base_outputs, 'models', 'pipeline_model.joblib'))
     df_test = df_matched.iloc[test_idx].copy()
     df_test['p_mean'] = test_mean
     df_test['p_std'] = test_std
@@ -219,13 +220,13 @@ def run_ml(args, logger, is_retrain=False):
             return 'UNKNOWN'
         df_test['likely_reason'] = df_test.apply(get_likely, axis=1)
     df_test['top_factors'] = get_explanations(df_test, X_test_scaled, explainer, feature_cols)
-    df_test.to_csv(os.path.join('outputs', 'predictions.csv'), index=False, encoding='utf-8')
+    df_test.to_csv(os.path.join(base_outputs, 'predictions.csv'), index=False, encoding='utf-8')
     metrics = {
         'ROC-AUC': float(roc_auc_score(y_test, test_mean)),
         'Coverage': float(cov),
         'Precision_on_Accepted': float(acc_prec)
     }
-    with open(os.path.join('outputs', 'metrics.json'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(base_outputs, 'metrics.json'), 'w', encoding='utf-8') as f:
         json.dump(metrics, f, indent=4)
     logger.info('Running anomaly detection on all signals (Step J)...')
     try:
@@ -252,8 +253,10 @@ def run_ml(args, logger, is_retrain=False):
         intersection = np.intersect1d(iso_top, lof_top)
         anomaly_idx = [i for i in intersection if decision_all[i] not in ['CANDIDATE', 'FALSE_POSITIVE']]
         df_anomalies = df_anom.iloc[anomaly_idx].copy()
-        df_anomalies.to_csv(os.path.join('outputs', 'anomalies.csv'), index=False, encoding='utf-8')
-        npz_path = os.path.join('outputs', 'folded_curves.npz')
+        df_anomalies.to_csv(os.path.join(base_outputs, 'anomalies.csv'), index=False, encoding='utf-8')
+        npz_path = os.path.join(base_outputs, 'folded_curves.npz')
+        if not os.path.exists(npz_path) and getattr(args, 'smoke_test', False):
+            npz_path = os.path.join('outputs', 'folded_curves.npz')
         if os.path.exists(npz_path) and len(df_anomalies) > 0:
             npz = np.load(npz_path)
             fig, axes = plt.subplots(4, 5, figsize=(20, 16))
@@ -269,13 +272,14 @@ def run_ml(args, logger, is_retrain=False):
                     axes[plot_idx].set_title(sid)
                     plot_idx += 1
             plt.tight_layout()
-            plt.savefig(os.path.join('outputs', 'figures', 'anomalies_grid.png'))
+            plt.savefig(os.path.join(base_outputs, 'figures', 'anomalies_grid.png'))
             plt.close()
     except Exception as e:
         logger.error(f'Anomaly detection failed: {e}')
     logger.info('Training completed.')
 
 def transfer_mode(args, logger):
+    base_outputs = getattr(args, 'base_outputs', os.path.join('outputs', '_smoke_test') if getattr(args, 'smoke_test', False) else 'outputs')
     if not args.train_csv or not args.test_csv:
         logger.error('--train-csv and --test-csv required for transfer mode')
         return
@@ -303,7 +307,7 @@ def transfer_mode(args, logger):
     plt.barh(names, vals)
     plt.gca().invert_yaxis()
     plt.title('KS Shift by Feature (Kepler vs TESS)')
-    plt.savefig(os.path.join('outputs', 'figures', 'ks_shift_by_feature.png'))
+    plt.savefig(os.path.join(base_outputs, 'figures', 'ks_shift_by_feature.png'))
     plt.close()
     robust_exclude = ['baseline_d', 'transit_count', 'gap_fraction', 'bls_epoch', 'transit_depth_scatter_ppm']
     robust_cols = [c for c in feature_cols if c not in robust_exclude]
@@ -338,7 +342,7 @@ def transfer_mode(args, logger):
         'T2_Kepler_TESS_Robust': float(auc2),
         'T3_TESS_CV': float(auc3)
     }
-    with open(os.path.join('outputs', 'metrics_transfer.json'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(base_outputs, 'metrics_transfer.json'), 'w', encoding='utf-8') as f:
         json.dump(res, f, indent=4)
     from sklearn.metrics import roc_curve
     fpr1, tpr1, _ = roc_curve(y_test, preds1)
@@ -349,12 +353,15 @@ def transfer_mode(args, logger):
     plt.plot(fpr2, tpr2, label=f'T2 (Robust): {auc2:.3f}')
     plt.plot(fpr3, tpr3, label=f'T3 (CV): {auc3:.3f}')
     plt.legend()
-    plt.savefig(os.path.join('outputs', 'figures', 'transfer_roc.png'))
+    plt.savefig(os.path.join(base_outputs, 'figures', 'transfer_roc.png'))
     plt.close()
     logger.info('Transfer experiments completed.')
 
 def predict_mode(args, logger):
-    model_path = os.path.join('outputs', 'models', 'pipeline_model.joblib')
+    base_outputs = getattr(args, 'base_outputs', os.path.join('outputs', '_smoke_test') if getattr(args, 'smoke_test', False) else 'outputs')
+    model_path = os.path.join(base_outputs, 'models', 'pipeline_model.joblib')
+    if not os.path.exists(model_path) and getattr(args, 'smoke_test', False):
+        model_path = os.path.join('outputs', 'models', 'pipeline_model.joblib')
     if not os.path.exists(model_path):
         logger.error(f'No trained model found at {model_path}! Run --mode train first.')
         return
@@ -401,9 +408,11 @@ def predict_mode(args, logger):
     out_file = args.output
     if not out_file:
         if args.mode == 'score-file':
-            out_file = os.path.join('outputs', 'scored_file.csv')
+            out_file = os.path.join(base_outputs, 'scored_file.csv')
         else:
-            out_file = os.path.join('outputs', 'new_candidates.csv')
+            out_file = os.path.join(base_outputs, 'new_candidates.csv')
+    elif getattr(args, 'smoke_test', False) and not '_smoke_test' in out_file:
+        out_file = os.path.join(base_outputs, os.path.basename(out_file))
     os.makedirs(os.path.dirname(out_file) or '.', exist_ok=True)
     df.to_csv(out_file, index=False, encoding='utf-8')
     logger.info(f'Prediction completed. Saved to {out_file}')
@@ -418,11 +427,15 @@ def main():
     parser.add_argument('--train-csv', default='')
     parser.add_argument('--test-csv', default='')
     parser.add_argument('--mode', default='train', choices=['train', 'predict', 'score-file', 'retrain', 'transfer'])
+    parser.add_argument('--smoke-test', action='store_true', help='[TEST ONLY] Run pipeline in isolated smoke test mode, writing outputs to outputs/_smoke_test/')
     args = parser.parse_args()
     logger = setup_logger()
-    os.makedirs(os.path.join('outputs', 'models'), exist_ok=True)
-    os.makedirs(os.path.join('outputs', 'figures'), exist_ok=True)
-    os.makedirs(os.path.join('outputs', 'explanations'), exist_ok=True)
+    base_outputs = os.path.join('outputs', '_smoke_test') if args.smoke_test else 'outputs'
+    os.makedirs(base_outputs, exist_ok=True)
+    os.makedirs(os.path.join(base_outputs, 'models'), exist_ok=True)
+    os.makedirs(os.path.join(base_outputs, 'figures'), exist_ok=True)
+    os.makedirs(os.path.join(base_outputs, 'explanations'), exist_ok=True)
+    args.base_outputs = base_outputs
     if args.mode in ['train', 'retrain']:
         run_ml(args, logger, is_retrain=(args.mode == 'retrain'))
     elif args.mode in ['predict', 'score-file']:

@@ -23,6 +23,7 @@ outputs/explanations/*
 !outputs/explanations/.gitkeep
 logs/*
 !logs/.gitkeep
+outputs/_smoke_test/
 .lightkurve-cache/
 .DS_Store
 Thumbs.db
