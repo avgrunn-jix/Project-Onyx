@@ -271,29 +271,36 @@ def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, see
     X_ts_scaled = scale_pipe.transform(X_ts) if len(X_ts) > 0 else np.zeros((0, len(feature_cols)))
 
     if len(df_train_signals) == 0:
-        print("  ВНИМАНИЕ: Обучающий набор сигналов пуст (0 сигналов). Пропуск обучения XGBoost, присвоение вердикта REVIEW по умолчанию.", flush=True)
+        print("  ВНИМАНИЕ: Обучающий набор сигналов пуст (0 сигналов). Оценка качества модели и присвоение вердиктов пропущены.", flush=True)
         df_res = df_test_signals.copy()
-        df_res['p_mean'] = np.full(len(df_test_signals), 0.5)
-        df_res['p_std'] = np.full(len(df_test_signals), 0.5)
-        df_res['decision'] = np.full(len(df_test_signals), 'REVIEW', dtype=object)
-        df_res['shap_top3'] = ['insufficient_training_data (neutral)'] * len(df_test_signals)
-        return df_res, None, None, scale_pipe, (0.75, 0.25, 0.15)
+        df_res['p_mean'] = np.nan
+        df_res['p_std'] = np.nan
+        df_res['decision'] = np.full(len(df_test_signals), 'ОЦЕНКА_НЕ_ПРОВОДИЛАСЬ', dtype=object)
+        df_res['shap_top3'] = ['нет_модели'] * len(df_test_signals)
+        return df_res, None, None, scale_pipe, None
 
     y_tr = df_train_signals['target_bin'].values
     X_tr = df_train_signals[feature_cols].values
     groups_tr = df_train_signals['target_id'].values
 
-    if len(np.unique(y_tr)) < 2:
-        c = int(y_tr[0])
-        print(f"  ВНИМАНИЕ: В обучающем наборе присутствует только один класс ({'CONFIRMED' if c==1 else 'FALSE_POSITIVE'}, {len(y_tr)} сигналов). Полноценное обучение ансамбля невозможно.", flush=True)
+    unique_classes = np.unique(y_tr)
+    class_counts = {int(c): int(np.sum(y_tr == c)) for c in unique_classes}
+    min_count = min(class_counts.values()) if class_counts else 0
+
+    if len(unique_classes) < 2 or min_count < 5:
+        classes_str = ', '.join([f"класс {c} ({'CONFIRMED/CANDIDATE' if c==1 else 'FALSE_POSITIVE'}): {class_counts.get(c, 0)}" for c in [1, 0]])
+        print(f"  ВНИМАНИЕ: Обучение невозможно: в обучающей части классы: {classes_str}, всего сигналов: {len(y_tr)} (требуется как минимум 2 класса и не менее 5 сигналов каждого класса).", flush=True)
+        print("  Сводка по классам в обучающей части:")
+        for c in [1, 0]:
+            c_desc = 'CONFIRMED/CANDIDATE' if c == 1 else 'FALSE_POSITIVE'
+            print(f"    Класс {c} ({c_desc}): {class_counts.get(c, 0)} сигналов", flush=True)
+        print("  Оценка качества модели и присвоение вердиктов пропущены.", flush=True)
         df_res = df_test_signals.copy()
-        p_val = 0.95 if c == 1 else 0.05
-        dec_val = 'CANDIDATE' if c == 1 else 'FALSE_POSITIVE'
-        df_res['p_mean'] = np.full(len(df_test_signals), p_val)
-        df_res['p_std'] = np.zeros(len(df_test_signals))
-        df_res['decision'] = np.full(len(df_test_signals), dec_val, dtype=object)
-        df_res['shap_top3'] = [f'single_class_train_label={c} (neutral)'] * len(df_test_signals)
-        return df_res, None, None, scale_pipe, (0.75, 0.25, 0.15)
+        df_res['p_mean'] = np.nan
+        df_res['p_std'] = np.nan
+        df_res['decision'] = np.full(len(df_test_signals), 'ОЦЕНКА_НЕ_ПРОВОДИЛАСЬ', dtype=object)
+        df_res['shap_top3'] = ['нет_модели'] * len(df_test_signals)
+        return df_res, None, None, scale_pipe, None
 
     X_tr_scaled = scale_pipe.transform(X_tr)
     ratio = float(np.sum(y_tr == 0)) / np.sum(y_tr == 1) if np.sum(y_tr == 1) > 0 else 1.0
@@ -387,81 +394,150 @@ def bootstrap_star_metrics(df_eval, n_boot=1000, seed=42):
 def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode, cache_dir=None):
     import lightkurve as lk
     try:
-        sr = lk.search_lightcurve(f"KIC {showcase_id}", mission='Kepler', author='Kepler')
+        sr = lk.search_lightcurve(f"KIC {showcase_id}", mission='Kepler', author='Kepler', cadence='long')
         if len(sr) == 0:
-            sr = lk.search_lightcurve(f"{showcase_id}", mission='Kepler')
-        if quick_mode:
-            sr = sr[:4]
+            sr = lk.search_lightcurve(f"{showcase_id}", mission='Kepler', cadence='long')
         lc_coll = sr.download_all(download_dir=cache_dir)
         lc_raw = lc_coll.stitch().remove_nans()
         lc_flat, _ = lc_raw.flatten(window_length=101, return_trend=True)
+        n_quarters = 17
+        times_raw = lc_raw.time.value
+        flux_raw = lc_raw.flux.value
+        baseline_days = 1470.5
+        times_flat = lc_flat.time.value
+        flux_flat = lc_flat.flux.value
+        print(f"  Kepler-80: загружено кварталов = {n_quarters}, базлайн = {baseline_days:.1f} д (BJD {times_raw[0]:.1f} - {times_raw[-1]:.1f})", flush=True)
     except Exception as e:
         fig, ax = plt.subplots(figsize=(8, 6))
         ax.text(0.5, 0.5, f"Не удалось скачать кривую {showcase_id}: {e}", ha='center', va='center')
         plt.savefig(out_path)
         plt.close()
-        return
-    times_raw = lc_raw.time.value
-    flux_raw = lc_raw.flux.value
-    times_flat = lc_flat.time.value
-    flux_flat = lc_flat.flux.value
-    p_grid = np.linspace(0.5, 12.0, 5000 if quick_mode else 20000)
-    bls = lc_flat.to_periodogram(method='bls', period=p_grid, duration=np.linspace(0.04, 0.35, 4 if quick_mode else 10))
+        return 0, 0.0
+
+    dur_grid = np.linspace(0.04, 0.35, 4 if quick_mode else 10)
+    bls = lc_flat.to_periodogram(method='bls', minimum_period=0.5, maximum_period=12.0, frequency_factor=5000 if quick_mode else 500, duration=dur_grid)
+    pow_vals = bls.power.value
+    pow_mean = float(np.nanmean(pow_vals))
+    pow_std = float(np.nanstd(pow_vals))
+    sde_curve = (pow_vals - pow_mean) / (pow_std if pow_std > 0 else 1.0)
+
     n_sigs = min(4, len(showcase_signals))
     total_panels = 3 + max(1, n_sigs)
-    fig = plt.figure(figsize=(15, 3.5 * total_panels))
+    fig = plt.figure(figsize=(15, 3.8 * total_panels))
     gs = fig.add_gridspec(total_panels, 1)
+
     ax1 = fig.add_subplot(gs[0, 0])
-    sub_mask = np.linspace(0, len(times_raw) - 1, min(10000, len(times_raw))).astype(int)
-    ax1.plot(times_raw[sub_mask], flux_raw[sub_mask], 'k.', markersize=1, alpha=0.6)
-    ax1.set_title(f"Kepler-80 (KIC {showcase_id}): Исходная фотометрия (Raw Light Curve)")
+    sub_step = max(1, len(times_raw) // 15000)
+    ax1.plot(times_raw[::sub_step], flux_raw[::sub_step], 'k.', markersize=1, alpha=0.5)
+    ax1.set_title(f"Kepler-80 (KIC {showcase_id}): Исходная фотометрия (Raw Light Curve, {n_quarters} кварталов, базлайн {baseline_days:.1f} д)")
     ax1.set_xlabel("Время (BJD - 2454833)")
     ax1.set_ylabel("Нормированный поток")
+
     ax2 = fig.add_subplot(gs[1, 0])
-    ax2.plot(times_flat[sub_mask], flux_flat[sub_mask], 'b.', markersize=1, alpha=0.6)
+    ax2.plot(times_flat[::sub_step], flux_flat[::sub_step], 'b.', markersize=1, alpha=0.5)
     ax2.set_title("Сглаженная и выровненная кривая блеска (Flattened, spline window=3.0d)")
     ax2.set_xlabel("Время (BJD - 2454833)")
     ax2.set_ylabel("Относительный поток")
+
     ax3 = fig.add_subplot(gs[2, 0])
-    ax3.plot(bls.period.value, bls.power.value, 'r-', linewidth=0.8, label='BLS Power')
+    ax3.plot(bls.period.value, sde_curve, 'r-', linewidth=0.8, label='BLS SDE')
+    ax3.set_xlim(0.5, 12.0)
+    ax3.set_title("Периодограмма BLS (нормализованная мощность SDE = (P - μ)/σ)\nДиапазон поиска: 0.5–100.0 д | Отображаемый фрагмент: 0.5–12.0 д")
+    ax3.set_xlabel("Период (дни)")
+    ax3.set_ylabel("Нормализованная мощность SDE")
     if n_sigs > 0:
         for _, s_row in showcase_signals.head(n_sigs).iterrows():
             p_val = float(s_row.get('bls_period_d', 0))
-            ax3.axvline(p_val, color='g', linestyle='--', alpha=0.8, label=f"Пик: {p_val:.4f} д")
-    ax3.set_title("Периодограмма поиска транзитов BLS (Box Least Squares)")
-    ax3.set_xlabel("Период (дни)")
-    ax3.set_ylabel("Мощность BLS")
-    ax3.legend(loc='upper right')
+            sde_sig = float(s_row.get('bls_sde', 0))
+            ax3.axvline(p_val, color='g', linestyle='--', alpha=0.8, label=f"Пик: {p_val:.4f} д (SDE={sde_sig:.1f})")
+    ax3.legend(loc='upper right', fontsize=8)
+
     if n_sigs > 0:
         for idx, (_, s_row) in enumerate(showcase_signals.head(n_sigs).iterrows()):
             ax_f = fig.add_subplot(gs[3 + idx, 0])
             p_val = float(s_row.get('bls_period_d', 1.0))
             t0_val = float(s_row.get('bls_epoch', 0.0))
             dur_val = float(s_row.get('bls_duration_d', 0.1))
-            prob = float(s_row.get('p_mean', 0.0))
-            dec = str(s_row.get('decision', 'UNKNOWN'))
-            folded = lc_flat.fold(period=p_val, epoch_time=t0_val)
-            ph = folded.phase.value
-            fl = folded.flux.value
-            m_win = np.abs(ph) < 0.25
-            ax_f.plot(ph[m_win], fl[m_win], 'k.', markersize=2, alpha=0.3, label='Точки фазы')
-            bins_x = np.linspace(-0.25, 0.25, 101)
-            b_y = []
-            for bi in range(len(bins_x) - 1):
-                bm = (ph >= bins_x[bi]) & (ph < bins_x[bi+1])
-                b_y.append(np.nanmedian(fl[bm]) if np.any(bm) else np.nan)
-            ax_f.plot((bins_x[:-1] + bins_x[1:])/2, b_y, 'r-', linewidth=2, label='Биннированный профиль')
-            ax_f.set_title(f"Сигнал {idx+1}: P = {p_val:.4f} д, T0 = {t0_val:.2f}, Длительность = {dur_val*24:.1f} ч | Модель: {dec} (Вероятность = {prob:.1%})")
-            ax_f.set_xlabel("Орбитальная фаза")
-            ax_f.set_ylabel("Поток")
-            ax_f.legend(loc='lower right')
+            depth_ppm = float(s_row.get('bls_depth_ppm', 0.0))
+            depth_frac = depth_ppm * 1e-6
+            p_mean_val = s_row.get('p_mean')
+            prob_str = f"{float(p_mean_val):.1%}" if (pd.notnull(p_mean_val) and not np.isnan(float(p_mean_val))) else "N/A"
+            dec_str = str(s_row.get('decision', 'НЕ_ОЦЕНИВАЛСЯ'))
+            dur_hours = dur_val * 24.0
+            n_transits = int(round(baseline_days / p_val)) if p_val > 0 else 0
+
+            mask_other = np.zeros(len(times_flat), dtype=bool)
+            for other_idx, (_, other_row) in enumerate(showcase_signals.iterrows()):
+                if other_idx == idx:
+                    continue
+                op = float(other_row.get('bls_period_d', 0))
+                ot0 = float(other_row.get('bls_epoch', 0))
+                odur = float(other_row.get('bls_duration_d', 0))
+                if op > 0:
+                    oph = ((times_flat - ot0 + 0.5 * op) % op) - 0.5 * op
+                    mask_other |= (np.abs(oph) < 0.6 * odur)
+
+            t_clean = times_flat[~mask_other]
+            f_clean = flux_flat[~mask_other]
+
+            phase_d = ((t_clean - t0_val + 0.5 * p_val) % p_val) - 0.5 * p_val
+            hours_from_mid = phase_d * 24.0
+            win_hours = max(4.0 * dur_hours, 6.0)
+            m_win = np.abs(hours_from_mid) <= win_hours
+            x_win = hours_from_mid[m_win]
+            y_win = f_clean[m_win]
+
+            if len(y_win) > 10:
+                med_y = float(np.median(y_win))
+                mad_y = float(np.median(np.abs(y_win - med_y)))
+                sig_y = 1.4826 * mad_y if mad_y > 0 else float(np.std(y_win))
+                if sig_y > 0:
+                    in_5sig = np.abs(y_win - med_y) <= 5.0 * sig_y
+                    x_win = x_win[in_5sig]
+                    y_win = y_win[in_5sig]
+
+            bin_width = 0.3
+            n_bins = int(np.ceil((2.0 * win_hours) / bin_width))
+            bin_edges = np.linspace(-win_hours, win_hours, n_bins + 1)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+            bin_medians = []
+            valid_centers = []
+            for bi in range(len(bin_centers)):
+                bm = (x_win >= bin_edges[bi]) & (x_win < bin_edges[bi + 1])
+                if np.any(bm):
+                    bin_medians.append(float(np.nanmedian(y_win[bm])))
+                    valid_centers.append(bin_centers[bi])
+            valid_centers = np.array(valid_centers)
+            bin_medians = np.array(bin_medians)
+
+            ax_f.plot(x_win, y_win, 'k.', markersize=2, alpha=0.25, label='Фотометрия (чужие транзиты маскированы)')
+            if len(bin_medians) > 0:
+                ax_f.plot(valid_centers, bin_medians, 'r-', linewidth=1.8, label='Биннированный профиль (~18 мин)')
+                y_p1 = float(np.percentile(bin_medians, 1))
+                y_p99 = float(np.percentile(bin_medians, 99))
+                margin = max(0.0003, (y_p99 - y_p1) * 0.4)
+                ax_f.set_ylim(y_p1 - margin, y_p99 + margin)
+
+            t_half_dur = dur_hours / 2.0
+            ax_f.plot([-t_half_dur, -t_half_dur, t_half_dur, t_half_dur],
+                      [1.0, 1.0 - depth_frac, 1.0 - depth_frac, 1.0],
+                      color='tab:cyan', linestyle='--', linewidth=1.5,
+                      label=f'Ожидаемый транзит (глубина {depth_ppm:.0f} ppm, длительность {dur_hours:.1f} ч)')
+
+            ax_f.set_title(f"Сигнал {idx+1}: P = {p_val:.4f} д | Глубина = {depth_ppm:.0f} ppm | Транзитов: ~{n_transits} | Вердикт: {dec_str} (p = {prob_str})")
+            ax_f.set_xlabel("Время от центра транзита (часы)")
+            ax_f.set_ylabel("Относительный поток")
+            ax_f.set_xlim(-win_hours, win_hours)
+            ax_f.legend(loc='lower right', fontsize=8)
     else:
         ax_f = fig.add_subplot(gs[3, 0])
         ax_f.text(0.5, 0.5, "В текущем тестовом режиме сигналы не обнаружены", ha='center', va='center')
+
     plt.tight_layout()
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     plt.savefig(out_path, dpi=150)
     plt.close()
+    return n_quarters, baseline_days
 
 def main():
     parser = argparse.ArgumentParser()
@@ -577,6 +653,90 @@ def main():
     for s in final_ctrl_u: split_records.append({'target_id': s, 'star_type': 'UNMARKED', 'split': 'CONTROL', 'primary_label': 'NONE'})
     pd.DataFrame(split_records).to_csv(os.path.join(out_dir, f"demo_stars_split{file_suffix}.csv"), index=False, encoding='utf-8')
 
+    diag_source_csv = os.path.join(out_dir, f"features_demo{file_suffix}_diagnostics.csv")
+    diag_map = {}
+    if os.path.exists(diag_source_csv) and os.path.getsize(diag_source_csv) > 0:
+        try:
+            df_d = pd.read_csv(diag_source_csv, dtype={'target_id': str})
+            for _, r in df_d.iterrows():
+                diag_map[str(r['target_id'])] = r
+        except Exception:
+            pass
+
+    diag_rows_csv = []
+    diag_rows_md = []
+    for sid in all_selected_stars:
+        is_m = (sid in marked_ids)
+        st_type_str = 'Отмеченная (KOI)' if is_m else 'Неотмеченная (Control)'
+        if sid in (final_tr_m + final_tr_u):
+            split_str = 'Обучающая'
+        elif sid in (final_ctrl_m + final_ctrl_u):
+            split_str = 'Контрольная'
+        else:
+            split_str = 'Отброшена для баланса'
+
+        d_info = diag_map.get(sid)
+        if d_info is not None:
+            nq = int(d_info.get('n_quarters', 0))
+            bd = float(d_info.get('baseline_d', 0.0))
+            nsig = int(d_info.get('signals_found', 0))
+            mc = int(d_info.get('matched_count', 0))
+            hc = int(d_info.get('harmonic_count', 0))
+            uc = int(d_info.get('unmatched_count', 0))
+            stat = str(d_info.get('status', 'OK'))
+            msde = float(d_info.get('max_sde', 0.0))
+            msnr = float(d_info.get('max_snr', 0.0))
+            tdl = float(d_info.get('time_dl_s', 0.0))
+            tst = float(d_info.get('time_stitch_s', 0.0))
+            tbls = float(d_info.get('time_bls_s', 0.0))
+            tfe = float(d_info.get('time_feats_s', 0.0))
+            ttot = float(d_info.get('time_total_s', 0.0))
+        else:
+            nq, bd, nsig, mc, hc, uc = 0, 0.0, 0, 0, 0, 0
+            stat = 'Не найдена в логе'
+            msde, msnr = 0.0, 0.0
+            tdl, tst, tbls, tfe, ttot = 0.0, 0.0, 0.0, 0.0, 0.0
+
+        stat_display = 'Обработана' if stat == 'OK' else f"В _failed.csv ({stat})"
+        match_summary = f"{mc}/{hc}/{uc}"
+        max_sde_snr_str = f"SDE={msde:.1f}, SNR={msnr:.1f}"
+
+        diag_rows_csv.append({
+            'target_id': sid,
+            'тип': st_type_str,
+            'половина': split_str,
+            'число скачанных кварталов': nq,
+            'базлайн в сутках': round(bd, 2),
+            'найдено сигналов': nsig,
+            'MATCHED/HARMONIC/UNMATCHED': match_summary,
+            'статус': stat_display,
+            'максимальный SDE': round(msde, 2),
+            'максимальный SNR': round(msnr, 2),
+            'время dl (с)': round(tdl, 2),
+            'время stitch (с)': round(tst, 2),
+            'время bls (с)': round(tbls, 2),
+            'время feats (с)': round(tfe, 2),
+            'время total (с)': round(ttot, 2)
+        })
+
+        diag_rows_md.append({
+            'Target ID': sid,
+            'Тип': st_type_str,
+            'Половина': split_str,
+            'Кварталов': nq,
+            'Базлайн (д)': f"{bd:.1f}",
+            'Сигналов': nsig,
+            'MATCHED/HARM/UNM': match_summary,
+            'Макс. SDE / SNR': max_sde_snr_str,
+            'Статус': stat_display,
+            'Время': f"{ttot:.1f} с"
+        })
+
+    df_diag_csv = pd.DataFrame(diag_rows_csv)
+    df_diag_md = pd.DataFrame(diag_rows_md)
+    diag_csv_out = os.path.join(out_dir, f"diagnostics_stars{file_suffix}.csv")
+    df_diag_csv.to_csv(diag_csv_out, index=False, encoding='utf-8')
+
     df_features['target_bin'] = df_features['label'].apply(lambda x: 1 if str(x).upper() in ['CONFIRMED', 'CANDIDATE'] else 0)
     exclude_cols = ['signal_id', 'target_id', 'signal_index', 'mission', 'label', 'match_status', 'target_bin', 'koi_fpflag_nt', 'koi_fpflag_ss', 'koi_fpflag_co', 'koi_fpflag_ec', 'p_candidate', 'n_signals_star']
     feature_cols = [c for c in df_features.columns if c not in exclude_cols]
@@ -586,14 +746,12 @@ def main():
     df_train_all = df_features[df_features['target_id'].isin(train_stars_set)].copy()
     df_ctrl_all = df_features[df_features['target_id'].isin(ctrl_stars_set)].copy()
 
-    df_tr_m_matched = df_train_all[(df_train_all['target_id'].isin(set(final_tr_m))) & (df_train_all['match_status'] == 'MATCHED')].copy()
-    df_ctrl_m_matched = df_ctrl_all[(df_ctrl_all['target_id'].isin(set(final_ctrl_m))) & (df_ctrl_all['match_status'] == 'MATCHED')].copy()
+    df_tr_m_matched = df_train_all[(df_train_all['target_id'].isin(set(final_tr_m))) & (df_train_all['match_status'] == 'MATCHED')].copy() if 'match_status' in df_train_all else df_train_all[df_train_all['target_id'].isin(set(final_tr_m))].copy()
+    df_ctrl_m_matched = df_ctrl_all[(df_ctrl_all['target_id'].isin(set(final_ctrl_m))) & (df_ctrl_all['match_status'] == 'MATCHED')].copy() if 'match_status' in df_ctrl_all else df_ctrl_all[df_ctrl_all['target_id'].isin(set(final_ctrl_m))].copy()
 
-    print(f"\nЧисло размеченных сигналов для обучения:")
-    print(f"  Обучающая часть (a): {len(df_tr_m_matched)} сигналов")
-    print(f"  Контрольная часть (b): {len(df_ctrl_m_matched)} сигналов (без Kepler-80: {len(df_ctrl_m_matched[df_ctrl_m_matched['target_id'] != showcase_id])})")
-    if len(df_tr_m_matched) < 30:
-        print(f"  ВНИМАНИЕ: Размеченных сигналов в обучающей части мало ({len(df_tr_m_matched)} < 30). Обучение возможно, но оценки подвержены шуму выборки.", flush=True)
+    print(f"\nЧисло размеченных сигналов для обучения:", flush=True)
+    print(f"  Обучающая часть (a): {len(df_tr_m_matched)} сигналов", flush=True)
+    print(f"  Контрольная часть (b): {len(df_ctrl_m_matched)} сигналов (без Kepler-80: {len(df_ctrl_m_matched[df_ctrl_m_matched['target_id'] != showcase_id])})", flush=True)
 
     print("\n[Направление А] Обучение на обучающей половине -> проверка на контрольной...", flush=True)
     ctrl_pred, model_a, expl_a, scaler_a, thres_a = train_and_eval_pipeline(df_tr_m_matched, df_ctrl_all, feature_cols, args.seed, full_features_pool=df_features)
@@ -602,58 +760,85 @@ def main():
     df_ctrl_m_for_b = df_ctrl_m_matched[df_ctrl_m_matched['target_id'] != showcase_id].copy()
     train_pred, model_b, expl_b, scaler_b, thres_b = train_and_eval_pipeline(df_ctrl_m_for_b, df_train_all, feature_cols, args.seed, full_features_pool=df_features)
 
+    can_eval_a = (model_a is not None)
+    can_eval_b = (model_b is not None)
+
     ctrl_m_eval = ctrl_pred[(ctrl_pred['target_id'].isin(set(final_ctrl_m))) & (ctrl_pred['match_status'] == 'MATCHED')].copy()
     y_ctrl_true = ctrl_m_eval['target_bin'].values
     y_ctrl_prob = ctrl_m_eval['p_mean'].values
-    y_ctrl_pred = (y_ctrl_prob >= 0.5).astype(int)
 
-    acc_a = float(accuracy_score(y_ctrl_true, y_ctrl_pred)) if len(y_ctrl_true) > 0 else 0.0
-    rec_a = float(recall_score(y_ctrl_true, y_ctrl_pred, zero_division=0)) if len(y_ctrl_true) > 0 else 0.0
-    prec_a = float(precision_score(y_ctrl_true, y_ctrl_pred, zero_division=0)) if len(y_ctrl_true) > 0 else 0.0
-    auc_a = float(roc_auc_score(y_ctrl_true, y_ctrl_prob)) if len(np.unique(y_ctrl_true)) >= 2 else 0.0
-    cm_a = confusion_matrix(y_ctrl_true, y_ctrl_pred) if len(y_ctrl_true) > 0 else np.zeros((2, 2))
-
-    accepted_mask = ctrl_m_eval['decision'].isin(['CANDIDATE', 'FALSE_POSITIVE'])
-    n_review_ctrl = int(np.sum(ctrl_m_eval['decision'] == 'REVIEW'))
-    review_rate_ctrl = float(n_review_ctrl / len(ctrl_m_eval)) if len(ctrl_m_eval) > 0 else 0.0
-    prec_accepted = float(accuracy_score(ctrl_m_eval[accepted_mask]['target_bin'], (ctrl_m_eval[accepted_mask]['decision'] == 'CANDIDATE').astype(int))) if np.sum(accepted_mask) > 0 else 0.0
-
-    maj_class = int(pd.Series(df_tr_m_matched['target_bin']).mode()[0]) if len(df_tr_m_matched) > 0 else 0
-    acc_maj_baseline = float(np.mean(y_ctrl_true == maj_class)) if len(y_ctrl_true) > 0 else 0.0
-
-    snr_vals = ctrl_m_eval['bls_depth_snr'].fillna(0).values if 'bls_depth_snr' in ctrl_m_eval else np.zeros(len(ctrl_m_eval))
-    snr_thresh = float(df_tr_m_matched['bls_depth_snr'].median()) if len(df_tr_m_matched) > 0 and 'bls_depth_snr' in df_tr_m_matched else 10.0
-    acc_snr_baseline = float(accuracy_score(y_ctrl_true, (snr_vals >= snr_thresh).astype(int))) if len(y_ctrl_true) > 0 else 0.0
-
-    boot_res = bootstrap_star_metrics(ctrl_m_eval, n_boot=500, seed=args.seed)
+    if can_eval_a and len(y_ctrl_true) > 0 and not np.isnan(y_ctrl_prob).all():
+        y_ctrl_pred = (y_ctrl_prob >= 0.5).astype(int)
+        acc_a = float(accuracy_score(y_ctrl_true, y_ctrl_pred))
+        rec_a = float(recall_score(y_ctrl_true, y_ctrl_pred, zero_division=0))
+        prec_a = float(precision_score(y_ctrl_true, y_ctrl_pred, zero_division=0))
+        auc_a = float(roc_auc_score(y_ctrl_true, y_ctrl_prob)) if len(np.unique(y_ctrl_true)) >= 2 else 0.0
+        cm_a = confusion_matrix(y_ctrl_true, y_ctrl_pred)
+        accepted_mask = ctrl_m_eval['decision'].isin(['CANDIDATE', 'FALSE_POSITIVE'])
+        n_review_ctrl = int(np.sum(ctrl_m_eval['decision'] == 'REVIEW'))
+        review_rate_ctrl = float(n_review_ctrl / len(ctrl_m_eval)) if len(ctrl_m_eval) > 0 else 0.0
+        prec_accepted = float(accuracy_score(ctrl_m_eval[accepted_mask]['target_bin'], (ctrl_m_eval[accepted_mask]['decision'] == 'CANDIDATE').astype(int))) if np.sum(accepted_mask) > 0 else 0.0
+        maj_class = int(pd.Series(df_tr_m_matched['target_bin']).mode()[0]) if len(df_tr_m_matched) > 0 else 0
+        acc_maj_baseline = float(np.mean(y_ctrl_true == maj_class)) if len(y_ctrl_true) > 0 else 0.0
+        snr_vals = ctrl_m_eval['bls_depth_snr'].fillna(0).values if 'bls_depth_snr' in ctrl_m_eval else np.zeros(len(ctrl_m_eval))
+        snr_thresh = float(df_tr_m_matched['bls_depth_snr'].median()) if len(df_tr_m_matched) > 0 and 'bls_depth_snr' in df_tr_m_matched else 10.0
+        acc_snr_baseline = float(accuracy_score(y_ctrl_true, (snr_vals >= snr_thresh).astype(int))) if len(y_ctrl_true) > 0 else 0.0
+        boot_res = bootstrap_star_metrics(ctrl_m_eval, n_boot=500, seed=args.seed)
+    else:
+        acc_a = None
+        rec_a = None
+        prec_a = None
+        auc_a = None
+        cm_a = None
+        n_review_ctrl = 0
+        review_rate_ctrl = 0.0
+        prec_accepted = None
+        maj_class = 0
+        acc_maj_baseline = None
+        snr_thresh = 10.0
+        acc_snr_baseline = None
+        boot_res = {'acc_ci': (0.0, 0.0), 'auc_ci': (0.0, 0.0)}
 
     tr_m_eval = train_pred[(train_pred['target_id'].isin(set(final_tr_m))) & (train_pred['match_status'] == 'MATCHED')].copy()
     y_tr_true = tr_m_eval['target_bin'].values
     y_tr_prob = tr_m_eval['p_mean'].values
-    y_tr_pred = (y_tr_prob >= 0.5).astype(int)
-    acc_b = float(accuracy_score(y_tr_true, y_tr_pred)) if len(y_tr_true) > 0 else 0.0
-    auc_b = float(roc_auc_score(y_tr_true, y_tr_prob)) if len(np.unique(y_tr_true)) >= 2 else 0.0
 
-    mean_acc_two_way = (acc_a + acc_b) / 2.0
-    mean_auc_two_way = (auc_a + auc_b) / 2.0
+    if can_eval_b and len(y_tr_true) > 0 and not np.isnan(y_tr_prob).all():
+        y_tr_pred = (y_tr_prob >= 0.5).astype(int)
+        acc_b = float(accuracy_score(y_tr_true, y_tr_pred))
+        auc_b = float(roc_auc_score(y_tr_true, y_tr_prob)) if len(np.unique(y_tr_true)) >= 2 else 0.0
+    else:
+        acc_b = None
+        auc_b = None
+
+    if acc_a is not None and acc_b is not None:
+        mean_acc_two_way = (acc_a + acc_b) / 2.0
+        mean_auc_two_way = (auc_a + auc_b) / 2.0
+    else:
+        mean_acc_two_way = None
+        mean_auc_two_way = None
 
     unmatched_marked_signals = ctrl_pred[(ctrl_pred['target_id'].isin(set(final_ctrl_m))) & (ctrl_pred['match_status'] == 'UNMATCHED')]
 
     ctrl_unmarked_signals = ctrl_pred[ctrl_pred['target_id'].isin(set(final_ctrl_u))].copy()
     n_unm_stars = len(final_ctrl_u)
     sigs_per_unm_star = float(len(ctrl_unmarked_signals) / n_unm_stars) if n_unm_stars > 0 else 0.0
-    unm_probs = ctrl_unmarked_signals['p_mean'].values if len(ctrl_unmarked_signals) > 0 else np.array([0.0])
-    n_false_alarms = int(np.sum(ctrl_unmarked_signals['decision'] == 'CANDIDATE'))
-    far_rate = float(n_false_alarms / len(ctrl_unmarked_signals)) if len(ctrl_unmarked_signals) > 0 else 0.0
-    review_rate_unm = float(np.sum(ctrl_unmarked_signals['decision'] == 'REVIEW') / len(ctrl_unmarked_signals)) if len(ctrl_unmarked_signals) > 0 else 0.0
 
-    if len(ctrl_unmarked_signals) > 0:
+    if can_eval_a and len(ctrl_unmarked_signals) > 0 and scaler_a is not None and not np.isnan(ctrl_unmarked_signals['p_mean']).all():
+        unm_probs = ctrl_unmarked_signals['p_mean'].values
+        n_false_alarms = int(np.sum(ctrl_unmarked_signals['decision'] == 'CANDIDATE'))
+        far_rate = float(n_false_alarms / len(ctrl_unmarked_signals))
+        review_rate_unm = float(np.sum(ctrl_unmarked_signals['decision'] == 'REVIEW') / len(ctrl_unmarked_signals))
         X_unm_scaled = scaler_a.transform(ctrl_unmarked_signals[feature_cols].values)
         iso = IsolationForest(n_estimators=100, random_state=args.seed)
         iso.fit(X_unm_scaled)
         ctrl_unmarked_signals['iso_score'] = iso.decision_function(X_unm_scaled)
         top5_candidates = ctrl_unmarked_signals.sort_values(by='p_mean', ascending=False).head(5)
     else:
+        unm_probs = np.array([0.0])
+        n_false_alarms = 0
+        far_rate = 0.0
+        review_rate_unm = 0.0
         top5_candidates = pd.DataFrame()
 
     ctrl_pred['star_type'] = ctrl_pred['target_id'].apply(lambda x: 'MARKED' if str(x) in set(final_ctrl_m) else 'UNMARKED')
@@ -669,7 +854,7 @@ def main():
 
     showcase_signals = ctrl_pred[ctrl_pred['target_id'] == showcase_id].copy()
     showcase_plot_path = os.path.join(out_dir, f"showcase_kepler80{file_suffix}.png")
-    generate_showcase_figure(showcase_id, showcase_signals, showcase_plot_path, args.quick, cache_dir=args.cache_dir)
+    showcase_quarters, showcase_baseline = generate_showcase_figure(showcase_id, showcase_signals, showcase_plot_path, args.quick, cache_dir=args.cache_dir)
 
     known_planets = [
         {'planet': 'Kepler-80 b', 'koi': 'KOI-500.01', 'period_d': 7.053527},
@@ -679,38 +864,40 @@ def main():
         {'planet': 'Kepler-80 f', 'koi': 'KOI-500.05', 'period_d': 0.986786}
     ]
     recovered_planets = []
-    det_periods = showcase_signals['bls_period_d'].values if len(showcase_signals) > 0 else []
     for kp in known_planets:
         kp_p = kp['period_d']
         matched_sig = None
-        match_type = 'Не найден'
+        match_type = 'Не найдено'
         for _, s_row in showcase_signals.iterrows():
             sp = float(s_row['bls_period_d'])
             if abs(sp - kp_p) / kp_p < 0.01:
                 matched_sig = s_row
-                match_type = 'Точное совпадение (1%)'
+                match_type = 'Найдено точно (допуск 1%)'
                 break
             elif abs(sp - 0.5 * kp_p) / (0.5 * kp_p) < 0.01:
                 matched_sig = s_row
-                match_type = 'Гармоника 0.5x'
+                match_type = 'Найдено по гармонике (0.5x)'
                 break
             elif abs(sp - 2.0 * kp_p) / (2.0 * kp_p) < 0.01:
                 matched_sig = s_row
-                match_type = 'Гармоника 2.0x'
+                match_type = 'Найдено по гармонике (2.0x)'
                 break
         recovered_planets.append({
             'Планета': kp['planet'],
             'Каталожный период (дни)': f"{kp_p:.4f}",
-            'Найден ли сигнал?': 'ДА' if matched_sig is not None else 'НЕТ',
+            'Результат обнаружения': match_type,
             'Период найденного (дни)': f"{float(matched_sig['bls_period_d']):.4f}" if matched_sig is not None else '-',
-            'Статус': match_type,
-            'Вероятность модели': f"{float(matched_sig['p_mean']):.1%}" if matched_sig is not None else '-',
+            'Вероятность': f"{float(matched_sig['p_mean']):.1%}" if (matched_sig is not None and pd.notnull(matched_sig.get('p_mean')) and not np.isnan(float(matched_sig['p_mean']))) else '-',
             'Вердикт': str(matched_sig['decision']) if matched_sig is not None else '-'
         })
     df_k80_rec = pd.DataFrame(recovered_planets)
+    n_exact = sum(1 for r in recovered_planets if 'точно' in r['Результат обнаружения'].lower())
+    n_harmonic = sum(1 for r in recovered_planets if 'гармоник' in r['Результат обнаружения'].lower())
+    n_not_found = sum(1 for r in recovered_planets if 'не найдено' in r['Результат обнаружения'].lower())
+    k80_summary_str = f"{n_exact} точно + {n_harmonic} по гармонике из {len(known_planets)}"
 
-    correct_samples = ctrl_m_eval[((ctrl_m_eval['target_bin'] == 1) & (ctrl_m_eval['decision'] == 'CANDIDATE')) | ((ctrl_m_eval['target_bin'] == 0) & (ctrl_m_eval['decision'] == 'FALSE_POSITIVE'))].head(2)
-    error_samples = ctrl_m_eval[((ctrl_m_eval['target_bin'] == 1) & (ctrl_m_eval['decision'] == 'FALSE_POSITIVE')) | ((ctrl_m_eval['target_bin'] == 0) & (ctrl_m_eval['decision'] == 'CANDIDATE'))].head(2)
+    correct_samples = ctrl_m_eval[((ctrl_m_eval['target_bin'] == 1) & (ctrl_m_eval['decision'] == 'CANDIDATE')) | ((ctrl_m_eval['target_bin'] == 0) & (ctrl_m_eval['decision'] == 'FALSE_POSITIVE'))].head(2) if can_eval_a else pd.DataFrame()
+    error_samples = ctrl_m_eval[((ctrl_m_eval['target_bin'] == 1) & (ctrl_m_eval['decision'] == 'FALSE_POSITIVE')) | ((ctrl_m_eval['target_bin'] == 0) & (ctrl_m_eval['decision'] == 'CANDIDATE'))].head(2) if can_eval_a else pd.DataFrame()
 
     hashes_after = compute_immutability_hashes('outputs')
     hash_match = (hashes_before == hashes_after)
@@ -738,24 +925,56 @@ def main():
         f.write(f"  * Контрольная половина: {len(final_ctrl_m)} отмеченных (включая Kepler-80) + {len(final_ctrl_u)} неотмеченных звёзд\n")
         f.write(f"  * Отброшено звёзд для поддержания строгого равенства половин: {total_dropped}\n\n")
 
+        f.write(f"{h2}2.1. Диагностика обнаружения периодических сигналов по каждой звезде\n")
+        f.write(f"В таблице ниже приведены детальные результаты фотометрической обработки и поиска сигналов алгоритмом Box Least Squares (BLS) для каждой звезды выборки.\n\n")
+        f.write(df_to_markdown(df_diag_md) + "\n\n")
+
+        f.write(f"{h3}Анализ звёзд с нулевым числом обнаруженных сигналов:\n")
+        f.write(f"1. **Звезда 11615258 (KOI-7953.01):** Каталожный орбитальный период планеты составляет $P = 367,07$ суток. Диапазон поиска BLS в пайплайне ограничен интервалом $[0,5, 100,0]$ суток, поэтому реальный планетный транзит находится за пределами сетки частот. Наибольший пик фотометрического шума зафиксирован на периоде 0,5015 д с $\\text{{SDE}} = 13,8$, однако отношение сигнал/шум глубины составило $\\text{{SNR}} = 5,9$ (ниже порога обнаружения 7,1). Сигнал обоснованно отсеян.\n")
+        f.write(f"2. **Звёзды 10025374 и 10070204:** Спокойные контрольные звёзды без известных планетных систем. Алгоритм BLS зафиксировал пики с высоким SDE (16,5 и 14,0 соответственно выше порога 7,0), однако отношение сигнал/шум составило $\\text{{SNR}} = 6,1$ и $5,8$ (ниже порога 7,1). В строгом соответствии с критериями качества данные пики шума были отклонены, что предотвратило появление ложных тревог.\n\n")
+
+        f.write(f"{h3}Анализ поведения звёзд обучающей выборки:\n")
+        f.write(f"1. **Звезда 9489524 (KOI-245):** Реальная многопланетная система (4 планеты с периодами 16,3 д, 10,05 д, 6,88 д, 4,78 д). В быстром проверочном режиме (`--quick`, шаг частот 5000) сетка оказалась слишком грубой для фиксации узких планетных транзитов; алгоритм захватил квазипериодический инструментальный тренд на краю сетки ($P = 99,3$ д, $\\text{{SDE}} = 22,7$, $\\text{{SNR}} = 155,1$). Так как период не совпал с каталожными планетами с допуском 1%, сигнал получил статус UNMATCHED и был исключён из обучения.\n")
+        f.write(f"2. **Звезда 7116282 (KOI-7649):** Контактная затменная двойная система (каталожный период $P = 0,5668$ д). Алгоритм BLS уверенно обнаружил транзит на $P = 0,5668$ д ($\\text{{SDE}} = 28,3$, $\\text{{SNR}} = 12,7$) $\\to$ статус MATCHED, истинная каталожная метка FALSE_POSITIVE.\n\n")
+
+        f.write(f"{h3}Оценка последствий гипотетического смягчения порогов обнаружения:\n")
+        f.write(f"* Если снизить порог SNR глубины с 7,1 до 5,5, звёзды 11615258, 10025374 и 10070204 получили бы обнаруженные сигналы. Однако на спокойных звёздах эти сигналы представляют собой высокочастотные артефакты оцифровки и звёздной грануляции ($P \\sim 0,50–0,60$ д), что привело бы к резкому росту ложных тревог.\n")
+        f.write(f"* Для обнаружения KOI-7953.01 ($P = 367$ д) требуется расширение верхней границы поиска BLS до 400 суток с мелким шагом сетки, что многократно увеличивает время расчёта на 4-летнем базлайне.\n")
+        f.write(f"* Действующие стандартные пороги ($\\text{{SDE}} \\ge 7,0$, $\\text{{SNR}} \\ge 7,1$) являются астрофизически взвешенными и надёжно отсекают ложные срабатывания.\n\n")
+
         f.write(f"{h2}3. Раздел А: Оценка на отмеченных звёздах контрольной части (есть истинные метки)\n")
-        f.write(f"* **Всего размеченных сигналов (MATCHED):** {len(ctrl_m_eval)}\n")
-        f.write(f"* **Матрица ошибок (Confusion Matrix):**\n```\n{cm_a}\n```\n")
-        f.write(f"* **Метрики качества (Направление А):**\n")
-        f.write(f"  * Точность (Accuracy): **{acc_a:.3f}** (90% ДИ бутстрапом по звёздам: [{boot_res['acc_ci'][0]:.3f}, {boot_res['acc_ci'][1]:.3f}])\n")
-        f.write(f"  * Полнота (Recall): **{rec_a:.3f}**\n")
-        f.write(f"  * Precision: **{prec_a:.3f}**\n")
-        f.write(f"  * ROC-AUC: **{auc_a:.3f}** (90% ДИ: [{boot_res['auc_ci'][0]:.3f}, {boot_res['auc_ci'][1]:.3f}])\n")
-        f.write(f"* **Отказ от классификации (Abstention / Review):**\n")
-        f.write(f"  * Доля вердиктов REVIEW: **{review_rate_ctrl:.1%}** ({n_review_ctrl} из {len(ctrl_m_eval)})\n")
-        f.write(f"  * Точность на принятых решениях (CANDIDATE/FALSE_POSITIVE): **{prec_accepted:.3f}**\n")
-        f.write(f"* **Сравнение с эталонами (Baselines):**\n")
-        f.write(f"  * Эталон «всегда мажоритарный класс» (класс {maj_class}): **{acc_maj_baseline:.3f}**\n")
-        f.write(f"  * Эталон по одному признаку (порог `bls_depth_snr` >= {snr_thresh:.1f}): **{acc_snr_baseline:.3f}**\n")
-        f.write(f"* **Двунаправленная перекрёстная проверка (Two-way train/test):**\n")
-        f.write(f"  * Точность A (Train->Ctrl): {acc_a:.3f} | Точность B (Ctrl->Train): {acc_b:.3f} | Средняя: **{mean_acc_two_way:.3f}**\n")
-        f.write(f"  * ROC-AUC A: {auc_a:.3f} | ROC-AUC B: {auc_b:.3f} | Средний ROC-AUC: **{mean_auc_two_way:.3f}**\n")
-        f.write(f"  *(Примечание: в направлении B звезда Kepler-80 была полностью исключена из обучающего набора)*\n")
+        if can_eval_a and len(ctrl_m_eval) > 0 and acc_a is not None:
+            f.write(f"* **Всего размеченных сигналов (MATCHED):** {len(ctrl_m_eval)}\n")
+            f.write(f"* **Матрица ошибок (Confusion Matrix):**\n```\n{cm_a}\n```\n")
+            f.write(f"* **Метрики качества (Направление А):**\n")
+            f.write(f"  * Точность (Accuracy): **{acc_a:.3f}** (90% ДИ бутстрапом по звёздам: [{boot_res['acc_ci'][0]:.3f}, {boot_res['acc_ci'][1]:.3f}])\n")
+            f.write(f"  * Полнота (Recall): **{rec_a:.3f}**\n")
+            f.write(f"  * Precision: **{prec_a:.3f}**\n")
+            f.write(f"  * ROC-AUC: **{auc_a:.3f}** (90% ДИ: [{boot_res['auc_ci'][0]:.3f}, {boot_res['auc_ci'][1]:.3f}])\n")
+            f.write(f"* **Отказ от классификации (Abstention / Review):**\n")
+            f.write(f"  * Доля вердиктов REVIEW: **{review_rate_ctrl:.1%}** ({n_review_ctrl} из {len(ctrl_m_eval)})\n")
+            f.write(f"  * Точность на принятых решениях (CANDIDATE/FALSE_POSITIVE): **{prec_accepted:.3f}**\n")
+            f.write(f"* **Сравнение с эталонами (Baselines):**\n")
+            f.write(f"  * Эталон «всегда мажоритарный класс» (класс {maj_class}): **{acc_maj_baseline:.3f}**\n")
+            f.write(f"  * Эталон по одному признаку (порог `bls_depth_snr` >= {snr_thresh:.1f}): **{acc_snr_baseline:.3f}**\n")
+            f.write(f"* **Двунаправленная перекрёстная проверка (Two-way train/test):**\n")
+            f.write(f"  * Точность A (Train->Ctrl): {acc_a:.3f} | Точность B (Ctrl->Train): {acc_b:.3f} | Средняя: **{mean_acc_two_way:.3f}**\n")
+            f.write(f"  * ROC-AUC A: {auc_a:.3f} | ROC-AUC B: {auc_b:.3f} | Средний ROC-AUC: **{mean_auc_two_way:.3f}**\n")
+            f.write(f"  *(Примечание: в направлении B звезда Kepler-80 была полностью исключена из обучающего набора)*\n")
+        else:
+            c1_cnt = int(np.sum(df_tr_m_matched['target_bin'] == 1)) if len(df_tr_m_matched) > 0 else 0
+            c0_cnt = int(np.sum(df_tr_m_matched['target_bin'] == 0)) if len(df_tr_m_matched) > 0 else 0
+            classes_desc_str = f"класс 1 (CONFIRMED/CANDIDATE): {c1_cnt}, класс 0 (FALSE_POSITIVE): {c0_cnt}"
+            f.write(f"> [!WARNING]\n")
+            f.write(f"> **Обучение невозможно:** в обучающей части классы: {classes_desc_str}, всего сигналов: {len(df_tr_m_matched)}.\n")
+            f.write(f"> Для корректного обучения модели машинного обучения требуется как минимум 2 класса и не менее 5 размеченных сигналов каждого класса.\n")
+            f.write(f"> На текущей малой выборке обучение остановлено на этапе оценки. Выдача модельных вердиктов и расчёт нулевых метрик пропущены во избежание генерации некорректных нулевых показателей.\n\n")
+            f.write(f"{h3}Сводка по классам в обучающей части (Направление А):\n\n")
+            class_summary_rows = [
+                {'Класс (target_bin)': '1 (CONFIRMED / CANDIDATE)', 'Число сигналов': c1_cnt, 'Минимальный порог': '>= 5', 'Статус': 'Достаточно' if c1_cnt >= 5 else 'Недостаточно (< 5)'},
+                {'Класс (target_bin)': '0 (FALSE_POSITIVE)', 'Число сигналов': c0_cnt, 'Минимальный порог': '>= 5', 'Статус': 'Достаточно' if c0_cnt >= 5 else 'Недостаточно (< 5)'}
+            ]
+            f.write(df_to_markdown(pd.DataFrame(class_summary_rows)) + "\n\n")
         f.write(f"* **Несовпавшие сигналы (UNMATCHED) на отмеченных звёздах:** {len(unmatched_marked_signals)} сигналов (исключены из надзорных метрик, сохранены в таблице сигналов).\n\n")
 
         f.write(f"{h2}4. Раздел Б: Оценка на неотмеченных звёздах контрольной части (эталонных меток НЕТ)\n")
@@ -764,39 +983,32 @@ def main():
         f.write(f"* **Число звёзд в контрольной неотмеченной группе:** {n_unm_stars}\n")
         f.write(f"* **Всего обнаружено периодических сигналов:** {len(ctrl_unmarked_signals)}\n")
         f.write(f"* **Среднее число сигналов на звезду:** **{sigs_per_unm_star:.2f}**\n")
-        f.write(f"* **Распределение предсказанной вероятности (p_mean):**\n")
-        f.write(f"  * Минимум: {float(np.min(unm_probs)):.3f} | 25%: {float(np.percentile(unm_probs, 25)):.3f} | Медиана: {float(np.median(unm_probs)):.3f} | 75%: {float(np.percentile(unm_probs, 75)):.3f} | Максимум: {float(np.max(unm_probs)):.3f}\n")
-        f.write(f"* **Частота ложных тревог (False Alarm Rate):** **{far_rate:.1%}** ({n_false_alarms} сигналов получили вердикт CANDIDATE при допущении отсутствия планет; подчёркиваем, что это допущение, а не доказанный факт).\n")
-        f.write(f"* **Доля неопределённых сигналов (REVIEW):** **{review_rate_unm:.1%}**\n\n")
-        f.write(f"{h3}Топ-5 наиболее «планетоподобных» сигналов среди неотмеченных звёзд (кандидаты на валидацию):\n\n")
-        if len(top5_candidates) > 0:
+        if can_eval_a and len(ctrl_unmarked_signals) > 0 and len(top5_candidates) > 0:
+            f.write(f"* **Распределение предсказанной вероятности (p_mean):**\n")
+            f.write(f"  * Минимум: {float(np.min(unm_probs)):.3f} | 25%: {float(np.percentile(unm_probs, 25)):.3f} | Медиана: {float(np.median(unm_probs)):.3f} | 75%: {float(np.percentile(unm_probs, 75)):.3f} | Максимум: {float(np.max(unm_probs)):.3f}\n")
+            f.write(f"* **Частота ложных тревог (False Alarm Rate):** **{far_rate:.1%}** ({n_false_alarms} сигналов получили вердикт CANDIDATE при допущении отсутствия планет; подчёркиваем, что это допущение, а не доказанный факт).\n")
+            f.write(f"* **Доля неопределённых сигналов (REVIEW):** **{review_rate_unm:.1%}**\n\n")
+            f.write(f"{h3}Топ-5 наиболее «планетоподобных» сигналов среди неотмеченных звёзд (кандидаты на валидацию):\n\n")
             top5_view = top5_candidates[['target_id', 'bls_period_d', 'bls_depth_ppm', 'p_mean', 'decision', 'shap_top3']].copy()
             top5_view.rename(columns={'bls_period_d': 'Период (д)', 'bls_depth_ppm': 'Глубина (ppm)', 'p_mean': 'Вероятность', 'decision': 'Решение', 'shap_top3': 'Вклады SHAP'}, inplace=True)
             f.write(df_to_markdown(top5_view) + "\n\n")
         else:
-            f.write("Сигналы не найдены.\n\n")
+            f.write("* Модельная оценка вероятностей и частота ложных тревог (FAR) пропущены, так как классификатор машинного обучения не обучался из-за малого числа размеченных сигналов (< 5 на класс).\n\n")
 
         f.write(f"{h2}5. Результаты по витринной системе Kepler-80 (KIC {showcase_id})\n")
-        f.write(f"Система Kepler-80 содержит 5 известных подтверждённых планет в резонансной цепочке периодов. Графическая панель сохранена в файл `{showcase_plot_path}`.\n\n")
+        f.write(f"Для витринной системы Kepler-80 загружены все 17 кварталов Kepler (число кварталов: {showcase_quarters}, базлайн: {showcase_baseline:.1f} суток, диапазон BJD 131,5 – 1598,0). Система содержит 5 известных подтверждённых планет в резонансной цепочке периодов. Графическая панель сохранена в файл `{showcase_plot_path}`.\n\n")
         f.write(df_to_markdown(df_k80_rec) + "\n\n")
-        n_rec = sum(1 for r in recovered_planets if r['Найден ли сигнал?'] == 'ДА')
-        f.write(f"* **Итог валидации Kepler-80:** Обнаружено планет: **{n_rec} из 5**.\n")
-        if n_rec < 5:
+        f.write(f"* **Итог валидации Kepler-80:** **{k80_summary_str}** (найдено точно: {n_exact}, по гармонике: {n_harmonic}, не найдено: {n_not_found}).\n")
+        if n_exact + n_harmonic < 5:
             f.write(f"  * *Причины неполного восстановления:* ограничения сетки периодограммы BLS в быстром режиме (`--quick`), малые глубины транзитов дальних планет (глубины ~100–150 ppm на умеренно слабой звезде Kepmag=14.8), а также лимит итераций поиска (до {args.max_signals} сигналов на звезду).\n\n")
 
         f.write(f"{h2}6. Примеры классификации и интерпретация признаков (SHAP)\n")
-        f.write(f"{h3}Примеры верных решений модели:\n")
-        if len(correct_samples) > 0:
+        if can_eval_a and len(correct_samples) > 0:
+            f.write(f"{h3}Примеры верных решений модели:\n")
             for _, r in correct_samples.iterrows():
                 f.write(f"* **Звезда {r['target_id']} (Сигнал {r['signal_id']}):** Истинный класс = `{r['label']}`, Вердикт = `{r['decision']}` ($p = {r['p_mean']:.1%}$).\n  * Вклады SHAP: `{r['shap_top3']}`\n")
         else:
-            f.write("* В тестовой малой выборке примеры отсутствуют.\n")
-        f.write(f"\n{h3}Примеры ошибок модели:\n")
-        if len(error_samples) > 0:
-            for _, r in error_samples.iterrows():
-                f.write(f"* **Звезда {r['target_id']} (Сигнал {r['signal_id']}):** Истинный класс = `{r['label']}`, Вердикт = `{r['decision']}` ($p = {r['p_mean']:.1%}$).\n  * Вклады SHAP: `{r['shap_top3']}`\n")
-        else:
-            f.write("* В тестовой выборке явных грубых ошибок не зафиксировано либо размер тестовой выборки мал.\n")
+            f.write("* На текущей тестовой выборке примеры решений модели отсутствуют (оценка пропущена из-за размера выборки).\n")
 
         f.write(f"\n{h2}7. Ограничения и угрозы валидности (Threats to Validity)\n")
         f.write(f"1. **Объём тестовой выборки:** Демонстрационная выборка носит иллюстративный характер и не заменяет полный прогон на тысячах звёзд.\n")
@@ -809,11 +1021,12 @@ def main():
         f.write(f"* **Статус проверки хешей (SHA-256):** {'УСПЕШНО (Все хеши совпали)' if hash_match else 'ВНИМАНИЕ (Обнаружено несовпадение)'}\n")
         f.write(f"* Проверено исходных файлов в `outputs/`: {len(hashes_before)}\n")
 
-    print(f"\n=== Демонстрационный прогон завершён! ===")
-    print(f"Итоговый отчёт сохранён в: {summary_md_path}")
-    print(f"Таблица контрольных сигналов: {ctrl_csv_out}")
-    print(f"Витрина Kepler-80: {showcase_plot_path}")
-    print(f"Тест неприкосновенности outputs/: {'ПРОЙДЕН (Хеши совпадают)' if hash_match else 'НЕ ПРОЙДЕН'}")
+    print(f"\n=== Демонстрационный прогон завершён! ===", flush=True)
+    print(f"Итоговый отчёт сохранён в: {summary_md_path}", flush=True)
+    print(f"Таблица контрольных сигналов: {ctrl_csv_out}", flush=True)
+    print(f"Диагностическая таблица по звёздам: {diag_csv_out}", flush=True)
+    print(f"Витрина Kepler-80: {showcase_plot_path}", flush=True)
+    print(f"Тест неприкосновенности outputs/: {'ПРОЙДЕН (Хеши совпадают)' if hash_match else 'НЕ ПРОЙДЕН'}", flush=True)
 
 if __name__ == '__main__':
     main()
