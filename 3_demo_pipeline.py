@@ -400,19 +400,21 @@ def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode
         lc_coll = sr.download_all(download_dir=cache_dir)
         lc_raw = lc_coll.stitch().remove_nans()
         lc_flat, _ = lc_raw.flatten(window_length=101, return_trend=True)
-        n_quarters = 17
+        n_quarters = len(lc_coll)
         times_raw = lc_raw.time.value
         flux_raw = lc_raw.flux.value
-        baseline_days = 1470.5
+        bjd_min = float(np.nanmin(times_raw))
+        bjd_max = float(np.nanmax(times_raw))
+        baseline_days = float(bjd_max - bjd_min)
         times_flat = lc_flat.time.value
         flux_flat = lc_flat.flux.value
-        print(f"  Kepler-80: загружено кварталов = {n_quarters}, базлайн = {baseline_days:.1f} д (BJD {times_raw[0]:.1f} - {times_raw[-1]:.1f})", flush=True)
+        print(f"  Kepler-80: загружено кварталов = {n_quarters}, базлайн = {baseline_days:.1f} д (BJD {bjd_min:.1f} - {bjd_max:.1f})", flush=True)
     except Exception as e:
         fig, ax = plt.subplots(figsize=(8, 6))
         ax.text(0.5, 0.5, f"Не удалось скачать кривую {showcase_id}: {e}", ha='center', va='center')
         plt.savefig(out_path)
         plt.close()
-        return 0, 0.0
+        return 0, 0.0, 0.0, 0.0
 
     dur_grid = np.linspace(0.04, 0.35, 4 if quick_mode else 10)
     bls = lc_flat.to_periodogram(method='bls', minimum_period=0.5, maximum_period=12.0, frequency_factor=5000 if quick_mode else 500, duration=dur_grid)
@@ -537,7 +539,7 @@ def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     plt.savefig(out_path, dpi=150)
     plt.close()
-    return n_quarters, baseline_days
+    return n_quarters, baseline_days, bjd_min, bjd_max
 
 def main():
     parser = argparse.ArgumentParser()
@@ -554,6 +556,7 @@ def main():
     parser.add_argument('--flatten-days', type=float, default=3.0)
     parser.add_argument('--max-signals', type=int, default=4)
     parser.add_argument('--star-timeout', type=float, default=1800.0)
+    parser.add_argument('--min-free-gb', type=float, default=1.0)
     args = parser.parse_args()
 
     out_dir = args.output_dir
@@ -601,7 +604,7 @@ def main():
 
     features_demo_csv = os.path.join(out_dir, f"features_demo{file_suffix}.csv")
     extractor_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), '1_data_extractor.py')
-    cmd_ext = [sys.executable, extractor_py, '--mission', 'Kepler', '--targets-file', targets_demo_file, '--output', features_demo_csv, '--workers', str(args.workers), '--star-timeout', str(args.star_timeout), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--cache-dir', args.cache_dir]
+    cmd_ext = [sys.executable, extractor_py, '--mission', 'Kepler', '--targets-file', targets_demo_file, '--output', features_demo_csv, '--workers', str(args.workers), '--star-timeout', str(args.star_timeout), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--cache-dir', args.cache_dir, '--min-free-gb', str(args.min_free_gb)]
     if args.quick:
         cmd_ext.append('--quick')
     if args.smoke_test:
@@ -614,11 +617,14 @@ def main():
         sys.exit(1)
     df_features = pd.read_csv(features_demo_csv, dtype={'target_id': str})
     failed_csv = os.path.join(out_dir, f"features_demo{file_suffix}_failed.csv")
-    failed_stars = set()
+    failed_stars = {}
     if os.path.exists(failed_csv) and os.path.getsize(failed_csv) > 0:
         try:
             df_fail = pd.read_csv(failed_csv, dtype={'target_id': str})
-            failed_stars = set(df_fail['target_id'].dropna().astype(str))
+            for _, fr in df_fail.iterrows():
+                f_id = str(fr.get('target_id', '')).strip()
+                if f_id:
+                    failed_stars[f_id] = str(fr.get('error', 'unknown error'))
         except Exception:
             pass
 
@@ -653,6 +659,15 @@ def main():
     for s in final_ctrl_u: split_records.append({'target_id': s, 'star_type': 'UNMARKED', 'split': 'CONTROL', 'primary_label': 'NONE'})
     pd.DataFrame(split_records).to_csv(os.path.join(out_dir, f"demo_stars_split{file_suffix}.csv"), index=False, encoding='utf-8')
 
+    eb_catalog_path = os.path.join('data', 'labels', 'kepler_eb_catalog.csv')
+    eb_stars_set = set()
+    if os.path.exists(eb_catalog_path):
+        try:
+            df_eb_cat = pd.read_csv(eb_catalog_path, dtype={'kepid': str})
+            eb_stars_set = set(df_eb_cat['kepid'].dropna().astype(str).str.lstrip('0'))
+        except Exception:
+            pass
+
     diag_source_csv = os.path.join(out_dir, f"features_demo{file_suffix}_diagnostics.csv")
     diag_map = {}
     if os.path.exists(diag_source_csv) and os.path.getsize(diag_source_csv) > 0:
@@ -674,6 +689,8 @@ def main():
             split_str = 'Контрольная'
         else:
             split_str = 'Отброшена для баланса'
+
+        is_eb = 'ДА' if str(sid).lstrip('0') in eb_stars_set else 'НЕТ'
 
         d_info = diag_map.get(sid)
         if d_info is not None:
@@ -716,7 +733,8 @@ def main():
             'время stitch (с)': round(tst, 2),
             'время bls (с)': round(tbls, 2),
             'время feats (с)': round(tfe, 2),
-            'время total (с)': round(ttot, 2)
+            'время total (с)': round(ttot, 2),
+            'Затменная двойная (EB Kirk+ 2016)': is_eb
         })
 
         diag_rows_md.append({
@@ -729,6 +747,7 @@ def main():
             'MATCHED/HARM/UNM': match_summary,
             'Макс. SDE / SNR': max_sde_snr_str,
             'Статус': stat_display,
+            'EB (каталог)': is_eb,
             'Время': f"{ttot:.1f} с"
         })
 
@@ -842,7 +861,11 @@ def main():
         top5_candidates = pd.DataFrame()
 
     ctrl_pred['star_type'] = ctrl_pred['target_id'].apply(lambda x: 'MARKED' if str(x) in set(final_ctrl_m) else 'UNMARKED')
-    out_table_cols = ['target_id', 'star_type', 'signal_id', 'bls_period_d', 'bls_depth_ppm', 'label', 'p_mean', 'p_std', 'decision', 'shap_top3']
+    ctrl_pred['is_artifact'] = (ctrl_pred['match_status'] == 'UNMATCHED') & ((ctrl_pred['bls_period_d'] >= 90.0) | (ctrl_pred['bls_depth_snr'] > 100.0))
+    ctrl_pred['possible_artifact'] = ctrl_pred['is_artifact'].apply(lambda x: 'ДА' if x else 'НЕТ')
+    ctrl_pred['is_kepler_eb'] = ctrl_pred['target_id'].astype(str).str.lstrip('0').apply(lambda x: 'ДА' if x in eb_stars_set else 'НЕТ')
+
+    out_table_cols = ['target_id', 'star_type', 'signal_id', 'bls_period_d', 'bls_depth_ppm', 'label', 'p_mean', 'p_std', 'decision', 'possible_artifact', 'is_kepler_eb', 'shap_top3']
     control_table = ctrl_pred[[c for c in out_table_cols if c in ctrl_pred]].copy()
     control_table.rename(columns={'bls_period_d': 'period_d', 'bls_depth_ppm': 'depth_ppm', 'label': 'catalog_label'}, inplace=True)
     control_table['catalog_label'] = control_table['catalog_label'].fillna('NONE')
@@ -852,9 +875,54 @@ def main():
     with open(ctrl_md_out, 'w', encoding='utf-8') as f:
         f.write(df_to_markdown(control_table) + "\n")
 
+    df_features['is_artifact'] = (df_features['match_status'] == 'UNMATCHED') & ((df_features['bls_period_d'] >= 90.0) | (df_features['bls_depth_snr'] > 100.0))
+    n_art_tr_m = int(np.sum((df_features['target_id'].isin(set(final_tr_m))) & df_features['is_artifact']))
+    n_unm_tr_m = int(np.sum((df_features['target_id'].isin(set(final_tr_m))) & (df_features['match_status'] == 'UNMATCHED')))
+    n_art_tr_u = int(np.sum((df_features['target_id'].isin(set(final_tr_u))) & df_features['is_artifact']))
+    n_unm_tr_u = int(np.sum((df_features['target_id'].isin(set(final_tr_u))) & (df_features['match_status'] == 'UNMATCHED')))
+    n_art_ctrl_m = int(np.sum((df_features['target_id'].isin(set(final_ctrl_m))) & df_features['is_artifact']))
+    n_unm_ctrl_m = int(np.sum((df_features['target_id'].isin(set(final_ctrl_m))) & (df_features['match_status'] == 'UNMATCHED')))
+    n_art_ctrl_u = int(np.sum((df_features['target_id'].isin(set(final_ctrl_u))) & df_features['is_artifact']))
+    n_unm_ctrl_u = int(np.sum((df_features['target_id'].isin(set(final_ctrl_u))) & (df_features['match_status'] == 'UNMATCHED')))
+
+    df_matched_all = df_features[df_features['match_status'] == 'MATCHED']
+    n_matched_total = len(df_matched_all)
+    n_matched_c1 = int(np.sum(df_matched_all['target_bin'] == 1))
+    n_matched_c0 = int(np.sum(df_matched_all['target_bin'] == 0))
+
+    df_matched_tr = df_matched_all[df_matched_all['target_id'].isin(set(final_tr_m))]
+    n_matched_tr = len(df_matched_tr)
+    n_tr_c1 = int(np.sum(df_matched_tr['target_bin'] == 1))
+    n_tr_c0 = int(np.sum(df_matched_tr['target_bin'] == 0))
+
+    df_matched_ctrl = df_matched_all[df_matched_all['target_id'].isin(set(final_ctrl_m))]
+    n_matched_ctrl = len(df_matched_ctrl)
+    n_ctrl_c1 = int(np.sum(df_matched_ctrl['target_bin'] == 1))
+    n_ctrl_c0 = int(np.sum(df_matched_ctrl['target_bin'] == 0))
+    n_ctrl_no_k80 = len(df_matched_ctrl[df_matched_ctrl['target_id'] != showcase_id])
+
+    tot_marked_stars = len(final_tr_m) + len(final_ctrl_m)
+    matched_per_marked = float(n_matched_total / tot_marked_stars) if tot_marked_stars > 0 else 0.0
+
+    n_failed_stars = len(failed_stars)
+    print("\n" + "="*50, flush=True)
+    print("СВОДКА РАЗМЕЧЕННЫХ СИГНАЛОВ И КАЧЕСТВА ДАННЫХ:", flush=True)
+    print(f"  Всего размеченных сигналов (MATCHED): {n_matched_total}", flush=True)
+    print(f"    - Класс 1 (CONFIRMED/CANDIDATE): {n_matched_c1}", flush=True)
+    print(f"    - Класс 0 (FALSE_POSITIVE): {n_matched_c0}", flush=True)
+    print(f"  Размеченных сигналов по половинам:", flush=True)
+    print(f"    - Обучающая половина: {n_matched_tr} (класс 1: {n_tr_c1}, класс 0: {n_tr_c0})", flush=True)
+    print(f"    - Контрольная половина: {n_matched_ctrl} (класс 1: {n_ctrl_c1}, класс 0: {n_ctrl_c0}; без Kepler-80: {n_ctrl_no_k80})", flush=True)
+    print(f"  Число размеченных сигналов на одну отмеченную звезду: {matched_per_marked:.2f} ({n_matched_total} / {tot_marked_stars})", flush=True)
+    print(f"  Число звёзд в _failed.csv: {n_failed_stars}", flush=True)
+    if n_failed_stars > 0:
+        for f_sid, f_err in failed_stars.items():
+            print(f"    * Звезда {f_sid}: {f_err}", flush=True)
+    print("="*50 + "\n", flush=True)
+
     showcase_signals = ctrl_pred[ctrl_pred['target_id'] == showcase_id].copy()
     showcase_plot_path = os.path.join(out_dir, f"showcase_kepler80{file_suffix}.png")
-    showcase_quarters, showcase_baseline = generate_showcase_figure(showcase_id, showcase_signals, showcase_plot_path, args.quick, cache_dir=args.cache_dir)
+    showcase_quarters, showcase_baseline, showcase_bjd_min, showcase_bjd_max = generate_showcase_figure(showcase_id, showcase_signals, showcase_plot_path, args.quick, cache_dir=args.cache_dir)
 
     known_planets = [
         {'planet': 'Kepler-80 b', 'koi': 'KOI-500.01', 'period_d': 7.053527},
@@ -929,18 +997,69 @@ def main():
         f.write(f"В таблице ниже приведены детальные результаты фотометрической обработки и поиска сигналов алгоритмом Box Least Squares (BLS) для каждой звезды выборки.\n\n")
         f.write(df_to_markdown(df_diag_md) + "\n\n")
 
-        f.write(f"{h3}Анализ звёзд с нулевым числом обнаруженных сигналов:\n")
-        f.write(f"1. **Звезда 11615258 (KOI-7953.01):** Каталожный орбитальный период планеты составляет $P = 367,07$ суток. Диапазон поиска BLS в пайплайне ограничен интервалом $[0,5, 100,0]$ суток, поэтому реальный планетный транзит находится за пределами сетки частот. Наибольший пик фотометрического шума зафиксирован на периоде 0,5015 д с $\\text{{SDE}} = 13,8$, однако отношение сигнал/шум глубины составило $\\text{{SNR}} = 5,9$ (ниже порога обнаружения 7,1). Сигнал обоснованно отсеян.\n")
-        f.write(f"2. **Звёзды 10025374 и 10070204:** Спокойные контрольные звёзды без известных планетных систем. Алгоритм BLS зафиксировал пики с высоким SDE (16,5 и 14,0 соответственно выше порога 7,0), однако отношение сигнал/шум составило $\\text{{SNR}} = 6,1$ и $5,8$ (ниже порога 7,1). В строгом соответствии с критериями качества данные пики шума были отклонены, что предотвратило появление ложных тревог.\n\n")
+        df_zero = df_diag_csv[df_diag_csv['найдено сигналов'] == 0]
+        if len(df_zero) > 0:
+            zero_rows = []
+            for _, zr in df_zero.iterrows():
+                z_tid = str(zr['target_id'])
+                z_type = str(zr['тип'])
+                z_sde = float(zr['максимальный SDE'])
+                z_snr = float(zr['максимальный SNR'])
+                z_eb = str(zr['Затменная двойная (EB Kirk+ 2016)'])
+                z_stat = str(zr['статус'])
+                z_cat_p = labels_df[labels_df['target_id'] == z_tid]['catalog_period'].dropna().tolist()
+                if 'FAILED' in z_stat:
+                    z_reason = f"Ошибка обработки ({z_stat})"
+                elif len(z_cat_p) > 0 and all(p > 100.0 for p in z_cat_p):
+                    p_strs = ', '.join(f"{p:.1f}" for p in z_cat_p)
+                    z_reason = f"Каталожный период вне диапазона поиска [0,5, 100,0] д ({p_strs} д)"
+                elif z_sde < 7.0 or z_snr < 7.1:
+                    z_reason = f"Пик ниже порога обнаружения (SDE={z_sde:.1f} < 7.0 или SNR={z_snr:.1f} < 7.1)"
+                else:
+                    z_reason = "Причина не установлена"
+                zero_rows.append({
+                    'Target ID': z_tid,
+                    'Тип': z_type,
+                    'Макс. SDE': f"{z_sde:.1f}",
+                    'Макс. SNR': f"{z_snr:.1f}",
+                    'EB (каталог)': z_eb,
+                    'Каталожные периоды (д)': ', '.join(f"{p:.2f}" for p in z_cat_p) if len(z_cat_p) > 0 else '-',
+                    'Причина отсутствия сигналов': z_reason
+                })
+            f.write(f"{h3}Анализ звёзд с нулевым числом обнаруженных сигналов:\n\n")
+            f.write(df_to_markdown(pd.DataFrame(zero_rows)) + "\n\n")
+        else:
+            f.write(f"{h3}Анализ звёзд с нулевым числом обнаруженных сигналов:\n")
+            f.write("В данном запуске на всех успешно обработанных звёздах обнаружен как минимум один периодический сигнал.\n\n")
 
-        f.write(f"{h3}Анализ поведения звёзд обучающей выборки:\n")
-        f.write(f"1. **Звезда 9489524 (KOI-245):** Реальная многопланетная система (4 планеты с периодами 16,3 д, 10,05 д, 6,88 д, 4,78 д). В быстром проверочном режиме (`--quick`, шаг частот 5000) сетка оказалась слишком грубой для фиксации узких планетных транзитов; алгоритм захватил квазипериодический инструментальный тренд на краю сетки ($P = 99,3$ д, $\\text{{SDE}} = 22,7$, $\\text{{SNR}} = 155,1$). Так как период не совпал с каталожными планетами с допуском 1%, сигнал получил статус UNMATCHED и был исключён из обучения.\n")
-        f.write(f"2. **Звезда 7116282 (KOI-7649):** Контактная затменная двойная система (каталожный период $P = 0,5668$ д). Алгоритм BLS уверенно обнаружил транзит на $P = 0,5668$ д ($\\text{{SDE}} = 28,3$, $\\text{{SNR}} = 12,7$) $\\to$ статус MATCHED, истинная каталожная метка FALSE_POSITIVE.\n\n")
+        f.write(f"{h2}2.2. Сводка по размеченным сигналам и качеству выборки\n")
+        f.write(f"* **Всего размеченных сигналов (MATCHED):** **{n_matched_total}**\n")
+        f.write(f"  * Класс 1 (CONFIRMED / CANDIDATE): **{n_matched_c1}**\n")
+        f.write(f"  * Класс 0 (FALSE_POSITIVE): **{n_matched_c0}**\n")
+        f.write(f"* **Разбиение по половинам выборки:**\n")
+        f.write(f"  * Обучающая половина: **{n_matched_tr}** (класс 1: {n_tr_c1}, класс 0: {n_tr_c0})\n")
+        f.write(f"  * Контрольная половина: **{n_matched_ctrl}** (класс 1: {n_ctrl_c1}, класс 0: {n_ctrl_c0}; без витринной Kepler-80: **{n_ctrl_no_k80}**)\n")
+        f.write(f"* **Среднее число размеченных сигналов на одну отмеченную звезду:** **{matched_per_marked:.2f}** ({n_matched_total} / {tot_marked_stars})\n")
+        if n_failed_stars > 0:
+            f.write(f"* **Число звёзд в `_failed.csv`:** **{n_failed_stars}**:\n")
+            for f_sid, f_err in failed_stars.items():
+                f.write(f"  * Звезда `{f_sid}`: `{f_err}`\n")
+        else:
+            f.write(f"* **Число звёзд в `_failed.csv`:** **0** (все звёзды выборки успешно загружены и обработаны без ошибок)\n")
+        f.write("\n")
 
-        f.write(f"{h3}Оценка последствий гипотетического смягчения порогов обнаружения:\n")
-        f.write(f"* Если снизить порог SNR глубины с 7,1 до 5,5, звёзды 11615258, 10025374 и 10070204 получили бы обнаруженные сигналы. Однако на спокойных звёздах эти сигналы представляют собой высокочастотные артефакты оцифровки и звёздной грануляции ($P \\sim 0,50–0,60$ д), что привело бы к резкому росту ложных тревог.\n")
-        f.write(f"* Для обнаружения KOI-7953.01 ($P = 367$ д) требуется расширение верхней границы поиска BLS до 400 суток с мелким шагом сетки, что многократно увеличивает время расчёта на 4-летнем базлайне.\n")
-        f.write(f"* Действующие стандартные пороги ($\\text{{SDE}} \\ge 7,0$, $\\text{{SNR}} \\ge 7,1$) являются астрофизически взвешенными и надёжно отсекают ложные срабатывания.\n\n")
+        f.write(f"{h2}2.3. Сводка несовпавших сигналов (UNMATCHED) и возможных артефактов\n")
+        f.write("Периодические сигналы на отмеченных звёздах, периоды которых не совпали с каталожными планетами или затменными двойными с допуском 1% (и их 0.5x, 2.0x гармониками), получают статус UNMATCHED. На неотмеченных звёздах все найденные сигналы получают статус UNMATCHED (каталожные метки отсутствуют).\n\n")
+        f.write("Сигналы со статусом UNMATCHED с орбитальным периодом P >= 90.0 суток или отношением сигнал/шум глубины SNR > 100.0 отмечены как **возможные артефакты** (инструментальные дрейфы на краю сетки BLS или фотометрические скачки). Данные сигналы **не исключаются** из выборки, а сохраняются в результирующей таблице с соответствующей пометкой.\n\n")
+
+        unm_summary_rows = [
+            {'Половина': 'Обучающая', 'Тип звёзд': 'Отмеченные (KOI)', 'Всего UNMATCHED': n_unm_tr_m, 'Из них возможных артефактов': n_art_tr_m},
+            {'Половина': 'Обучающая', 'Тип звёзд': 'Неотмеченные', 'Всего UNMATCHED': n_unm_tr_u, 'Из них возможных артефактов': n_art_tr_u},
+            {'Половина': 'Контрольная', 'Тип звёзд': 'Отмеченные (KOI)', 'Всего UNMATCHED': n_unm_ctrl_m, 'Из них возможных артефактов': n_art_ctrl_m},
+            {'Половина': 'Контрольная', 'Тип звёзд': 'Неотмеченные', 'Всего UNMATCHED': n_unm_ctrl_u, 'Из них возможных артефактов': n_art_ctrl_u},
+            {'Половина': 'ИТОГО', 'Тип звёзд': 'Все группы', 'Всего UNMATCHED': n_unm_tr_m + n_unm_tr_u + n_unm_ctrl_m + n_unm_ctrl_u, 'Из них возможных артефактов': n_art_tr_m + n_art_tr_u + n_art_ctrl_m + n_art_ctrl_u}
+        ]
+        f.write(df_to_markdown(pd.DataFrame(unm_summary_rows)) + "\n\n")
 
         f.write(f"{h2}3. Раздел А: Оценка на отмеченных звёздах контрольной части (есть истинные метки)\n")
         if can_eval_a and len(ctrl_m_eval) > 0 and acc_a is not None:
@@ -996,11 +1115,11 @@ def main():
             f.write("* Модельная оценка вероятностей и частота ложных тревог (FAR) пропущены, так как классификатор машинного обучения не обучался из-за малого числа размеченных сигналов (< 5 на класс).\n\n")
 
         f.write(f"{h2}5. Результаты по витринной системе Kepler-80 (KIC {showcase_id})\n")
-        f.write(f"Для витринной системы Kepler-80 загружены все 17 кварталов Kepler (число кварталов: {showcase_quarters}, базлайн: {showcase_baseline:.1f} суток, диапазон BJD 131,5 – 1598,0). Система содержит 5 известных подтверждённых планет в резонансной цепочке периодов. Графическая панель сохранена в файл `{showcase_plot_path}`.\n\n")
+        f.write(f"Для витринной системы Kepler-80 загружены все 17 кварталов Kepler (число кварталов: {showcase_quarters}, базлайн: {showcase_baseline:.1f} суток, диапазон BJD {showcase_bjd_min:.1f} – {showcase_bjd_max:.1f}). Система содержит 5 известных подтверждённых планет в резонансной цепочке периодов. Графическая панель сохранена в файл `{showcase_plot_path}`.\n\n")
         f.write(df_to_markdown(df_k80_rec) + "\n\n")
         f.write(f"* **Итог валидации Kepler-80:** **{k80_summary_str}** (найдено точно: {n_exact}, по гармонике: {n_harmonic}, не найдено: {n_not_found}).\n")
         if n_exact + n_harmonic < 5:
-            f.write(f"  * *Причины неполного восстановления:* ограничения сетки периодограммы BLS в быстром режиме (`--quick`), малые глубины транзитов дальних планет (глубины ~100–150 ppm на умеренно слабой звезде Kepmag=14.8), а также лимит итераций поиска (до {args.max_signals} сигналов на звезду).\n\n")
+            f.write(f"  * *Для ненайденных планет:* причина не установлена (требуется дополнительный специализированный анализ периодограммы BLS и фазовой кривой без умозрительных предположений).\n\n")
 
         f.write(f"{h2}6. Примеры классификации и интерпретация признаков (SHAP)\n")
         if can_eval_a and len(correct_samples) > 0:

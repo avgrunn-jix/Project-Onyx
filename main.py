@@ -191,7 +191,8 @@ def main():
 
     elif args.mode == 'demo':
         demo_script = os.path.join(base_dir, '3_demo_pipeline.py')
-        cmd = [sys.executable, demo_script, '--marked-stars', str(args.marked_stars), '--unmarked-stars', str(args.unmarked_stars), '--seed', str(args.seed), '--showcase-star', str(args.showcase_star), '--workers', str(args.workers), '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals)]
+        eff_min_free = 1.0 if args.smoke_test and args.min_free_gb == 5.0 else args.min_free_gb
+        cmd = [sys.executable, demo_script, '--marked-stars', str(args.marked_stars), '--unmarked-stars', str(args.unmarked_stars), '--seed', str(args.seed), '--showcase-star', str(args.showcase_star), '--workers', str(args.workers), '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--min-free-gb', str(eff_min_free)]
         if args.output_dir:
             cmd.extend(['--output-dir', args.output_dir])
         if args.unmarked_file:

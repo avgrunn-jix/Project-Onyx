@@ -588,6 +588,8 @@ def main():
     parser.add_argument('--max-sectors', type=int, default=0, help='[DEBUG ONLY] Limit the number of sectors/quarters downloaded. Warning: alters baseline, features, and detection results; not for production training.')
     parser.add_argument('--smoke-test', action='store_true', help='[TEST ONLY] Run extractor in isolated smoke test mode, writing outputs to outputs/_smoke_test/')
     args = parser.parse_args()
+    if args.smoke_test and args.min_free_gb == 5.0:
+        args.min_free_gb = 1.0
     logger = setup_logger()
 
     logical_cores = os.cpu_count() or 1
@@ -677,15 +679,15 @@ def main():
 
     if args.inject:
         all_tids = labels_df['target_id'].unique().tolist()
-        quiet_stars = []
+        unmarked_stars = []
         if args.targets_file and os.path.exists(args.targets_file):
             tids_from_file = read_targets_file(args.targets_file)
-            quiet_stars = [tid for tid in tids_from_file if tid not in all_tids]
+            unmarked_stars = [tid for tid in tids_from_file if tid not in all_tids]
         else:
             logger.error("Please provide --targets-file with a list of target IDs for injection (which will be filtered to exclude KOIs).")
             return
-        np.random.shuffle(quiet_stars)
-        quiet_stars = quiet_stars[:args.injection_stars]
+        np.random.shuffle(unmarked_stars)
+        unmarked_stars = unmarked_stars[:args.injection_stars]
 
         inj_out = args.injection_output
         if args.quick and not '_quick' in inj_out:
@@ -722,7 +724,7 @@ def main():
                 pass
 
         tasks = []
-        for tid in quiet_stars:
+        for tid in unmarked_stars:
             tid_str = str(tid)
             if tid_str in completed_inj_stars:
                 continue
@@ -844,7 +846,7 @@ def main():
                 processed_ids.update(df_diag[df_diag['status'] == 'OK']['target_id'].dropna().astype(str))
             except Exception:
                 pass
-        if os.path.exists(args.output) and os.path.getsize(args.output) > 0:
+        elif os.path.exists(args.output) and os.path.getsize(args.output) > 0:
             try:
                 df_exist = pd.read_csv(args.output, usecols=['target_id'], dtype=str)
                 processed_ids.update(df_exist['target_id'].dropna().astype(str))
@@ -1006,6 +1008,24 @@ def main():
                     logger.error(f"Error on {tid_str}: {err}")
                     log_failure(failed_csv, tid_str, err, failed_attempts)
                     skip_count += 1
+                    diag_row = {
+                        'target_id': tid_str,
+                        'n_quarters': 0,
+                        'baseline_d': 0.0,
+                        'signals_found': 0,
+                        'matched_count': 0,
+                        'harmonic_count': 0,
+                        'unmatched_count': 0,
+                        'status': f'FAILED: {err}',
+                        'max_sde': 0.0,
+                        'max_snr': 0.0,
+                        'time_dl_s': 0.0,
+                        'time_stitch_s': 0.0,
+                        'time_bls_s': 0.0,
+                        'time_feats_s': 0.0,
+                        'time_total_s': round(args.star_timeout, 2)
+                    }
+                    append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     completed_stars += 1
                     durations.append(args.star_timeout)
                     avg_time = sum(durations) / len(durations)
