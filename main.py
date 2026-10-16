@@ -4,6 +4,7 @@ import sys
 import logging
 import os
 import tempfile
+import shutil
 
 def get_effective_output(out_path, default_base, is_quick, max_sectors, is_smoke):
     base_dir = os.path.join('outputs', '_smoke_test') if is_smoke else ''
@@ -53,6 +54,14 @@ def main():
     parser.add_argument('--unmarked-file', default='')
     parser.add_argument('--output-dir', default='')
     args = parser.parse_args()
+
+    if args.smoke_test and args.min_free_gb == 5.0:
+        args.min_free_gb = 1.0
+    free_now_gb = shutil.disk_usage(os.path.abspath('.')).free / (1024**3)
+    print(f"Свободное место на диске: {free_now_gb:.2f} ГБ (требуемый минимум: {args.min_free_gb:.2f} ГБ)", flush=True)
+    if free_now_gb < args.min_free_gb:
+        print(f"Ошибка: Недостаточно свободного места на диске ({free_now_gb:.2f} ГБ < {args.min_free_gb:.2f} ГБ). Освободите место или используйте параметр --min-free-gb.", flush=True)
+        sys.exit(1)
 
     logical_cores = os.cpu_count() or 1
     cpu_msg = f"Detected CPU cores: {logical_cores} logical. Default workers: {args.workers}. Note: on systems with Hyper-Threading (SMT), the optimal number of worker processes for CPU-bound BLS computation is typically equal to the number of physical cores."

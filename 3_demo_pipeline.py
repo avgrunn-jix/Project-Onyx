@@ -398,9 +398,20 @@ def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode
         if len(sr) == 0:
             sr = lk.search_lightcurve(f"{showcase_id}", mission='Kepler', cadence='long')
         lc_coll = sr.download_all(download_dir=cache_dir)
+        filtered_lcs = []
+        for c_lc in lc_coll:
+            exp_val = getattr(c_lc, 'exptime', None)
+            if exp_val is None and hasattr(c_lc, 'meta') and isinstance(c_lc.meta, dict):
+                exp_val = c_lc.meta.get('EXPTIME')
+            if exp_val is None or exp_val >= 1700.0:
+                filtered_lcs.append(c_lc)
+        if len(filtered_lcs) > 0:
+            lc_coll = lk.LightCurveCollection(filtered_lcs)
+        n_files = len(lc_coll)
+        unique_quarters = set(lc.quarter for lc in lc_coll if getattr(lc, 'quarter', None) is not None)
+        n_quarters = len(unique_quarters) if len(unique_quarters) > 0 else n_files
         lc_raw = lc_coll.stitch().remove_nans()
         lc_flat, _ = lc_raw.flatten(window_length=101, return_trend=True)
-        n_quarters = len(lc_coll)
         times_raw = lc_raw.time.value
         flux_raw = lc_raw.flux.value
         bjd_min = float(np.nanmin(times_raw))
@@ -408,13 +419,13 @@ def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode
         baseline_days = float(bjd_max - bjd_min)
         times_flat = lc_flat.time.value
         flux_flat = lc_flat.flux.value
-        print(f"  Kepler-80: загружено кварталов = {n_quarters}, базлайн = {baseline_days:.1f} д (BJD {bjd_min:.1f} - {bjd_max:.1f})", flush=True)
+        print(f"  Kepler-80: загружено файлов = {n_files}, уник. кварталов = {n_quarters}, базлайн = {baseline_days:.1f} д (BJD {bjd_min:.1f} - {bjd_max:.1f})", flush=True)
     except Exception as e:
         fig, ax = plt.subplots(figsize=(8, 6))
         ax.text(0.5, 0.5, f"Не удалось скачать кривую {showcase_id}: {e}", ha='center', va='center')
         plt.savefig(out_path)
         plt.close()
-        return 0, 0.0, 0.0, 0.0
+        return 0, 0, 0.0, 0.0, 0.0
 
     dur_grid = np.linspace(0.04, 0.35, 4 if quick_mode else 10)
     bls = lc_flat.to_periodogram(method='bls', minimum_period=0.5, maximum_period=12.0, frequency_factor=5000 if quick_mode else 500, duration=dur_grid)
@@ -431,7 +442,7 @@ def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode
     ax1 = fig.add_subplot(gs[0, 0])
     sub_step = max(1, len(times_raw) // 15000)
     ax1.plot(times_raw[::sub_step], flux_raw[::sub_step], 'k.', markersize=1, alpha=0.5)
-    ax1.set_title(f"Kepler-80 (KIC {showcase_id}): Исходная фотометрия (Raw Light Curve, {n_quarters} кварталов, базлайн {baseline_days:.1f} д)")
+    ax1.set_title(f"Kepler-80 (KIC {showcase_id}): Исходная фотометрия ({n_files} файлов, {n_quarters} уник. кварталов, базлайн {baseline_days:.1f} д)")
     ax1.set_xlabel("Время (BJD - 2454833)")
     ax1.set_ylabel("Нормированный поток")
 
@@ -539,7 +550,7 @@ def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     plt.savefig(out_path, dpi=150)
     plt.close()
-    return n_quarters, baseline_days, bjd_min, bjd_max
+    return n_files, n_quarters, baseline_days, bjd_min, bjd_max
 
 def main():
     parser = argparse.ArgumentParser()
@@ -556,8 +567,16 @@ def main():
     parser.add_argument('--flatten-days', type=float, default=3.0)
     parser.add_argument('--max-signals', type=int, default=4)
     parser.add_argument('--star-timeout', type=float, default=1800.0)
-    parser.add_argument('--min-free-gb', type=float, default=1.0)
+    parser.add_argument('--min-free-gb', type=float, default=5.0)
     args = parser.parse_args()
+
+    if args.smoke_test and args.min_free_gb == 5.0:
+        args.min_free_gb = 1.0
+    free_now_gb = shutil.disk_usage(os.path.abspath('.')).free / (1024**3)
+    print(f"Свободное место на диске: {free_now_gb:.2f} ГБ (требуемый минимум: {args.min_free_gb:.2f} ГБ)", flush=True)
+    if free_now_gb < args.min_free_gb:
+        print(f"Ошибка: Недостаточно свободного места на диске ({free_now_gb:.2f} ГБ < {args.min_free_gb:.2f} ГБ). Освободите место или используйте параметр --min-free-gb.", flush=True)
+        sys.exit(1)
 
     out_dir = args.output_dir
     if args.smoke_test and not '_smoke_test' in out_dir:
@@ -694,6 +713,7 @@ def main():
 
         d_info = diag_map.get(sid)
         if d_info is not None:
+            nf = int(d_info.get('n_files', d_info.get('n_quarters', 0)))
             nq = int(d_info.get('n_quarters', 0))
             bd = float(d_info.get('baseline_d', 0.0))
             nsig = int(d_info.get('signals_found', 0))
@@ -709,7 +729,7 @@ def main():
             tfe = float(d_info.get('time_feats_s', 0.0))
             ttot = float(d_info.get('time_total_s', 0.0))
         else:
-            nq, bd, nsig, mc, hc, uc = 0, 0.0, 0, 0, 0, 0
+            nf, nq, bd, nsig, mc, hc, uc = 0, 0, 0.0, 0, 0, 0, 0
             stat = 'Не найдена в логе'
             msde, msnr = 0.0, 0.0
             tdl, tst, tbls, tfe, ttot = 0.0, 0.0, 0.0, 0.0, 0.0
@@ -722,7 +742,8 @@ def main():
             'target_id': sid,
             'тип': st_type_str,
             'половина': split_str,
-            'число скачанных кварталов': nq,
+            'число файлов': nf,
+            'число уникальных кварталов': nq,
             'базлайн в сутках': round(bd, 2),
             'найдено сигналов': nsig,
             'MATCHED/HARMONIC/UNMATCHED': match_summary,
@@ -741,7 +762,8 @@ def main():
             'Target ID': sid,
             'Тип': st_type_str,
             'Половина': split_str,
-            'Кварталов': nq,
+            'Файлов': nf,
+            'Кварталов (уник.)': nq,
             'Базлайн (д)': f"{bd:.1f}",
             'Сигналов': nsig,
             'MATCHED/HARM/UNM': match_summary,
@@ -782,7 +804,7 @@ def main():
     can_eval_a = (model_a is not None)
     can_eval_b = (model_b is not None)
 
-    ctrl_m_eval = ctrl_pred[(ctrl_pred['target_id'].isin(set(final_ctrl_m))) & (ctrl_pred['match_status'] == 'MATCHED')].copy()
+    ctrl_m_eval = ctrl_pred[(ctrl_pred['target_id'].isin(set(final_ctrl_m))) & (ctrl_pred['target_id'] != showcase_id) & (ctrl_pred['match_status'] == 'MATCHED')].copy()
     y_ctrl_true = ctrl_m_eval['target_bin'].values
     y_ctrl_prob = ctrl_m_eval['p_mean'].values
 
@@ -922,7 +944,7 @@ def main():
 
     showcase_signals = ctrl_pred[ctrl_pred['target_id'] == showcase_id].copy()
     showcase_plot_path = os.path.join(out_dir, f"showcase_kepler80{file_suffix}.png")
-    showcase_quarters, showcase_baseline, showcase_bjd_min, showcase_bjd_max = generate_showcase_figure(showcase_id, showcase_signals, showcase_plot_path, args.quick, cache_dir=args.cache_dir)
+    showcase_n_files, showcase_quarters, showcase_baseline, showcase_bjd_min, showcase_bjd_max = generate_showcase_figure(showcase_id, showcase_signals, showcase_plot_path, args.quick, cache_dir=args.cache_dir)
 
     known_planets = [
         {'planet': 'Kepler-80 b', 'koi': 'KOI-500.01', 'period_d': 7.053527},
@@ -1014,7 +1036,12 @@ def main():
                     p_strs = ', '.join(f"{p:.1f}" for p in z_cat_p)
                     z_reason = f"Каталожный период вне диапазона поиска [0,5, 100,0] д ({p_strs} д)"
                 elif z_sde < 7.0 or z_snr < 7.1:
-                    z_reason = f"Пик ниже порога обнаружения (SDE={z_sde:.1f} < 7.0 или SNR={z_snr:.1f} < 7.1)"
+                    if z_sde < 7.0 and z_snr < 7.1:
+                        z_reason = f"Пик ниже порога обнаружения: SDE={z_sde:.1f} ниже порога 7,0; SNR={z_snr:.1f} ниже порога 7,1"
+                    elif z_sde < 7.0:
+                        z_reason = f"Пик ниже порога обнаружения: SDE={z_sde:.1f} ниже порога 7,0; SNR={z_snr:.1f} выше порога 7,1"
+                    else:
+                        z_reason = f"Пик ниже порога обнаружения: SNR={z_snr:.1f} ниже порога 7,1; SDE={z_sde:.1f} выше порога 7,0"
                 else:
                     z_reason = "Причина не установлена"
                 zero_rows.append({
@@ -1041,11 +1068,11 @@ def main():
         f.write(f"  * Контрольная половина: **{n_matched_ctrl}** (класс 1: {n_ctrl_c1}, класс 0: {n_ctrl_c0}; без витринной Kepler-80: **{n_ctrl_no_k80}**)\n")
         f.write(f"* **Среднее число размеченных сигналов на одну отмеченную звезду:** **{matched_per_marked:.2f}** ({n_matched_total} / {tot_marked_stars})\n")
         if n_failed_stars > 0:
-            f.write(f"* **Число звёзд в `_failed.csv`:** **{n_failed_stars}**:\n")
+            f.write(f"* **Число звёзд в `_failed.csv` (не удалось скачать или обработать после всех повторных попыток):** **{n_failed_stars}**:\n")
             for f_sid, f_err in failed_stars.items():
                 f.write(f"  * Звезда `{f_sid}`: `{f_err}`\n")
         else:
-            f.write(f"* **Число звёзд в `_failed.csv`:** **0** (все звёзды выборки успешно загружены и обработаны без ошибок)\n")
+            f.write(f"* **Число звёзд в `_failed.csv`:** **0** (все звёзды выборки успешно загружены и обработаны без ошибок после повторных попыток)\n")
         f.write("\n")
 
         f.write(f"{h2}2.3. Сводка несовпавших сигналов (UNMATCHED) и возможных артефактов\n")
@@ -1062,8 +1089,9 @@ def main():
         f.write(df_to_markdown(pd.DataFrame(unm_summary_rows)) + "\n\n")
 
         f.write(f"{h2}3. Раздел А: Оценка на отмеченных звёздах контрольной части (есть истинные метки)\n")
+        f.write(f"*(Примечание: витринная система Kepler-80 исключена из количественных метрик Раздела А и оценивается качественно и независимо в Разделе 5)*\n\n")
         if can_eval_a and len(ctrl_m_eval) > 0 and acc_a is not None:
-            f.write(f"* **Всего размеченных сигналов (MATCHED):** {len(ctrl_m_eval)}\n")
+            f.write(f"* **Всего размеченных сигналов (MATCHED) для оценки (без Kepler-80):** {len(ctrl_m_eval)}\n")
             f.write(f"* **Матрица ошибок (Confusion Matrix):**\n```\n{cm_a}\n```\n")
             f.write(f"* **Метрики качества (Направление А):**\n")
             f.write(f"  * Точность (Accuracy): **{acc_a:.3f}** (90% ДИ бутстрапом по звёздам: [{boot_res['acc_ci'][0]:.3f}, {boot_res['acc_ci'][1]:.3f}])\n")
@@ -1115,7 +1143,7 @@ def main():
             f.write("* Модельная оценка вероятностей и частота ложных тревог (FAR) пропущены, так как классификатор машинного обучения не обучался из-за малого числа размеченных сигналов (< 5 на класс).\n\n")
 
         f.write(f"{h2}5. Результаты по витринной системе Kepler-80 (KIC {showcase_id})\n")
-        f.write(f"Для витринной системы Kepler-80 загружены все 17 кварталов Kepler (число кварталов: {showcase_quarters}, базлайн: {showcase_baseline:.1f} суток, диапазон BJD {showcase_bjd_min:.1f} – {showcase_bjd_max:.1f}). Система содержит 5 известных подтверждённых планет в резонансной цепочке периодов. Графическая панель сохранена в файл `{showcase_plot_path}`.\n\n")
+        f.write(f"Для витринной системы Kepler-80 загружено {showcase_n_files} файлов ({showcase_quarters} уникальных кварталов Kepler, базлайн: {showcase_baseline:.1f} суток, диапазон BJD {showcase_bjd_min:.1f} – {showcase_bjd_max:.1f}). Система содержит 5 известных подтверждённых планет в резонансной цепочке периодов. Графическая панель сохранена в файл `{showcase_plot_path}`.\n\n")
         f.write(df_to_markdown(df_k80_rec) + "\n\n")
         f.write(f"* **Итог валидации Kepler-80:** **{k80_summary_str}** (найдено точно: {n_exact}, по гармонике: {n_harmonic}, не найдено: {n_not_found}).\n")
         if n_exact + n_harmonic < 5:

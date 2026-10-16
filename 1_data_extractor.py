@@ -189,22 +189,39 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
     os.makedirs(tmp_dir, exist_ok=True)
     try:
         author = 'Kepler' if mission == 'Kepler' else 'SPOC'
-        search_target = f"TIC {tid}" if mission == 'TESS' and not str(tid).startswith('TIC') else tid
+        search_target = f"KIC {tid}" if mission == 'Kepler' and not str(tid).startswith('KIC') else (f"TIC {tid}" if mission == 'TESS' and not str(tid).startswith('TIC') else str(tid))
         for attempt in range(3):
             if time.time() > deadline:
                 return None, tid, f'TimeoutError: Exceeded {star_timeout}s'
             try:
                 search_result = lk.search_lightcurve(search_target, author=author, cadence='long')
-                break
+                if search_result is not None and len(search_result) > 0:
+                    break
             except Exception:
-                time.sleep(2 ** attempt)
+                time.sleep(2 ** (attempt + 1))
         else: return None, tid, 'Download failed'
         if len(search_result) == 0: return None, tid, 'No lightcurves found'
+        if mission == 'Kepler' and 'target_name' in search_result.table.colnames:
+            tid_digits = str(tid).lstrip('0')
+            target_mask = [tid_digits in str(t_name).lstrip('0') for t_name in search_result.table['target_name']]
+            if any(target_mask):
+                search_result = search_result[target_mask]
         if max_sectors > 0 and len(search_result) > max_sectors:
             search_result = search_result[:max_sectors]
         if time.time() > deadline:
             return None, tid, f'TimeoutError: Exceeded {star_timeout}s'
-        lc_col = search_result.download_all(download_dir=tmp_dir)
+        lc_col = None
+        for dl_attempt in range(3):
+            if time.time() > deadline:
+                return None, tid, f'TimeoutError: Exceeded {star_timeout}s'
+            try:
+                lc_col = search_result.download_all(download_dir=tmp_dir)
+                if lc_col is not None and len(lc_col) > 0:
+                    break
+            except Exception as dl_err:
+                if dl_attempt == 2:
+                    return None, tid, f'DownloadError: {dl_err}'
+                time.sleep(2 ** (dl_attempt + 1))
         if lc_col is None or len(lc_col) == 0: return None, tid, 'No lightcurves found'
         detrend_centroids(lc_col, flatten_days)
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
@@ -296,30 +313,68 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
     try:
         t_dl_start = time.time()
         author = 'Kepler' if mission == 'Kepler' else 'SPOC'
-        search_target = f"TIC {tid}" if mission == 'TESS' and not str(tid).startswith('TIC') else tid
+        search_target = f"KIC {tid}" if mission == 'Kepler' and not str(tid).startswith('KIC') else (f"TIC {tid}" if mission == 'TESS' and not str(tid).startswith('TIC') else str(tid))
         for attempt in range(3):
             if time.time() > deadline:
                 return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
             try:
                 search_result = lk.search_lightcurve(search_target, author=author, cadence='long')
-                break
+                if search_result is not None and len(search_result) > 0:
+                    break
             except Exception:
-                time.sleep(2 ** attempt)
+                time.sleep(2 ** (attempt + 1))
         else:
             return None, None, tid, 'Download failed', dl_size, None
         if len(search_result) == 0:
             return None, None, tid, 'No lightcurves found', dl_size, None
+        if mission == 'Kepler' and 'target_name' in search_result.table.colnames:
+            tid_digits = str(tid).lstrip('0')
+            target_mask = [tid_digits in str(t_name).lstrip('0') for t_name in search_result.table['target_name']]
+            if any(target_mask):
+                search_result = search_result[target_mask]
         if max_sectors > 0 and len(search_result) > max_sectors:
             search_result = search_result[:max_sectors]
         if time.time() > deadline:
             return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
-        lc_col = search_result.download_all(download_dir=tmp_dir)
+        lc_col = None
+        for dl_attempt in range(3):
+            if time.time() > deadline:
+                return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
+            try:
+                lc_col = search_result.download_all(download_dir=tmp_dir)
+                if lc_col is not None and len(lc_col) > 0:
+                    break
+            except Exception as dl_err:
+                if dl_attempt == 2:
+                    return None, None, tid, f'DownloadError: {dl_err}', dl_size, None
+                time.sleep(2 ** (dl_attempt + 1))
         dl_size = get_dir_size(tmp_dir)
         t_dl_end = time.time()
         timing_dl = t_dl_end - t_dl_start
 
         if lc_col is None or len(lc_col) == 0:
             return None, None, tid, 'No lightcurves found', dl_size, None
+
+        filtered_lcs = []
+        for c_lc in lc_col:
+            exp_val = getattr(c_lc, 'exptime', None)
+            if exp_val is None and hasattr(c_lc, 'meta') and isinstance(c_lc.meta, dict):
+                exp_val = c_lc.meta.get('EXPTIME')
+            if exp_val is None or exp_val >= 1700.0:
+                filtered_lcs.append(c_lc)
+        if len(filtered_lcs) > 0:
+            lc_col = lk.LightCurveCollection(filtered_lcs)
+
+        n_files = len(lc_col) if 'lc_col' in locals() and lc_col is not None else 0
+        unique_quarters = set()
+        if 'lc_col' in locals() and lc_col is not None:
+            for c_lc in lc_col:
+                q_val = getattr(c_lc, 'quarter', None)
+                if q_val is None and hasattr(c_lc, 'meta') and isinstance(c_lc.meta, dict):
+                    q_val = c_lc.meta.get('QUARTER')
+                if q_val is not None:
+                    unique_quarters.add(q_val)
+        n_quarters = len(unique_quarters) if len(unique_quarters) > 0 else n_files
 
         t_stitch_start = time.time()
         detrend_centroids(lc_col, flatten_days)
@@ -536,7 +591,8 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'bls_details': timing_bls_details,
             'feats': sum(timing_feats),
             'total': timing_total,
-            'n_quarters': len(lc_col) if 'lc_col' in locals() and lc_col is not None else 0,
+            'n_files': n_files if 'n_files' in locals() else (len(lc_col) if 'lc_col' in locals() and lc_col is not None else 0),
+            'n_quarters': n_quarters if 'n_quarters' in locals() else (len(lc_col) if 'lc_col' in locals() and lc_col is not None else 0),
             'baseline_d': baseline_d if 'baseline_d' in locals() else 0.0
         }
         return features_list, curves_dict, tid, None, dl_size, timings
@@ -590,6 +646,11 @@ def main():
     args = parser.parse_args()
     if args.smoke_test and args.min_free_gb == 5.0:
         args.min_free_gb = 1.0
+    free_now_gb = shutil.disk_usage(os.path.abspath('.')).free / (1024**3)
+    print(f"Свободное место на диске: {free_now_gb:.2f} ГБ (требуемый минимум: {args.min_free_gb:.2f} ГБ)", flush=True)
+    if free_now_gb < args.min_free_gb:
+        print(f"Ошибка: Недостаточно свободного места на диске ({free_now_gb:.2f} ГБ < {args.min_free_gb:.2f} ГБ). Освободите место или используйте параметр --min-free-gb.", flush=True)
+        sys.exit(1)
     logger = setup_logger()
 
     logical_cores = os.cpu_count() or 1
@@ -916,6 +977,7 @@ def main():
                     skip_count += 1
                     diag_row = {
                         'target_id': tid_str,
+                        'n_files': 0,
                         'n_quarters': 0,
                         'baseline_d': 0.0,
                         'signals_found': 0,
@@ -934,6 +996,7 @@ def main():
                     append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                 else:
                     success_count += 1
+                    n_f = timings.get('n_files', 0) if timings else 0
                     n_q = timings.get('n_quarters', 0) if timings else 0
                     b_d = timings.get('baseline_d', 0.0) if timings else 0.0
                     n_sig = len(feats) if feats else 0
@@ -945,6 +1008,7 @@ def main():
                     m_snr = max([d.get('snr', 0.0) for d in b_details]) if b_details else 0.0
                     diag_row = {
                         'target_id': tid_str,
+                        'n_files': n_f,
                         'n_quarters': n_q,
                         'baseline_d': round(b_d, 2),
                         'signals_found': n_sig,
@@ -1010,6 +1074,7 @@ def main():
                     skip_count += 1
                     diag_row = {
                         'target_id': tid_str,
+                        'n_files': 0,
                         'n_quarters': 0,
                         'baseline_d': 0.0,
                         'signals_found': 0,
@@ -1042,6 +1107,74 @@ def main():
                         active_futures[next_f] = (next_t[0], time.time())
                     except StopIteration:
                         pass
+
+        if failed_attempts:
+            retry_targets = [t for t in tasks if t[0] in failed_attempts]
+            if retry_targets:
+                logger.info(f"Повторный проход (retry pass) по {len(retry_targets)} упавшим звёздам...")
+                print(f"\nПовторный проход по {len(retry_targets)} упавшим звёздам...", flush=True)
+                recovered_stars = set()
+                for rt in retry_targets:
+                    r_tid_str = rt[0]
+                    feats, curves, tid, err, dl_size, timings = process_single_star(*rt)
+                    if not err:
+                        logger.info(f"Звезда {r_tid_str} успешно обработана при повторном проходе!")
+                        print(f"Звезда {r_tid_str} успешно обработана при повторном проходе!", flush=True)
+                        success_count += 1
+                        skip_count = max(0, skip_count - 1)
+                        recovered_stars.add(r_tid_str)
+                        if feats:
+                            append_to_csv_flush(args.output, pd.DataFrame(feats))
+                            for item in feats:
+                                m_st = item.get('match_status', 'UNMATCHED')
+                                match_stats[m_st] = match_stats.get(m_st, 0) + 1
+                        if curves:
+                            if os.path.exists(npz_path):
+                                with np.load(npz_path) as data:
+                                    existing = dict(data)
+                                existing.update(curves)
+                                np.savez_compressed(npz_path, **existing)
+                            else:
+                                np.savez_compressed(npz_path, **curves)
+                        if diag_csv:
+                            n_f = timings.get('n_files', 0) if timings else 0
+                            n_q = timings.get('n_quarters', 0) if timings else 0
+                            b_d = timings.get('baseline_d', 0.0) if timings else 0.0
+                            n_sig = len(feats) if feats else 0
+                            m_cnt = sum(1 for item in feats if item.get('match_status') == 'MATCHED') if feats else 0
+                            h_cnt = sum(1 for item in feats if item.get('match_status') == 'HARMONIC') if feats else 0
+                            u_cnt = sum(1 for item in feats if item.get('match_status') == 'UNMATCHED') if feats else 0
+                            b_details = timings.get('bls_details', []) if timings else []
+                            m_sde = max([d.get('sde', 0.0) for d in b_details]) if b_details else 0.0
+                            m_snr = max([d.get('snr', 0.0) for d in b_details]) if b_details else 0.0
+                            diag_row = {
+                                'target_id': r_tid_str,
+                                'n_files': n_f,
+                                'n_quarters': n_q,
+                                'baseline_d': round(b_d, 2),
+                                'signals_found': n_sig,
+                                'matched_count': m_cnt,
+                                'harmonic_count': h_cnt,
+                                'unmatched_count': u_cnt,
+                                'status': 'OK',
+                                'max_sde': round(m_sde, 2),
+                                'max_snr': round(m_snr, 2),
+                                'time_dl_s': round(timings['dl'], 2) if timings else 0.0,
+                                'time_stitch_s': round(timings['stitch'], 2) if timings else 0.0,
+                                'time_bls_s': round(timings['bls'], 2) if timings else 0.0,
+                                'time_feats_s': round(timings['feats'], 2) if timings else 0.0,
+                                'time_total_s': round(timings['total'], 2) if timings else 0.0
+                            }
+                            append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
+                    else:
+                        logger.error(f"Звезда {r_tid_str} окончательно завершилась ошибкой: {err}")
+                        print(f"Звезда {r_tid_str} окончательно завершилась ошибкой: {err}", flush=True)
+                for rec_s in recovered_stars:
+                    del failed_attempts[rec_s]
+                if os.path.exists(failed_csv):
+                    os.remove(failed_csv)
+                for f_tid, f_att in failed_attempts.items():
+                    log_failure(failed_csv, f_tid, 'Persistent failure after retries', {f_tid: f_att - 1})
 
     logger.info(f'Total processed: {success_count}')
     logger.info(f'Total skipped: {skip_count}')
