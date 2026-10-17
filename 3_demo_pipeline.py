@@ -113,20 +113,14 @@ def get_marked_stars(labels_df, n_stars, seed, showcase_star):
     showcase_id = str(showcase_star)
     if showcase_id not in star_prim:
         star_prim[showcase_id] = 'CONFIRMED'
-    conf_stars = [s for s, l in star_prim.items() if l == 'CONFIRMED' and s != showcase_id]
-    cand_stars = [s for s, l in star_prim.items() if l == 'CANDIDATE' and s != showcase_id]
-    fp_stars = [s for s, l in star_prim.items() if l == 'FALSE_POSITIVE' and s != showcase_id]
+    all_other_marked = sorted([s for s in star_prim if s != showcase_id])
     rng = np.random.RandomState(seed)
-    rng.shuffle(conf_stars)
-    rng.shuffle(cand_stars)
-    rng.shuffle(fp_stars)
-    n_remain = max(0, n_stars - 1)
-    tot_avail = len(conf_stars) + len(cand_stars) + len(fp_stars)
-    n_conf = int(round(n_remain * (len(conf_stars) / tot_avail)))
-    n_cand = int(round(n_remain * (len(cand_stars) / tot_avail)))
-    n_fp = n_remain - n_conf - n_cand
-    selected_marked = [showcase_id] + conf_stars[:n_conf] + cand_stars[:n_cand] + fp_stars[:n_fp]
-    selected_marked = selected_marked[:n_stars]
+    rng.shuffle(all_other_marked)
+    if len(all_other_marked) > 0:
+        master_marked = [all_other_marked[0], showcase_id] + all_other_marked[1:]
+    else:
+        master_marked = [showcase_id]
+    selected_marked = master_marked[:n_stars]
     return selected_marked, star_prim
 
 def get_unmarked_pool(labels_df, pool_file, unmarked_file):
@@ -158,11 +152,18 @@ def get_unmarked_pool(labels_df, pool_file, unmarked_file):
         fallback_ids = [str(10000000 + i * 137) for i in range(3000) if str(10000000 + i * 137) not in koi_ids]
         return pd.DataFrame([{'kepid': sid, 'kepmag': 13.5, 'st_quarters': '11111111111111111', 'dataspan': 1400.0} for sid in fallback_ids])
 
-def match_unmarked_stars(marked_info, pool_df, n_unmarked, seed):
-    m_mag = np.array([marked_info[s][0] for s in marked_info])
-    m_q = np.array([marked_info[s][1] for s in marked_info])
-    std_mag = float(np.std(m_mag)) if np.std(m_mag) > 0 else 1.0
-    std_q = float(np.std(m_q)) if np.std(m_q) > 0 else 1.0
+def match_unmarked_stars(arg1, arg2, arg3, arg4=None, arg5=None):
+    if isinstance(arg1, (list, tuple)) and isinstance(arg2, dict):
+        marked_ids_list = list(arg1)
+        marked_info_dict = arg2
+        pool_df = arg3
+        n_unmarked = arg4 if arg4 is not None else len(marked_ids_list)
+    else:
+        marked_info_dict = arg1 if isinstance(arg1, dict) else {}
+        marked_ids_list = list(marked_info_dict.keys())
+        pool_df = arg2
+        n_unmarked = arg3
+
     pool_df = pool_df.copy()
     pool_df['kepmag'] = pd.to_numeric(pool_df['kepmag'], errors='coerce').fillna(13.5)
     pool_df['quarters'] = pool_df['st_quarters'].astype(str).apply(lambda x: x.count('1'))
@@ -170,31 +171,38 @@ def match_unmarked_stars(marked_info, pool_df, n_unmarked, seed):
     p_mag = pool_df['kepmag'].values
     p_q = pool_df['quarters'].values
     p_ids = pool_df['kepid'].astype(str).values
+
+    std_mag = float(np.std(p_mag)) if np.std(p_mag) > 0 else 1.0
+    std_q = float(np.std(p_q)) if np.std(p_q) > 0 else 1.0
+
     chosen_ids = []
     chosen_info = {}
-    avail_indices = set(range(len(pool_df)))
-    rng = np.random.RandomState(seed)
-    order = list(range(len(m_mag)))
-    rng.shuffle(order)
-    for idx in order:
+    avail_mask = np.ones(len(pool_df), dtype=bool)
+
+    for m_id in marked_ids_list:
         if len(chosen_ids) >= n_unmarked:
             break
-        target_m = m_mag[idx]
-        target_q = m_q[idx]
-        avail_list = list(avail_indices)
-        if not avail_list:
+        t_mag, t_q = marked_info_dict.get(str(m_id), (13.5, 17))
+        avail_indices = np.where(avail_mask)[0]
+        if len(avail_indices) == 0:
             break
-        d = ((p_mag[avail_list] - target_m) / std_mag)**2 + ((p_q[avail_list] - target_q) / std_q)**2
-        best_i = avail_list[int(np.argmin(d))]
-        avail_indices.remove(best_i)
+        d = ((p_mag[avail_indices] - t_mag) / std_mag)**2 + ((p_q[avail_indices] - t_q) / std_q)**2
+        best_i = avail_indices[int(np.argmin(d))]
+        avail_mask[best_i] = False
         sid = p_ids[best_i]
         chosen_ids.append(sid)
         chosen_info[sid] = (float(p_mag[best_i]), int(p_q[best_i]))
-    while len(chosen_ids) < n_unmarked and avail_indices:
-        b_idx = avail_indices.pop()
-        sid = p_ids[b_idx]
+
+    while len(chosen_ids) < n_unmarked:
+        avail_indices = np.where(avail_mask)[0]
+        if len(avail_indices) == 0:
+            break
+        best_i = avail_indices[0]
+        avail_mask[best_i] = False
+        sid = p_ids[best_i]
         chosen_ids.append(sid)
-        chosen_info[sid] = (float(p_mag[b_idx]), int(p_q[b_idx]))
+        chosen_info[sid] = (float(p_mag[best_i]), int(p_q[best_i]))
+
     return chosen_ids, chosen_info
 
 def compute_group_stats(info_dict):
@@ -215,30 +223,20 @@ def compute_group_stats(info_dict):
 
 def split_stars(marked_stars, unmarked_stars, star_prim, showcase_star, seed):
     showcase_id = str(showcase_star)
-    marked_conf = [s for s in marked_stars if star_prim.get(s) == 'CONFIRMED' and s != showcase_id]
-    marked_cand = [s for s in marked_stars if star_prim.get(s) == 'CANDIDATE' and s != showcase_id]
-    marked_fp = [s for s in marked_stars if star_prim.get(s) == 'FALSE_POSITIVE' and s != showcase_id]
-    rng = np.random.RandomState(seed)
-    rng.shuffle(marked_conf)
-    rng.shuffle(marked_cand)
-    rng.shuffle(marked_fp)
-    ctrl_marked = [showcase_id]
-    tr_marked = []
-    for grp in [marked_conf, marked_cand, marked_fp]:
-        for i, s in enumerate(grp):
-            if len(ctrl_marked) <= len(tr_marked):
-                ctrl_marked.append(s)
-            else:
-                tr_marked.append(s)
-    while len(ctrl_marked) > len(tr_marked) + 1:
-        moved = [s for s in ctrl_marked if s != showcase_id][-1]
-        ctrl_marked.remove(moved)
-        tr_marked.append(moved)
-    unm_list = list(unmarked_stars)
-    rng.shuffle(unm_list)
-    mid_u = len(unm_list) // 2
-    tr_unmarked = unm_list[:mid_u]
-    ctrl_unmarked = unm_list[mid_u:]
+    tr_marked = [marked_stars[i] for i in range(len(marked_stars)) if i % 2 == 0]
+    ctrl_marked = [marked_stars[i] for i in range(len(marked_stars)) if i % 2 == 1]
+    tr_unmarked = [unmarked_stars[i] for i in range(len(unmarked_stars)) if i % 2 == 0]
+    ctrl_unmarked = [unmarked_stars[i] for i in range(len(unmarked_stars)) if i % 2 == 1]
+
+    n_bal_m = min(len(tr_marked), len(ctrl_marked))
+    n_bal_u = min(len(tr_unmarked), len(ctrl_unmarked))
+    n_bal = min(n_bal_m, n_bal_u)
+
+    tr_marked = tr_marked[:n_bal]
+    ctrl_marked = ctrl_marked[:n_bal]
+    tr_unmarked = tr_unmarked[:n_bal]
+    ctrl_unmarked = ctrl_unmarked[:n_bal]
+
     assert len(set(tr_marked).intersection(set(ctrl_marked))) == 0
     assert len(set(tr_unmarked).intersection(set(ctrl_unmarked))) == 0
     assert showcase_id in ctrl_marked
@@ -603,7 +601,7 @@ def main():
 
     unmarked_pool_file = os.path.join('data', 'labels', 'kepler_stellar_unmarked_pool.csv')
     pool_df = get_unmarked_pool(labels_df, unmarked_pool_file, args.unmarked_file)
-    unmarked_ids, unmarked_info = match_unmarked_stars(marked_info, pool_df, args.unmarked_stars, args.seed)
+    unmarked_ids, unmarked_info = match_unmarked_stars(marked_ids, marked_info, pool_df, args.unmarked_stars, args.seed)
 
     stats_m = compute_group_stats(marked_info)
     stats_u = compute_group_stats(unmarked_info)
@@ -615,7 +613,7 @@ def main():
     print(comp_table.to_string(index=False), flush=True)
 
     tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked = split_stars(marked_ids, unmarked_ids, star_prim, args.showcase_star, args.seed)
-    all_selected_stars = list(set(tr_marked + ctrl_marked + tr_unmarked + ctrl_unmarked))
+    all_selected_stars = tr_marked + ctrl_marked + tr_unmarked + ctrl_unmarked
     targets_demo_file = os.path.join(out_dir, f"targets_demo{file_suffix}.txt")
     with open(targets_demo_file, 'w', encoding='utf-8') as f:
         for sid in all_selected_stars:
