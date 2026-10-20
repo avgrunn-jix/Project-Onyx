@@ -53,6 +53,9 @@ def main():
     parser.add_argument('--showcase-star', default='4852528')
     parser.add_argument('--unmarked-file', default='')
     parser.add_argument('--output-dir', default='')
+    parser.add_argument('--max-download-workers', type=int, default=4)
+    parser.add_argument('--target-precision', type=float, default=0.90)
+    parser.add_argument('--min-depth-ppm', type=float, default=30.0)
     args = parser.parse_args()
 
     if args.smoke_test and args.min_free_gb == 5.0:
@@ -201,7 +204,7 @@ def main():
     elif args.mode == 'demo':
         demo_script = os.path.join(base_dir, '3_demo_pipeline.py')
         eff_min_free = 1.0 if args.smoke_test and args.min_free_gb == 5.0 else args.min_free_gb
-        cmd = [sys.executable, demo_script, '--marked-stars', str(args.marked_stars), '--unmarked-stars', str(args.unmarked_stars), '--seed', str(args.seed), '--showcase-star', str(args.showcase_star), '--workers', str(args.workers), '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--min-free-gb', str(eff_min_free)]
+        cmd = [sys.executable, demo_script, '--marked-stars', str(args.marked_stars), '--unmarked-stars', str(args.unmarked_stars), '--seed', str(args.seed), '--showcase-star', str(args.showcase_star), '--workers', str(args.workers), '--max-download-workers', str(args.max_download_workers), '--target-precision', str(args.target_precision), '--min-depth-ppm', str(args.min_depth_ppm), '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--min-free-gb', str(eff_min_free)]
         if args.output_dir:
             cmd.extend(['--output-dir', args.output_dir])
         if args.unmarked_file:

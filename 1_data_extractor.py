@@ -26,6 +26,12 @@ warnings.filterwarnings('ignore')
 logging.getLogger('lightkurve').setLevel(logging.ERROR)
 logging.getLogger('astroquery').setLevel(logging.ERROR)
 
+_dl_sem = None
+
+def init_worker(sem):
+    global _dl_sem
+    _dl_sem = sem
+
 def setup_logger():
     os.makedirs('logs', exist_ok=True)
     log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
@@ -55,20 +61,38 @@ def get_dir_size(path):
 
 def fetch_labels(mission):
     os.makedirs(os.path.join('data', 'labels'), exist_ok=True)
+    csv_path = os.path.join('data', 'labels', 'kepler_labels.csv' if mission == 'Kepler' else 'tess_labels.csv')
+    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+        try:
+            df = pd.read_csv(csv_path, dtype={'target_id': str})
+            if len(df) > 0:
+                return df
+        except Exception:
+            pass
     if mission == 'Kepler':
-        labels_table = NasaExoplanetArchive.query_criteria(table='cumulative', select='kepid,koi_disposition,koi_period,koi_fpflag_nt,koi_fpflag_ss,koi_fpflag_co,koi_fpflag_ec')
-        df = labels_table.to_pandas()
-        df.rename(columns={'kepid': 'target_id', 'koi_disposition': 'label', 'koi_period': 'catalog_period'}, inplace=True)
-        df['target_id'] = df['target_id'].astype(str)
-        df.to_csv(os.path.join('data', 'labels', 'kepler_labels.csv'), index=False, encoding='utf-8')
-        return df
+        try:
+            labels_table = NasaExoplanetArchive.query_criteria(table='cumulative', select='kepid,koi_disposition,koi_period,koi_fpflag_nt,koi_fpflag_ss,koi_fpflag_co,koi_fpflag_ec')
+            df = labels_table.to_pandas()
+            df.rename(columns={'kepid': 'target_id', 'koi_disposition': 'label', 'koi_period': 'catalog_period'}, inplace=True)
+            df['target_id'] = df['target_id'].astype(str)
+            df.to_csv(csv_path, index=False, encoding='utf-8')
+            return df
+        except Exception:
+            if os.path.exists(csv_path):
+                return pd.read_csv(csv_path, dtype={'target_id': str})
+            raise
     else:
-        labels_table = NasaExoplanetArchive.query_criteria(table='toi', select='tic_id,tfopwg_disp,pl_orbper')
-        df = labels_table.to_pandas()
-        df.rename(columns={'tic_id': 'target_id', 'tfopwg_disp': 'label', 'pl_orbper': 'catalog_period'}, inplace=True)
-        df['target_id'] = df['target_id'].astype(str)
-        df.to_csv(os.path.join('data', 'labels', 'tess_labels.csv'), index=False, encoding='utf-8')
-        return df
+        try:
+            labels_table = NasaExoplanetArchive.query_criteria(table='toi', select='tic_id,tfopwg_disp,pl_orbper')
+            df = labels_table.to_pandas()
+            df.rename(columns={'tic_id': 'target_id', 'tfopwg_disp': 'label', 'pl_orbper': 'catalog_period'}, inplace=True)
+            df['target_id'] = df['target_id'].astype(str)
+            df.to_csv(csv_path, index=False, encoding='utf-8')
+            return df
+        except Exception:
+            if os.path.exists(csv_path):
+                return pd.read_csv(csv_path, dtype={'target_id': str})
+            raise
 
 def read_targets_file(filepath):
     if not filepath or not os.path.exists(filepath):
@@ -314,46 +338,55 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         t_dl_start = time.time()
         author = 'Kepler' if mission == 'Kepler' else 'SPOC'
         search_target = f"KIC {tid}" if mission == 'Kepler' and not str(tid).startswith('KIC') else (f"TIC {tid}" if mission == 'TESS' and not str(tid).startswith('TIC') else str(tid))
-        for attempt in range(3):
+        global _dl_sem
+        if _dl_sem is not None:
+            _dl_sem.acquire()
+        try:
+            for attempt in range(3):
+                if time.time() > deadline:
+                    return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
+                try:
+                    search_result = lk.search_lightcurve(search_target, author=author, cadence='long')
+                    if search_result is not None and len(search_result) > 0:
+                        break
+                except Exception as s_err:
+                    if attempt == 2:
+                        return None, None, tid, f'DownloadError: Search failed: {s_err}', dl_size, None
+                    time.sleep(2 ** (attempt + 1))
+            else:
+                return None, None, tid, 'DownloadError: No search results after retries', dl_size, None
+            if len(search_result) == 0:
+                return None, None, tid, 'DownloadError: No lightcurves found', dl_size, None
+            if mission == 'Kepler' and 'target_name' in search_result.table.colnames:
+                tid_digits = str(tid).lstrip('0')
+                target_mask = [tid_digits in str(t_name).lstrip('0') for t_name in search_result.table['target_name']]
+                if any(target_mask):
+                    search_result = search_result[target_mask]
+            if max_sectors > 0 and len(search_result) > max_sectors:
+                search_result = search_result[:max_sectors]
             if time.time() > deadline:
                 return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
-            try:
-                search_result = lk.search_lightcurve(search_target, author=author, cadence='long')
-                if search_result is not None and len(search_result) > 0:
-                    break
-            except Exception:
-                time.sleep(2 ** (attempt + 1))
-        else:
-            return None, None, tid, 'Download failed', dl_size, None
-        if len(search_result) == 0:
-            return None, None, tid, 'No lightcurves found', dl_size, None
-        if mission == 'Kepler' and 'target_name' in search_result.table.colnames:
-            tid_digits = str(tid).lstrip('0')
-            target_mask = [tid_digits in str(t_name).lstrip('0') for t_name in search_result.table['target_name']]
-            if any(target_mask):
-                search_result = search_result[target_mask]
-        if max_sectors > 0 and len(search_result) > max_sectors:
-            search_result = search_result[:max_sectors]
-        if time.time() > deadline:
-            return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
-        lc_col = None
-        for dl_attempt in range(3):
-            if time.time() > deadline:
-                return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
-            try:
-                lc_col = search_result.download_all(download_dir=tmp_dir)
-                if lc_col is not None and len(lc_col) > 0:
-                    break
-            except Exception as dl_err:
-                if dl_attempt == 2:
-                    return None, None, tid, f'DownloadError: {dl_err}', dl_size, None
-                time.sleep(2 ** (dl_attempt + 1))
+            lc_col = None
+            for dl_attempt in range(3):
+                if time.time() > deadline:
+                    return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
+                try:
+                    lc_col = search_result.download_all(download_dir=tmp_dir)
+                    if lc_col is not None and len(lc_col) > 0:
+                        break
+                except Exception as dl_err:
+                    if dl_attempt == 2:
+                        return None, None, tid, f'DownloadError: Download failed: {dl_err}', dl_size, None
+                    time.sleep(2 ** (dl_attempt + 1))
+        finally:
+            if _dl_sem is not None:
+                _dl_sem.release()
         dl_size = get_dir_size(tmp_dir)
         t_dl_end = time.time()
         timing_dl = t_dl_end - t_dl_start
 
         if lc_col is None or len(lc_col) == 0:
-            return None, None, tid, 'No lightcurves found', dl_size, None
+            return None, None, tid, 'DownloadError: No lightcurves found', dl_size, None
 
         filtered_lcs = []
         for c_lc in lc_col:
@@ -614,10 +647,17 @@ def append_to_csv_flush(filepath, df_rows):
         except Exception:
             pass
 
-def log_failure(failed_path, tid_str, err_msg, attempts_dict):
+def log_failure(failed_path, tid_str, err_msg, attempts_dict, stage='unknown', star_type='UNKNOWN', split='UNKNOWN'):
     att = attempts_dict.get(tid_str, 0) + 1
     attempts_dict[tid_str] = att
-    df_err = pd.DataFrame([{'target_id': tid_str, 'error': str(err_msg), 'attempts': att}])
+    df_err = pd.DataFrame([{
+        'target_id': str(tid_str),
+        'star_type': str(star_type),
+        'split': str(split),
+        'stage': str(stage),
+        'error': str(err_msg),
+        'attempts': att
+    }])
     append_to_csv_flush(failed_path, df_err)
 
 def main():
@@ -628,6 +668,7 @@ def main():
     parser.add_argument('--output', default='extracted_features.csv')
     parser.add_argument('--targets-file', default='')
     parser.add_argument('--workers', type=int, default=os.cpu_count() or 1)
+    parser.add_argument('--max-download-workers', type=int, default=4)
     parser.add_argument('--keep-raw', action='store_true')
     parser.add_argument('--min-free-gb', type=float, default=5.0)
     parser.add_argument('--purge-lk-cache', action='store_true')
@@ -797,7 +838,10 @@ def main():
         print(f"Injection tasks: {total_inj} stars to process (already completed: {len(completed_inj_stars)})", flush=True)
         logger.info(f"Injection tasks: {total_inj} stars to process (already completed: {len(completed_inj_stars)})")
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
+        import multiprocessing
+        mgr_inj = multiprocessing.Manager()
+        dl_sem_inj = mgr_inj.Semaphore(args.max_download_workers)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(dl_sem_inj,)) as executor:
             task_iter = iter(tasks)
             active_futures = {}
             for _ in range(min(args.workers * 2, total_inj)):
@@ -892,12 +936,14 @@ def main():
     target_ids = []
     if args.targets_file and os.path.exists(args.targets_file):
         target_ids = read_targets_file(args.targets_file)
+        if any(arg.startswith('--limit') for arg in sys.argv):
+            target_ids = target_ids[:args.limit]
     else:
         labels_df = labels_df.dropna(subset=['label'])
         target_ids = sorted(labels_df['target_id'].dropna().astype(str).unique().tolist())
-    np.random.seed(42)
-    np.random.shuffle(target_ids)
-    target_ids = target_ids[:args.limit]
+        np.random.seed(42)
+        np.random.shuffle(target_ids)
+        target_ids = target_ids[:args.limit]
 
     processed_ids = set()
     if resume:
@@ -946,7 +992,10 @@ def main():
     logger.info(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= 2)} | To process: {total_tasks}")
     print(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= 2)} | To process: {total_tasks}", flush=True)
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
+    import multiprocessing
+    mgr = multiprocessing.Manager()
+    dl_sem = mgr.Semaphore(args.max_download_workers)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(dl_sem,)) as executor:
         task_iter = iter(tasks)
         active_futures = {}
         for _ in range(min(args.workers * 2, total_tasks)):
@@ -973,7 +1022,8 @@ def main():
 
                 if err:
                     logger.error(f"Error on {tid_str}: {err}")
-                    log_failure(failed_csv, tid_str, err, failed_attempts)
+                    stage = 'download' if 'download' in err.lower() or 'search' in err.lower() else ('timeout' if 'timeout' in err.lower() else ('stitch' if 'stitch' in err.lower() or 'flatten' in err.lower() else 'features'))
+                    log_failure(failed_csv, tid_str, err, failed_attempts, stage=stage)
                     skip_count += 1
                     diag_row = {
                         'target_id': tid_str,
@@ -1070,7 +1120,7 @@ def main():
                     f.cancel()
                     err = f"TimeoutError: Exceeded {args.star_timeout}s"
                     logger.error(f"Error on {tid_str}: {err}")
-                    log_failure(failed_csv, tid_str, err, failed_attempts)
+                    log_failure(failed_csv, tid_str, err, failed_attempts, stage='timeout')
                     skip_count += 1
                     diag_row = {
                         'target_id': tid_str,
@@ -1174,7 +1224,7 @@ def main():
                 if os.path.exists(failed_csv):
                     os.remove(failed_csv)
                 for f_tid, f_att in failed_attempts.items():
-                    log_failure(failed_csv, f_tid, 'Persistent failure after retries', {f_tid: f_att - 1})
+                    log_failure(failed_csv, f_tid, 'Persistent failure after retries', {f_tid: f_att - 1}, stage='retry_failed')
 
     logger.info(f'Total processed: {success_count}')
     logger.info(f'Total skipped: {skip_count}')

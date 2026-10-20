@@ -9,8 +9,16 @@ __pycache__/
 *.fits.gz
 *.fz
 data/raw/
-data/labels/
+data/labels/*
+!data/labels/kepler_labels.csv
+!data/labels/kepler_eb_catalog.csv
+!data/labels/kepler_stellar_cache.csv
+!data/labels/kepler_stellar_unmarked_pool.csv
+!data/labels/legacy_unmarked_selection/
+!data/labels/legacy_unmarked_selection/*
 *.csv
+!data/labels/*.csv
+!data/labels/legacy_unmarked_selection/*.csv
 *.npz
 *.joblib
 *.pkl
