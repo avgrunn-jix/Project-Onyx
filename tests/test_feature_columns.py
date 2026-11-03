@@ -2,21 +2,20 @@ import pandas as pd
 import onyx_features
 
 
-EXTRACTOR_COLUMNS = [
-    'signal_id', 'target_id', 'signal_index', 'mission', 'label', 'match_status',
-    'bls_period_d', 'bls_epoch', 'bls_duration_d', 'bls_depth_ppm', 'bls_depth_snr',
-    'bls_power_peak', 'bls_sde', 'transit_count', 'duty_cycle',
-    'odd_even_depth_diff_ppm', 'odd_even_sigma', 'secondary_depth_ppm',
-    'secondary_snr', 'harmonic_power_ratio', 'shape_v_u_ratio',
-    'in_transit_scatter_ppm', 'depth_scatter_ppm', 'flux_std_ppm',
-    'flux_mad_ppm', 'flux_skew', 'flux_kurtosis', 'cdpp_ppm',
-    'pointwise_scatter_ppm', 'autocorr_max', 'ls_peak_power', 'gap_fraction',
-    'baseline_d', 'star_teff', 'star_radius', 'star_logg',
-    'centroid_shift_col_sigma', 'centroid_shift_row_sigma',
-    'centroid_shift_total_sigma', 'centroid_shift_total_arcsec',
-    'koi_fpflag_nt', 'koi_fpflag_ss', 'koi_fpflag_co', 'koi_fpflag_ec',
-    'n_signals_star', 'target_bin',
-]
+REAL_HEADER = (
+    "signal_id,target_id,signal_index,mission,label,match_status,bls_period_d,"
+    "bls_epoch,bls_duration_d,bls_depth_ppm,bls_depth_snr,bls_power_peak,bls_sde,"
+    "transit_count,duty_cycle,odd_even_depth_diff_ppm,odd_even_sigma,"
+    "secondary_depth_ppm,secondary_snr,harmonic_power_ratio,shape_v_u_ratio,"
+    "in_transit_scatter_ppm,depth_scatter_ppm,flux_std_ppm,flux_mad_ppm,flux_skew,"
+    "flux_kurtosis,cdpp_ppm,pointwise_scatter_ppm,autocorr_max,ls_peak_power,"
+    "gap_fraction,baseline_d,star_teff,star_radius,star_logg,"
+    "centroid_shift_col_sigma,centroid_shift_row_sigma,centroid_shift_total_sigma,"
+    "centroid_shift_total_arcsec,koi_fpflag_nt,koi_fpflag_ss,koi_fpflag_co,"
+    "koi_fpflag_ec,n_signals_star"
+).split(',')
+
+EXTRACTOR_COLUMNS = REAL_HEADER + ['target_bin']
 
 LEGACY_ML_FEATURES = [
     'bls_period_d', 'bls_epoch', 'bls_duration_d', 'bls_depth_ppm', 'bls_depth_snr',
@@ -59,6 +58,8 @@ LEGACY_COVERAGE_COLS = [
 def test_equivalence_ml_pipeline_schema():
     df = pd.DataFrame(columns=EXTRACTOR_COLUMNS)
     actual = onyx_features.compute_feature_columns(df, exclude_coverage=False)
+    assert len(REAL_HEADER) == 45
+    assert len(actual) == 34
     assert actual == LEGACY_ML_FEATURES
     assert 'baseline_d' in actual
 
@@ -67,6 +68,7 @@ def test_equivalence_demo_pipeline_schema():
     cols = EXTRACTOR_COLUMNS + ['n_files', 'n_quarters']
     df = pd.DataFrame(columns=cols)
     actual = onyx_features.compute_feature_columns(df, exclude_coverage=True)
+    assert len(actual) == 33
     assert actual == LEGACY_DEMO_FEATURES
     for cov in LEGACY_COVERAGE_COLS:
         assert cov not in actual
