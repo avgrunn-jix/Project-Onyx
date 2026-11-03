@@ -30,3 +30,9 @@ def extractor():
 @pytest.fixture(scope="session")
 def demo():
     return load_module("3_demo_pipeline.py", "onyx_demo")
+
+
+@pytest.fixture(scope="session")
+def ml_pipeline():
+    return load_module("2_ml_pipeline.py", "onyx_ml")
+

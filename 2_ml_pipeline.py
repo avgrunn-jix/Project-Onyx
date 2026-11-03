@@ -17,6 +17,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from xgboost import XGBClassifier
 import joblib
 import shap
+from onyx_features import compute_feature_columns
 
 warnings.filterwarnings('ignore')
 
@@ -68,8 +69,7 @@ def run_ml(args, logger, is_retrain=False):
         logger.error('No matched signals found for training')
         return
     df_matched['target_bin'] = df_matched['label'].apply(lambda x: 1 if x in ['CONFIRMED', 'CANDIDATE'] else 0)
-    exclude_cols = ['signal_id', 'target_id', 'signal_index', 'mission', 'label', 'match_status', 'target_bin', 'koi_fpflag_nt', 'koi_fpflag_ss', 'koi_fpflag_co', 'koi_fpflag_ec', 'p_candidate', 'n_signals_star']
-    feature_cols = [c for c in df.columns if c not in exclude_cols]
+    feature_cols = compute_feature_columns(df, exclude_coverage=False)
     X_raw = df_matched[feature_cols].values
     y = df_matched['target_bin'].values
     groups = df_matched['target_id'].values
@@ -289,8 +289,7 @@ def transfer_mode(args, logger):
     df_test = df_test[df_test['match_status'] == 'MATCHED'].copy()
     df_train['target_bin'] = df_train['label'].apply(lambda x: 1 if x in ['CONFIRMED', 'CANDIDATE'] else 0)
     df_test['target_bin'] = df_test['label'].apply(lambda x: 1 if x in ['CONFIRMED', 'CANDIDATE'] else 0)
-    exclude_cols = ['signal_id', 'target_id', 'signal_index', 'mission', 'label', 'match_status', 'target_bin', 'koi_fpflag_nt', 'koi_fpflag_ss', 'koi_fpflag_co', 'koi_fpflag_ec', 'p_candidate', 'n_signals_star']
-    feature_cols = [c for c in df_train.columns if c not in exclude_cols and c in df_test.columns]
+    feature_cols = compute_feature_columns(df_train, exclude_coverage=False, other_cols=df_test.columns)
     X_train = df_train[feature_cols].values
     y_train = df_train['target_bin'].values
     X_test = df_test[feature_cols].values
