@@ -4,10 +4,11 @@
 - П0: ветка fix-search-2 создана от main (49d286193dc61901a9638ac31e006c32bad18dbf). Незакоммичено на main: только неотслеживаемая папка paper_notes/ (не трогаю). pytest 9.2.0 установлен в venv; пакеты requirements.txt уже были установлены.
 - П1: CLIP_UPWARD_ONLY + clip_outliers() в 1_data_extractor.py, оба вызова remove_outliers заменены (инжекция и process_single_star). Проверено: py_compile, pytest tests/test_clip_outliers.py (3 passed). Хеш: 6b886c5.
 - П2: RESOLVE_ALIASES + resolve_alias_period(), is_alias_duplicate(), _box_depth(), _power_near(), _class_depths_ok() в 1_data_extractor.py; вызов в цикле BLS process_single_star перед признаками и маской; alias_corrections последним столбцом диагностики (4 места diag_row); лог флагов в main; append_to_csv_flush выравнивает строки по заголовку существующего файла, если в нём нет нового столбца. Проверено: py_compile, pytest (12 passed). Хеш: a3389e6.
-- П3: создан общий модуль onyx_features.py (EXCLUDE_COLS, COVERAGE_COLS, is_koi_column, compute_feature_columns); подключён в 2_ml_pipeline.py (run_ml и transfer_mode) и 3_demo_pipeline.py; добавлены тесты эквивалентности и гарантии отсутствия KOI-колонок в tests/test_feature_columns.py. Проверено: py_compile, pytest (17 passed).
+- П3: создан общий модуль onyx_features.py (EXCLUDE_COLS, COVERAGE_COLS, is_koi_column, compute_feature_columns); подключён в 2_ml_pipeline.py (run_ml и transfer_mode) и 3_demo_pipeline.py; добавлены тесты эквивалентности и гарантии отсутствия KOI-колонок в tests/test_feature_columns.py. Проверено: py_compile, pytest (17 passed). Хеш: fcf15de.
+- П4: добавлены тесты на гарантию разбиения по звёздам без утечки между train и control (tests/test_star_split_no_leakage.py): попарная непересекаемость половин, строгая группировка многосигнальных звёзд, изоляция showcase-звезды в контроле, GroupKFold/StratifiedGroupKFold без пересечения target_id. Проверено: py_compile, pytest (20 passed).
 
 ## Сейчас
-- П4: тесты на гарантию разбиения по звёздам без утечки между train и control (tests/test_star_split_no_leakage.py) и префикс-стабильность выбора звёзд (tests/test_prefix_stability.py).
+- П5: тесты на префикс-стабильность выбора и разбиения звёзд (tests/test_prefix_stability.py).
 
 ## Решения
 - outputs/ на этом компьютере есть; не читаю и не меняю.
