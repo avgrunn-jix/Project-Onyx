@@ -27,6 +27,12 @@ logging.getLogger('lightkurve').setLevel(logging.ERROR)
 logging.getLogger('astroquery').setLevel(logging.ERROR)
 
 CLIP_UPWARD_ONLY = True
+RESOLVE_ALIASES = True
+ALIAS_TOL = 0.01
+ALIAS_DEPTH_SHORT = 0.8
+ALIAS_DEPTH_LONG = 1.25
+ALIAS_CLASS_DEPTH = 0.5
+ALIAS_POWER_FRACTION = 0.5
 
 _dl_sem = None
 
@@ -36,6 +42,98 @@ def clip_outliers(lc, upward_only=None):
     if upward_only:
         return lc.remove_outliers(sigma_upper=5, sigma_lower=float('inf'))
     return lc.remove_outliers(sigma=5)
+
+def _box_depth(t, f, w, period, epoch, duration):
+    if period <= 0 or len(t) == 0:
+        return np.nan, np.zeros(0, dtype=bool), np.zeros(0, dtype=int)
+    phase = ((t - epoch + 0.5 * period) % period) - 0.5 * period
+    in_m = np.abs(phase) < (duration / 2.0)
+    if np.sum(in_m) < 3 or np.sum(~in_m) < 3:
+        return np.nan, in_m, np.zeros(len(t), dtype=int)
+    d = float(np.sum(w[~in_m] * f[~in_m]) / np.sum(w[~in_m]) - np.sum(w[in_m] * f[in_m]) / np.sum(w[in_m]))
+    ep_idx = np.round((t - epoch) / period).astype(int)
+    return d, in_m, ep_idx
+
+def _power_near(periods, powers, p, tol):
+    if periods is None or powers is None or len(periods) == 0:
+        return np.nan
+    sel = np.abs(periods / p - 1.0) <= tol
+    if not np.any(sel):
+        return np.nan
+    vals = powers[sel]
+    vals = vals[np.isfinite(vals)]
+    return float(np.max(vals)) if len(vals) > 0 else np.nan
+
+def _class_depths_ok(t, f, w, in_m, period_c, epoch, k, d_c):
+    cls = np.round((t - epoch) / period_c * k).astype(int) % k
+    for c in range(k):
+        sel = cls == c
+        m_in = sel & in_m
+        if np.sum(m_in) < 3:
+            return False
+        out_m = ~in_m
+        d_cls = float(np.sum(w[out_m] * f[out_m]) / np.sum(w[out_m]) - np.sum(w[m_in] * f[m_in]) / np.sum(w[m_in]))
+        if not (d_cls >= ALIAS_CLASS_DEPTH * d_c):
+            return False
+    return True
+
+def resolve_alias_period(time_arr, flux_arr, err_arr, period, epoch, duration, periods, powers):
+    t = np.asarray(time_arr, dtype=float)
+    f = np.asarray(flux_arr, dtype=float)
+    if err_arr is None:
+        e = np.ones(len(t))
+    else:
+        e = np.asarray(err_arr, dtype=float)
+    ok = np.isfinite(t) & np.isfinite(f)
+    t, f, e = t[ok], f[ok], e[ok]
+    good_e = np.isfinite(e) & (e > 0)
+    w = np.where(good_e, 1.0 / np.where(good_e, e, 1.0) ** 2, 0.0)
+    if not np.any(w > 0):
+        w = np.ones(len(t))
+    w = np.where(w > 0, w, np.median(w[w > 0]))
+    p_arr = None if periods is None else np.asarray(periods, dtype=float)
+    pw_arr = None if powers is None else np.asarray(powers, dtype=float)
+    result = {'period': float(period), 'epoch': float(epoch), 'depth': np.nan, 'factor': 1.0}
+    d_c, _, _ = _box_depth(t, f, w, period, epoch, duration)
+    result['depth'] = d_c
+    if not np.isfinite(d_c) or d_c <= 0:
+        return result
+    pow_c = _power_near(p_arr, pw_arr, period, ALIAS_TOL)
+    for k in (3, 2):
+        p_try = period / k
+        if p_try <= duration:
+            continue
+        pow_try = _power_near(p_arr, pw_arr, p_try, ALIAS_TOL)
+        if not (np.isfinite(pow_try) and np.isfinite(pow_c) and pow_try >= ALIAS_POWER_FRACTION * pow_c):
+            continue
+        d_try, in_try, _ = _box_depth(t, f, w, p_try, epoch, duration)
+        if not (np.isfinite(d_try) and d_try >= ALIAS_DEPTH_SHORT * d_c):
+            continue
+        if not _class_depths_ok(t, f, w, in_try, period, epoch, k, d_c):
+            continue
+        result.update({'period': float(p_try), 'epoch': float(epoch), 'depth': d_try, 'factor': 1.0 / k})
+        return result
+    p_try = period * 2.0
+    pow_try = _power_near(p_arr, pw_arr, p_try, ALIAS_TOL)
+    if np.isfinite(pow_try) and np.isfinite(pow_c) and pow_try >= ALIAS_POWER_FRACTION * pow_c:
+        best_d, best_e = np.nan, epoch
+        for e_try in (epoch, epoch + period):
+            d_try, _, _ = _box_depth(t, f, w, p_try, e_try, duration)
+            if np.isfinite(d_try) and (not np.isfinite(best_d) or d_try > best_d):
+                best_d, best_e = d_try, e_try
+        if np.isfinite(best_d) and best_d >= ALIAS_DEPTH_LONG * d_c:
+            result.update({'period': float(p_try), 'epoch': float(best_e), 'depth': best_d, 'factor': 2.0})
+    return result
+
+def is_alias_duplicate(period, found_periods, tol=ALIAS_TOL):
+    for p0 in found_periods:
+        if p0 <= 0:
+            continue
+        ratio = float(period) / float(p0)
+        for m in (1.0, 2.0, 3.0, 0.5, 1.0 / 3.0):
+            if abs(ratio / m - 1.0) < tol:
+                return True
+    return False
 
 def init_worker(sem):
     global _dl_sem
@@ -469,6 +567,8 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         timing_bls = []
         timing_bls_details = []
         timing_feats = []
+        alias_corrections = 0
+        found_periods = []
 
         for sig_idx in range(max_signals):
             if time.time() > deadline:
@@ -509,8 +609,22 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             bls_epoch = float(bls.transit_time_at_max_power.value)
             bls_duration_d = float(bls.duration_at_max_power.value)
             bls_depth_ppm = float(bls.depth_at_max_power.value * 1e6)
+            if RESOLVE_ALIASES:
+                s_err = np.asarray(lc_search.flux_err.value, dtype=float) if 'flux_err' in lc_search.columns else None
+                alias_res = resolve_alias_period(np.asarray(lc_search.time.value, dtype=float), np.asarray(lc_search.flux.value, dtype=float), s_err, bls_period_d, bls_epoch, bls_duration_d, np.asarray(bls.period.value, dtype=float), power_values)
+                if alias_res['factor'] != 1.0:
+                    bls_period_d = alias_res['period']
+                    bls_epoch = alias_res['epoch']
+                    bls_depth_ppm = float(alias_res['depth'] * 1e6)
+                    alias_corrections += 1
+                if is_alias_duplicate(bls_period_d, found_periods):
+                    dup_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=bls_epoch, duration=bls_duration_d * 1.5)
+                    lc_search = lc_search[~dup_mask]
+                    continue
+                found_periods.append(bls_period_d)
             transit_count = int(baseline_d / bls_period_d)
             duty_cycle = float(bls_duration_d / bls_period_d)
+            rec_idx = len(features_list)
 
             t_feat_start = time.time()
             folded = lc_search.fold(period=bls_period_d, epoch_time=bls_epoch, normalize_phase=False)
@@ -519,7 +633,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             norm_phase = phase_times / bls_period_d
             norm_phase = (norm_phase + 0.5) % 1.0 - 0.5
             binned_phase = bin_folded_curve(norm_phase, fold_flux)
-            sig_id = f'{tid}_{sig_idx}'
+            sig_id = f'{tid}_{rec_idx}'
             zoom_mask = np.abs(phase_times) <= (bls_duration_d * 2.0)
             if np.any(zoom_mask):
                 zoom_phase = phase_times[zoom_mask] / (bls_duration_d * 2.0)
@@ -593,7 +707,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             c_shift_col_sig, c_shift_row_sig, c_shift_tot_sig, c_shift_tot_arcsec = compute_centroid_shift(times_search, col_det, row_det, bls_period_d, bls_epoch, bls_duration_d, mission)
 
             feat = {
-                'signal_id': sig_id, 'target_id': tid, 'signal_index': sig_idx, 
+                'signal_id': sig_id, 'target_id': tid, 'signal_index': rec_idx, 
                 'mission': mission, 'label': match_label, 'match_status': match_status,
                 'bls_period_d': bls_period_d, 'bls_epoch': bls_epoch, 'bls_duration_d': bls_duration_d,
                 'bls_depth_ppm': bls_depth_ppm, 'bls_depth_snr': bls_depth_snr,
@@ -635,7 +749,8 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'total': timing_total,
             'n_files': n_files if 'n_files' in locals() else (len(lc_col) if 'lc_col' in locals() and lc_col is not None else 0),
             'n_quarters': n_quarters if 'n_quarters' in locals() else (len(lc_col) if 'lc_col' in locals() and lc_col is not None else 0),
-            'baseline_d': baseline_d if 'baseline_d' in locals() else 0.0
+            'baseline_d': baseline_d if 'baseline_d' in locals() else 0.0,
+            'alias_corrections': alias_corrections
         }
         return features_list, curves_dict, tid, None, dl_size, timings
     except Exception as e:
@@ -648,6 +763,14 @@ def append_to_csv_flush(filepath, df_rows):
     if df_rows is None or len(df_rows) == 0:
         return
     hdr = not os.path.exists(filepath) or os.path.getsize(filepath) == 0
+    if not hdr:
+        try:
+            with open(filepath, 'r', encoding='utf-8') as fh:
+                existing_cols = fh.readline().strip().split(',')
+            if list(df_rows.columns) != existing_cols and all(c in df_rows.columns for c in existing_cols):
+                df_rows = df_rows[existing_cols]
+        except Exception:
+            pass
     with open(filepath, 'a', encoding='utf-8', newline='') as f:
         df_rows.to_csv(f, header=hdr, index=False)
         f.flush()
@@ -702,6 +825,9 @@ def main():
         print(f"Ошибка: Недостаточно свободного места на диске ({free_now_gb:.2f} ГБ < {args.min_free_gb:.2f} ГБ). Освободите место или используйте параметр --min-free-gb.", flush=True)
         sys.exit(1)
     logger = setup_logger()
+    flags_msg = f"Search flags: CLIP_UPWARD_ONLY={CLIP_UPWARD_ONLY}, RESOLVE_ALIASES={RESOLVE_ALIASES}"
+    print(flags_msg, flush=True)
+    logger.info(flags_msg)
 
     logical_cores = os.cpu_count() or 1
     cpu_msg = f"Detected CPU cores: {logical_cores} logical. Default workers: {args.workers}. Note: on systems with Hyper-Threading (SMT), the optimal number of worker processes for CPU-bound BLS computation is typically equal to the number of physical cores."
@@ -1050,7 +1176,8 @@ def main():
                         'time_stitch_s': 0.0,
                         'time_bls_s': 0.0,
                         'time_feats_s': 0.0,
-                        'time_total_s': round(elapsed, 2)
+                        'time_total_s': round(elapsed, 2),
+                        'alias_corrections': 0
                     }
                     append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                 else:
@@ -1081,7 +1208,8 @@ def main():
                         'time_stitch_s': round(timings['stitch'], 2) if timings else 0.0,
                         'time_bls_s': round(timings['bls'], 2) if timings else 0.0,
                         'time_feats_s': round(timings['feats'], 2) if timings else 0.0,
-                        'time_total_s': round(timings['total'], 2) if timings else round(elapsed, 2)
+                        'time_total_s': round(timings['total'], 2) if timings else round(elapsed, 2),
+                        'alias_corrections': int(timings.get('alias_corrections', 0)) if timings else 0
                     }
                     append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     if timings:
@@ -1147,7 +1275,8 @@ def main():
                         'time_stitch_s': 0.0,
                         'time_bls_s': 0.0,
                         'time_feats_s': 0.0,
-                        'time_total_s': round(args.star_timeout, 2)
+                        'time_total_s': round(args.star_timeout, 2),
+                        'alias_corrections': 0
                     }
                     append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     completed_stars += 1
@@ -1222,7 +1351,8 @@ def main():
                                 'time_stitch_s': round(timings['stitch'], 2) if timings else 0.0,
                                 'time_bls_s': round(timings['bls'], 2) if timings else 0.0,
                                 'time_feats_s': round(timings['feats'], 2) if timings else 0.0,
-                                'time_total_s': round(timings['total'], 2) if timings else 0.0
+                                'time_total_s': round(timings['total'], 2) if timings else 0.0,
+                                'alias_corrections': int(timings.get('alias_corrections', 0)) if timings else 0
                             }
                             append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     else:
