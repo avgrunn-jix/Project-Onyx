@@ -176,3 +176,72 @@ def test_loop_disabled_keeps_old_behaviour(extractor, monkeypatch, tmp_path):
     assert timings["alias_factors"] == ""
     assert abs(periods[0] / 2.0 - 1.0) < 0.01
     assert all(abs(p / 4.0 - 1.0) >= 0.01 for p in periods)
+
+
+def test_offline_astropy_bls_project_grid_two_pass(extractor):
+    rng = np.random.default_rng(2026)
+    baseline_d = 60.0
+    cadence_d = 0.0204
+    t = np.arange(0.0, baseline_d, cadence_d)
+    sigma = 2e-4
+    f = 1.0 + rng.normal(0.0, sigma, len(t))
+    e = np.full(len(t), sigma)
+
+    true_period = 3.0
+    true_epoch = 1.15
+    true_dur = 0.12
+    depth = 1e-3
+
+    ph1 = ((t - true_epoch + 0.5 * true_period) % true_period) - 0.5 * true_period
+    f[np.abs(ph1) < true_dur / 2.0] -= depth
+    ph2 = ((t - (true_epoch + 0.5 * true_period) + 0.5 * true_period) % true_period) - 0.5 * true_period
+    f[np.abs(ph2) < true_dur / 2.0] -= 0.4 * depth
+
+    dur_grid = np.linspace(0.04, 0.45, 10)
+    max_p = min(100.0, baseline_d / 2.0)
+    freq_factor = 500
+
+    bls1 = BoxLeastSquares(t, f, dy=e)
+    periods1 = bls1.autoperiod(dur_grid, minimum_period=0.5, maximum_period=max_p, frequency_factor=freq_factor)
+    res1 = bls1.power(periods1, dur_grid)
+    powers1 = np.asarray(res1.power, dtype=float)
+    periods1_arr = np.asarray(res1.period, dtype=float)
+    assert len(periods1_arr) == len(powers1)
+
+    idx1 = int(np.nanargmax(powers1))
+    p1_raw = float(periods1_arr[idx1])
+    t0_1_raw = float(res1.transit_time[idx1])
+    dur1_raw = float(res1.duration[idx1])
+
+    alias1 = extractor.resolve_alias_period(t, f, e, p1_raw, t0_1_raw, dur1_raw, periods1_arr, powers1)
+    p1 = alias1["period"]
+    t0_1 = alias1["epoch"]
+    assert abs(p1 - true_period) / true_period < 0.01
+
+    found_periods = []
+    assert not extractor.is_alias_duplicate(p1, found_periods)
+    found_periods.append(p1)
+
+    lc_cur = lk.LightCurve(time=t, flux=f, flux_err=e)
+    mask1 = lc_cur.create_transit_mask(period=p1, transit_time=t0_1, duration=dur1_raw * 1.5)
+    lc_masked = lc_cur[~mask1]
+    t2 = np.asarray(lc_masked.time.value, dtype=float)
+    f2 = np.asarray(lc_masked.flux.value, dtype=float)
+    e2 = np.asarray(lc_masked.flux_err.value, dtype=float)
+
+    bls2 = BoxLeastSquares(t2, f2, dy=e2)
+    periods2 = bls2.autoperiod(dur_grid, minimum_period=0.5, maximum_period=max_p, frequency_factor=freq_factor)
+    res2 = bls2.power(periods2, dur_grid)
+    powers2 = np.asarray(res2.power, dtype=float)
+    periods2_arr = np.asarray(res2.period, dtype=float)
+    assert len(periods2_arr) == len(powers2)
+
+    idx2 = int(np.nanargmax(powers2))
+    p2_raw = float(periods2_arr[idx2])
+    t0_2_raw = float(res2.transit_time[idx2])
+    dur2_raw = float(res2.duration[idx2])
+
+    alias2 = extractor.resolve_alias_period(t2, f2, e2, p2_raw, t0_2_raw, dur2_raw, periods2_arr, powers2)
+    p2 = alias2["period"]
+    assert extractor.is_alias_duplicate(p2, found_periods)
+

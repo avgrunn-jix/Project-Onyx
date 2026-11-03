@@ -8,10 +8,11 @@
 - П4: добавлены тесты на гарантию разбиения по звёздам без утечки между train и control (tests/test_star_split_no_leakage.py): попарная непересекаемость половин, строгая группировка многосигнальных звёзд, изоляция showcase-звезды в контроле, проверка реального вызова train_and_eval_pipeline с GroupKFold без пересечения target_id. Проверено: py_compile, pytest, проверка поломкой (дублирование звезды между train и control роняет тесты).
 - П5: добавлены тесты на префикс-стабильность выбора и разбиения звёзд (tests/test_prefix_stability.py) для get_marked_stars, match_unmarked_stars и split_stars на различных размерах выборки N1 < N2 без обращений к сети. Проверено: py_compile, pytest (23 passed), проверка поломкой (зависимость seed от n_stars роняет все 3 теста).
 - П6 (п.1 доработки поиска): добавлены флаги CLI --no-clip-upward и --no-resolve-aliases в 1_data_extractor.py; значения передаются воркерам через init_worker и аргументы задач (run_injection, process_single_star), а также выводятся в print и logger при старте. Добавлен тест test_init_worker_sets_search_flags в tests/test_clip_outliers.py. Хеш: 2b6177d.
-- П7 (п.2 доработки поиска): добавлена колонка alias_factors в диагностический csv (4 места diag_row в 1_data_extractor.py + поле в timings), содержащая разделённые ';' факторы исправлений периода (например, '0.5;2.0', или '' при отсутствии исправлений); в таблицу признаков не попадает. Проверено в tests/test_alias_resolution.py.
+- П7 (п.2 доработки поиска): добавлена колонка alias_factors в диагностический csv (4 места diag_row в 1_data_extractor.py + поле в timings), содержащая разделённые ';' факторы исправлений периода (например, '0.5;2.0', или '' при отсутствии исправлений); в таблицу признаков не попадает. Проверено в tests/test_alias_resolution.py. Хеш: 72415e6.
+- П8 (п.3 доработки поиска): проверена передача bls.period.value и power_values в resolve_alias_period (1D массивы одинаковой длины и одной нормировки мощности BLS); добавлена защита на совпадение длин и разворачивание Quantity в _power_near и resolve_alias_period; добавлен офлайн-тест test_offline_astropy_bls_project_grid_two_pass в tests/test_alias_resolution.py (60 суток, период 3 суток, глубина 1000 ppm, гауссов шум, реальный astropy BoxLeastSquares с сеткой проекта, 2 прогона с маской и фильтрацией дубликата). Проверено: py_compile, pytest (25 passed).
 
 ## Сейчас
-- П8 (п.3 доработки поиска): проверка передачи bls.period.value и power_values в resolve_alias_period и офлайн-тест полного цикла BLS с реальной сеткой периодов проекта, маской транзита и фильтрацией дубликата.
+- Все пункты ветки fix-search-2 выполнены и проверены локально.
 
 ## Решения
 - outputs/ на этом компьютере есть; не читаю и не меняю.

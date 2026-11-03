@@ -55,7 +55,7 @@ def _box_depth(t, f, w, period, epoch, duration):
     return d, in_m, ep_idx
 
 def _power_near(periods, powers, p, tol):
-    if periods is None or powers is None or len(periods) == 0:
+    if periods is None or powers is None or len(periods) == 0 or len(periods) != len(powers):
         return np.nan
     sel = np.abs(periods / p - 1.0) <= tol
     if not np.any(sel):
@@ -91,8 +91,8 @@ def resolve_alias_period(time_arr, flux_arr, err_arr, period, epoch, duration, p
     if not np.any(w > 0):
         w = np.ones(len(t))
     w = np.where(w > 0, w, np.median(w[w > 0]))
-    p_arr = None if periods is None else np.asarray(periods, dtype=float)
-    pw_arr = None if powers is None else np.asarray(powers, dtype=float)
+    p_arr = None if periods is None else np.asarray(getattr(periods, 'value', periods), dtype=float).ravel()
+    pw_arr = None if powers is None else np.asarray(getattr(powers, 'value', powers), dtype=float).ravel()
     result = {'period': float(period), 'epoch': float(epoch), 'depth': np.nan, 'factor': 1.0}
     d_c, _, _ = _box_depth(t, f, w, period, epoch, duration)
     result['depth'] = d_c
