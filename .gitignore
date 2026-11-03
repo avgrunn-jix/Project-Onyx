@@ -36,3 +36,4 @@ legacy/
 .lightkurve-cache/
 .DS_Store
 Thumbs.db
+!bench/*.csv
