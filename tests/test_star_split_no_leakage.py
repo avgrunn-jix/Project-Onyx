@@ -1,10 +1,8 @@
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
 
 
 def make_synthetic_catalog(n_marked_pool=80, n_unmarked_pool=200, showcase_star="4852528", seed=7):
-    rng = np.random.RandomState(seed)
     marked_ids = [showcase_star] + [str(2000000 + i * 1103) for i in range(n_marked_pool - 1)]
     rows = []
     dispositions = ["CONFIRMED", "CANDIDATE", "FALSE POSITIVE"]
@@ -102,28 +100,57 @@ def test_multi_signal_stars_never_split_across_train_and_control(demo):
     assert set(df_ctrl_m_for_b["target_id"]).isdisjoint(train_targets)
 
 
-def test_group_cv_splits_keep_all_star_signals_together():
+def test_train_and_eval_pipeline_group_cv_keeps_star_signals_together(demo, monkeypatch):
     rng = np.random.RandomState(123)
-    star_ids = [f"star_{i}" for i in range(20)]
-    rows = []
-    for i, sid in enumerate(star_ids):
+    train_stars = [f"tr_star_{i}" for i in range(10)]
+    ctrl_stars = [f"ctrl_star_{i}" for i in range(6)]
+    tr_rows = []
+    for i, sid in enumerate(train_stars):
         cls = 1 if i % 2 == 0 else 0
         for k in range(3):
-            rows.append({
+            tr_rows.append({
+                "signal_id": f"{sid}_{k}",
                 "target_id": sid,
-                "y": cls,
-                "f1": float(rng.normal(cls, 1.0)),
-                "f2": float(rng.normal(0.0, 1.0)),
+                "target_bin": cls,
+                "f1": float(rng.normal(cls * 2.0, 0.5) + 2.0),
+                "f2": float(rng.normal(0.0, 1.0) + 2.0),
             })
-    df = pd.DataFrame(rows)
-    X = df[["f1", "f2"]].values
-    y = df["y"].values
-    groups = df["target_id"].values
+    ctrl_rows = []
+    for i, sid in enumerate(ctrl_stars):
+        cls = 1 if i % 2 == 0 else 0
+        for k in range(2):
+            ctrl_rows.append({
+                "signal_id": f"{sid}_{k}",
+                "target_id": sid,
+                "target_bin": cls,
+                "f1": float(rng.normal(cls * 2.0, 0.5) + 2.0),
+                "f2": float(rng.normal(0.0, 1.0) + 2.0),
+            })
+    df_tr = pd.DataFrame(tr_rows)
+    df_ctrl = pd.DataFrame(ctrl_rows)
 
-    gkf = GroupKFold(n_splits=5)
-    for tr_idx, val_idx in gkf.split(X, y, groups=groups):
-        assert set(groups[tr_idx]).isdisjoint(set(groups[val_idx]))
+    recorded_folds = []
+    orig_gkf = demo.GroupKFold
 
-    sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
-    for tr_idx, val_idx in sgkf.split(X, y, groups=groups):
-        assert set(groups[tr_idx]).isdisjoint(set(groups[val_idx]))
+    class SpyGroupKFold:
+        def __init__(self, n_splits=5):
+            self.inner = orig_gkf(n_splits=n_splits)
+
+        def split(self, X, y=None, groups=None):
+            assert groups is not None
+            real_star_ids = df_tr["target_id"].values
+            for tr_idx, val_idx in self.inner.split(X, y, groups=groups):
+                tr_g = set(real_star_ids[tr_idx])
+                val_g = set(real_star_ids[val_idx])
+                recorded_folds.append((tr_g, val_g))
+                yield tr_idx, val_idx
+
+    monkeypatch.setattr(demo, "GroupKFold", SpyGroupKFold)
+    df_res, model, _, _, _ = demo.train_and_eval_pipeline(df_tr, df_ctrl, ["f1", "f2"], seed=42)
+    assert model is not None
+    assert len(df_res) == len(df_ctrl)
+    assert len(recorded_folds) == 5
+    for tr_g, val_g in recorded_folds:
+        assert tr_g.isdisjoint(val_g)
+        assert tr_g.isdisjoint(set(ctrl_stars))
+        assert val_g.isdisjoint(set(ctrl_stars))
