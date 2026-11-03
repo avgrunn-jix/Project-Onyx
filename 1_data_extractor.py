@@ -575,6 +575,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         timing_bls_details = []
         timing_feats = []
         alias_corrections = 0
+        alias_factors_list = []
         found_periods = []
 
         for sig_idx in range(max_signals):
@@ -624,6 +625,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
                     bls_epoch = alias_res['epoch']
                     bls_depth_ppm = float(alias_res['depth'] * 1e6)
                     alias_corrections += 1
+                    alias_factors_list.append(str(round(float(alias_res['factor']), 4)))
                 if is_alias_duplicate(bls_period_d, found_periods):
                     dup_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=bls_epoch, duration=bls_duration_d * 1.5)
                     lc_search = lc_search[~dup_mask]
@@ -757,7 +759,8 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'n_files': n_files if 'n_files' in locals() else (len(lc_col) if 'lc_col' in locals() and lc_col is not None else 0),
             'n_quarters': n_quarters if 'n_quarters' in locals() else (len(lc_col) if 'lc_col' in locals() and lc_col is not None else 0),
             'baseline_d': baseline_d if 'baseline_d' in locals() else 0.0,
-            'alias_corrections': alias_corrections
+            'alias_corrections': alias_corrections,
+            'alias_factors': ';'.join(alias_factors_list)
         }
         return features_list, curves_dict, tid, None, dl_size, timings
     except Exception as e:
@@ -1189,7 +1192,8 @@ def main():
                         'time_bls_s': 0.0,
                         'time_feats_s': 0.0,
                         'time_total_s': round(elapsed, 2),
-                        'alias_corrections': 0
+                        'alias_corrections': 0,
+                        'alias_factors': ''
                     }
                     append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                 else:
@@ -1221,7 +1225,8 @@ def main():
                         'time_bls_s': round(timings['bls'], 2) if timings else 0.0,
                         'time_feats_s': round(timings['feats'], 2) if timings else 0.0,
                         'time_total_s': round(timings['total'], 2) if timings else round(elapsed, 2),
-                        'alias_corrections': int(timings.get('alias_corrections', 0)) if timings else 0
+                        'alias_corrections': int(timings.get('alias_corrections', 0)) if timings else 0,
+                        'alias_factors': str(timings.get('alias_factors', '')) if timings else ''
                     }
                     append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     if timings:
@@ -1288,7 +1293,8 @@ def main():
                         'time_bls_s': 0.0,
                         'time_feats_s': 0.0,
                         'time_total_s': round(args.star_timeout, 2),
-                        'alias_corrections': 0
+                        'alias_corrections': 0,
+                        'alias_factors': ''
                     }
                     append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     completed_stars += 1
@@ -1364,7 +1370,8 @@ def main():
                                 'time_bls_s': round(timings['bls'], 2) if timings else 0.0,
                                 'time_feats_s': round(timings['feats'], 2) if timings else 0.0,
                                 'time_total_s': round(timings['total'], 2) if timings else 0.0,
-                                'alias_corrections': int(timings.get('alias_corrections', 0)) if timings else 0
+                                'alias_corrections': int(timings.get('alias_corrections', 0)) if timings else 0,
+                                'alias_factors': str(timings.get('alias_factors', '')) if timings else ''
                             }
                             append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     else:

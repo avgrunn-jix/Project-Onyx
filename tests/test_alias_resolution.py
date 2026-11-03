@@ -151,7 +151,15 @@ def test_loop_has_no_alias_duplicates(extractor, monkeypatch, tmp_path):
     assert [x["signal_index"] for x in feats] == list(range(len(feats)))
     assert "alias_corrections" in timings
     assert timings["alias_corrections"] >= 1
-    print("RESOLVE_ALIASES=True periods:", periods, "corrections:", timings["alias_corrections"], "dup checks:", dup_calls)
+    assert "alias_factors" in timings
+    assert isinstance(timings["alias_factors"], str) and len(timings["alias_factors"]) > 0
+    factors_parts = timings["alias_factors"].split(";")
+    assert len(factors_parts) == timings["alias_corrections"]
+    assert "2.0" in factors_parts
+    for item in feats:
+        assert "alias_factors" not in item
+        assert "alias_corrections" not in item
+    print("RESOLVE_ALIASES=True periods:", periods, "corrections:", timings["alias_corrections"], "factors:", timings["alias_factors"], "dup checks:", dup_calls)
 
 
 def test_loop_disabled_keeps_old_behaviour(extractor, monkeypatch, tmp_path):
@@ -165,5 +173,6 @@ def test_loop_disabled_keeps_old_behaviour(extractor, monkeypatch, tmp_path):
     feats, timings = run_star(extractor, monkeypatch, tmp_path)
     periods = [float(x["bls_period_d"]) for x in feats]
     assert timings["alias_corrections"] == 0
+    assert timings["alias_factors"] == ""
     assert abs(periods[0] / 2.0 - 1.0) < 0.01
     assert all(abs(p / 4.0 - 1.0) >= 0.01 for p in periods)
