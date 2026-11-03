@@ -7,9 +7,10 @@
 - П3: создан общий модуль onyx_features.py (EXCLUDE_COLS, COVERAGE_COLS, is_koi_column, compute_feature_columns); подключён в 2_ml_pipeline.py (run_ml и transfer_mode) и 3_demo_pipeline.py; добавлены тесты эквивалентности (со старым списком признаков, зашитым константой LEGACY_ML_FEATURES / LEGACY_DEMO_FEATURES) и гарантии отсутствия KOI-колонок в tests/test_feature_columns.py. Проверено: py_compile, pytest, проверка поломкой (пропуск koi_period роняет тест).
 - П4: добавлены тесты на гарантию разбиения по звёздам без утечки между train и control (tests/test_star_split_no_leakage.py): попарная непересекаемость половин, строгая группировка многосигнальных звёзд, изоляция showcase-звезды в контроле, проверка реального вызова train_and_eval_pipeline с GroupKFold без пересечения target_id. Проверено: py_compile, pytest, проверка поломкой (дублирование звезды между train и control роняет тесты).
 - П5: добавлены тесты на префикс-стабильность выбора и разбиения звёзд (tests/test_prefix_stability.py) для get_marked_stars, match_unmarked_stars и split_stars на различных размерах выборки N1 < N2 без обращений к сети. Проверено: py_compile, pytest (23 passed), проверка поломкой (зависимость seed от n_stars роняет все 3 теста).
+- П6 (п.1 доработки поиска): добавлены флаги CLI --no-clip-upward и --no-resolve-aliases в 1_data_extractor.py; значения передаются воркерам через init_worker и аргументы задач (run_injection, process_single_star), а также выводятся в print и logger при старте. Добавлен тест test_init_worker_sets_search_flags в tests/test_clip_outliers.py.
 
 ## Сейчас
-- Все пункты ветки fix-search-2 выполнены и проверены локально.
+- П7 (п.2 доработки поиска): колонка alias_factors в диагностический csv (строка вида "0.5;2.0", пустая при отсутствии исправлений), без попадания в таблицу признаков.
 
 ## Решения
 - outputs/ на этом компьютере есть; не читаю и не меняю.

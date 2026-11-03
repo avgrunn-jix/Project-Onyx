@@ -135,9 +135,13 @@ def is_alias_duplicate(period, found_periods, tol=ALIAS_TOL):
                 return True
     return False
 
-def init_worker(sem):
-    global _dl_sem
+def init_worker(sem, clip_upward=None, resolve_aliases=None):
+    global _dl_sem, CLIP_UPWARD_ONLY, RESOLVE_ALIASES
     _dl_sem = sem
+    if clip_upward is not None:
+        CLIP_UPWARD_ONLY = bool(clip_upward)
+    if resolve_aliases is not None:
+        RESOLVE_ALIASES = bool(resolve_aliases)
 
 def setup_logger():
     os.makedirs('logs', exist_ok=True)
@@ -310,7 +314,8 @@ def compute_centroid_shift(times, col_det, row_det, period, epoch, duration, mis
         return c_shift_col_sig, c_shift_row_sig, c_shift_tot_sig, c_shift_tot_arcsec
     return np.nan, np.nan, np.nan, np.nan
 
-def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0):
+def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0, clip_upward=None, resolve_aliases=None):
+    use_clip_upward = CLIP_UPWARD_ONLY if clip_upward is None else bool(clip_upward)
     free_bytes = shutil.disk_usage(os.path.abspath('.')).free
     if free_bytes < min_free_gb * 1024**3: return None, tid, 'Disk space below threshold'
     start_t = time.time()
@@ -356,7 +361,7 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
         if lc_col is None or len(lc_col) == 0: return None, tid, 'No lightcurves found'
         detrend_centroids(lc_col, flatten_days)
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
-        lc = clip_outliers(lc.remove_nans())
+        lc = clip_outliers(lc.remove_nans(), upward_only=use_clip_upward)
         if len(lc) < 500: return None, tid, 'Not enough points'
         times = np.asarray(lc.time.value, dtype=float)
         flux_val = np.asarray(lc.flux.value, dtype=float)
@@ -417,7 +422,7 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
             results.append(res)
             if recovered:
                 rem_timeout = max(10.0, deadline - time.time())
-                feat, _, _, _, _, _ = process_single_star(tid, mission, [{'catalog_period': inj_period, 'label': 'INJECTED'}], True, 0, flatten_days, 1, quick_mode=quick_mode, cache_dir=cache_dir, star_timeout=rem_timeout, max_sectors=max_sectors)
+                feat, _, _, _, _, _ = process_single_star(tid, mission, [{'catalog_period': inj_period, 'label': 'INJECTED'}], True, 0, flatten_days, 1, quick_mode=quick_mode, cache_dir=cache_dir, star_timeout=rem_timeout, max_sectors=max_sectors, clip_upward=clip_upward, resolve_aliases=resolve_aliases)
                 if feat and len(feat) > 0:
                     feat[0]['centroid_shift_col_sigma'] = c_col_sig
                     feat[0]['centroid_shift_row_sigma'] = c_row_sig
@@ -431,7 +436,9 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0):
+def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0, clip_upward=None, resolve_aliases=None):
+    use_clip_upward = CLIP_UPWARD_ONLY if clip_upward is None else bool(clip_upward)
+    use_resolve_aliases = RESOLVE_ALIASES if resolve_aliases is None else bool(resolve_aliases)
     free_bytes = shutil.disk_usage(os.path.abspath('.')).free
     if free_bytes < min_free_gb * 1024**3:
         return None, None, tid, 'Disk space below threshold', 0, None
@@ -519,7 +526,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         t_stitch_start = time.time()
         detrend_centroids(lc_col, flatten_days)
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
-        lc = clip_outliers(lc.remove_nans())
+        lc = clip_outliers(lc.remove_nans(), upward_only=use_clip_upward)
         if len(lc) < 500:
             return None, None, tid, 'Not enough valid points', dl_size, None
         times = np.asarray(lc.time.value, dtype=float)
@@ -609,7 +616,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             bls_epoch = float(bls.transit_time_at_max_power.value)
             bls_duration_d = float(bls.duration_at_max_power.value)
             bls_depth_ppm = float(bls.depth_at_max_power.value * 1e6)
-            if RESOLVE_ALIASES:
+            if use_resolve_aliases:
                 s_err = np.asarray(lc_search.flux_err.value, dtype=float) if 'flux_err' in lc_search.columns else None
                 alias_res = resolve_alias_period(np.asarray(lc_search.time.value, dtype=float), np.asarray(lc_search.flux.value, dtype=float), s_err, bls_period_d, bls_epoch, bls_duration_d, np.asarray(bls.period.value, dtype=float), power_values)
                 if alias_res['factor'] != 1.0:
@@ -816,7 +823,12 @@ def main():
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
     parser.add_argument('--max-sectors', type=int, default=0, help='[DEBUG ONLY] Limit the number of sectors/quarters downloaded. Warning: alters baseline, features, and detection results; not for production training.')
     parser.add_argument('--smoke-test', action='store_true', help='[TEST ONLY] Run extractor in isolated smoke test mode, writing outputs to outputs/_smoke_test/')
+    parser.add_argument('--no-clip-upward', action='store_true')
+    parser.add_argument('--no-resolve-aliases', action='store_true')
     args = parser.parse_args()
+    global CLIP_UPWARD_ONLY, RESOLVE_ALIASES
+    CLIP_UPWARD_ONLY = not args.no_clip_upward
+    RESOLVE_ALIASES = not args.no_resolve_aliases
     if args.smoke_test and args.min_free_gb == 5.0:
         args.min_free_gb = 1.0
     free_now_gb = shutil.disk_usage(os.path.abspath('.')).free / (1024**3)
@@ -965,7 +977,7 @@ def main():
             tid_str = str(tid)
             if tid_str in completed_inj_stars:
                 continue
-            tasks.append((tid_str, args.mission, args.injections_per_star, args.min_free_gb, args.flatten_days, args.quick, args.cache_dir, args.star_timeout, args.max_sectors))
+            tasks.append((tid_str, args.mission, args.injections_per_star, args.min_free_gb, args.flatten_days, args.quick, args.cache_dir, args.star_timeout, args.max_sectors, CLIP_UPWARD_ONLY, RESOLVE_ALIASES))
 
         total_inj = len(tasks)
         done_inj = 0
@@ -976,7 +988,7 @@ def main():
         import multiprocessing
         mgr_inj = multiprocessing.Manager()
         dl_sem_inj = mgr_inj.Semaphore(args.max_download_workers)
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(dl_sem_inj,)) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(dl_sem_inj, CLIP_UPWARD_ONLY, RESOLVE_ALIASES)) as executor:
             task_iter = iter(tasks)
             active_futures = {}
             for _ in range(min(args.workers * 2, total_inj)):
@@ -1113,7 +1125,7 @@ def main():
         if tid_str in failed_attempts and failed_attempts[tid_str] >= 2:
             continue
         rows = labels_df[labels_df['target_id'] == tid_str].to_dict('records')
-        tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout, args.max_sectors))
+        tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout, args.max_sectors, CLIP_UPWARD_ONLY, RESOLVE_ALIASES))
 
     total_tasks = len(tasks)
     completed_stars = 0
@@ -1130,7 +1142,7 @@ def main():
     import multiprocessing
     mgr = multiprocessing.Manager()
     dl_sem = mgr.Semaphore(args.max_download_workers)
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(dl_sem,)) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(dl_sem, CLIP_UPWARD_ONLY, RESOLVE_ALIASES)) as executor:
         task_iter = iter(tasks)
         active_futures = {}
         for _ in range(min(args.workers * 2, total_tasks)):

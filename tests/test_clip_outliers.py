@@ -39,3 +39,15 @@ def test_default_follows_constant(extractor, monkeypatch):
     flux = np.asarray(extractor.clip_outliers(lc).flux.value, dtype=float)
     assert np.any(np.isclose(flux, 1.0 - 10 * sigma))
     assert extractor.CLIP_UPWARD_ONLY is True
+
+
+def test_init_worker_sets_search_flags(extractor, monkeypatch):
+    monkeypatch.setattr(extractor, "CLIP_UPWARD_ONLY", True)
+    monkeypatch.setattr(extractor, "RESOLVE_ALIASES", True)
+    extractor.init_worker("dummy_sem", clip_upward=False, resolve_aliases=False)
+    assert extractor.CLIP_UPWARD_ONLY is False
+    assert extractor.RESOLVE_ALIASES is False
+    extractor.init_worker("dummy_sem", clip_upward=True, resolve_aliases=True)
+    assert extractor.CLIP_UPWARD_ONLY is True
+    assert extractor.RESOLVE_ALIASES is True
+
