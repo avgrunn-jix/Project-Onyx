@@ -26,7 +26,16 @@ warnings.filterwarnings('ignore')
 logging.getLogger('lightkurve').setLevel(logging.ERROR)
 logging.getLogger('astroquery').setLevel(logging.ERROR)
 
+CLIP_UPWARD_ONLY = True
+
 _dl_sem = None
+
+def clip_outliers(lc, upward_only=None):
+    if upward_only is None:
+        upward_only = CLIP_UPWARD_ONLY
+    if upward_only:
+        return lc.remove_outliers(sigma_upper=5, sigma_lower=float('inf'))
+    return lc.remove_outliers(sigma=5)
 
 def init_worker(sem):
     global _dl_sem
@@ -249,7 +258,7 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
         if lc_col is None or len(lc_col) == 0: return None, tid, 'No lightcurves found'
         detrend_centroids(lc_col, flatten_days)
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
-        lc = lc.remove_nans().remove_outliers(sigma=5)
+        lc = clip_outliers(lc.remove_nans())
         if len(lc) < 500: return None, tid, 'Not enough points'
         times = np.asarray(lc.time.value, dtype=float)
         flux_val = np.asarray(lc.flux.value, dtype=float)
@@ -412,7 +421,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         t_stitch_start = time.time()
         detrend_centroids(lc_col, flatten_days)
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
-        lc = lc.remove_nans().remove_outliers(sigma=5)
+        lc = clip_outliers(lc.remove_nans())
         if len(lc) < 500:
             return None, None, tid, 'Not enough valid points', dl_size, None
         times = np.asarray(lc.time.value, dtype=float)
