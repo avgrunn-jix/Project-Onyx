@@ -26,6 +26,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupKFold
 from xgboost import XGBClassifier
 import shap
+from onyx_features import COVERAGE_COLS, compute_feature_columns
 
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Segoe UI']
 plt.rcParams['axes.unicode_minus'] = False
@@ -1006,9 +1007,10 @@ def main():
     df_diag_csv.to_csv(diag_csv_out, index=False, encoding='utf-8')
 
     df_features['target_bin'] = df_features['label'].apply(lambda x: 1 if str(x).upper() in ['CONFIRMED', 'CANDIDATE'] else 0)
-    exclude_cols = ['signal_id', 'target_id', 'signal_index', 'mission', 'label', 'match_status', 'target_bin', 'koi_fpflag_nt', 'koi_fpflag_ss', 'koi_fpflag_co', 'koi_fpflag_ec', 'p_candidate', 'n_signals_star']
-    coverage_cols = ['baseline_d', 'n_files', 'n_quarters', 'quarters', 'st_quarters', 'dataspan', 'cadence_days', 'mean_cadence_min']
-    feature_cols = [c for c in df_features.columns if c not in exclude_cols and c not in coverage_cols]
+    coverage_cols = list(COVERAGE_COLS)
+    feature_cols = compute_feature_columns(df_features, exclude_coverage=True)
+
+
 
     train_stars_set = set(final_tr_m + final_tr_u)
     ctrl_stars_set = set(final_ctrl_m + final_ctrl_u)
