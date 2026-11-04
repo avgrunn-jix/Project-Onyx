@@ -51,3 +51,22 @@ def test_init_worker_sets_search_flags(extractor, monkeypatch):
     assert extractor.CLIP_UPWARD_ONLY is True
     assert extractor.RESOLVE_ALIASES is True
 
+
+def test_default_is_symmetric(extractor):
+    assert extractor.CLIP_UPWARD_ONLY is False
+    lc, sigma = make_lc()
+    flux = np.asarray(extractor.clip_outliers(lc).flux.value, dtype=float)
+    expected = np.asarray(lc.remove_outliers(sigma=5).flux.value, dtype=float)
+    assert np.array_equal(flux, expected)
+    assert not np.any(np.isclose(flux, 1.0 - 10 * sigma))
+    assert not np.any(np.isclose(flux, 1.0 + 10 * sigma))
+
+
+def test_clip_upward_only_flag_reaches_workers(extractor, monkeypatch):
+    monkeypatch.setattr(extractor, "CLIP_UPWARD_ONLY", False)
+    extractor.init_worker("dummy_sem", clip_upward=True, resolve_aliases=True)
+    assert extractor.CLIP_UPWARD_ONLY is True
+    lc, sigma = make_lc()
+    flux = np.asarray(extractor.clip_outliers(lc).flux.value, dtype=float)
+    assert np.any(np.isclose(flux, 1.0 - 10 * sigma))
+    assert not np.any(np.isclose(flux, 1.0 + 10 * sigma))
