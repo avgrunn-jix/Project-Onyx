@@ -37,3 +37,4 @@ legacy/
 .DS_Store
 Thumbs.db
 !bench/*.csv
+PROGRESS_*.md
