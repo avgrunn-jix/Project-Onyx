@@ -8,6 +8,7 @@ Unlike black-box deep learning systems, Onyx focuses on honest evaluation, featu
 
 - [Key features](#key-features)
 - [Installation and quick start](#installation-and-quick-start)
+- [Running tests](#running-tests)
 - [Pipeline modes](#pipeline-modes)
 - [Demo mode](#demo-mode)
 - [Search settings](#search-settings)
@@ -29,7 +30,7 @@ Unlike black-box deep learning systems, Onyx focuses on honest evaluation, featu
 - **Centroid-shift diagnostics.** In-transit versus out-of-transit centroid shifts are computed from `centroid_col` and `centroid_row`, detrended per observation segment. The features are `centroid_shift_col_sigma`, `centroid_shift_row_sigma`, `centroid_shift_total_sigma`, and `centroid_shift_total_arcsec` (pixel scales of 3.98"/pixel for Kepler and 21.0"/pixel for TESS).
 - **Likely false-positive reason.** One binary XGBoost classifier is trained per KOI false-positive flag (`koi_fpflag_nt`, `koi_fpflag_ss`, `koi_fpflag_co`, `koi_fpflag_ec`) when enough positive and negative examples exist. Predictions include `p_reason_*` and `likely_reason` columns.
 - **Explainability (SHAP).** A `TreeExplainer` (Lundberg & Lee, 2017) reports the top 3 contributing features for every prediction, for example `secondary_depth_ppm=450 (negative)`, meaning a deep secondary eclipse pushed the model towards rejecting the candidate.
-- **Confidence and abstention.** The `train` mode builds an ensemble of 20 XGBoost models trained on star-grouped bootstraps and reports `p_mean` and `p_std`. A signal with ambiguous or uncertain scores gets the verdict `REVIEW` instead of a forced binary decision. The thresholds are searched on a grid, targeting at least 95% precision for the confident `CANDIDATE` and `FALSE_POSITIVE` verdicts. They are tuned on the training split.
+- **Confidence and abstention.** The `train` mode builds an ensemble of 20 XGBoost models trained on star-grouped bootstraps and reports `p_mean` and `p_std`. A signal with ambiguous or uncertain scores gets the verdict `REVIEW` instead of a forced binary decision. The thresholds are searched on a grid, and the first setting is used for which the confident verdicts reach at least 95% precision (the share of correct `CANDIDATE` verdicts, and the share of correct `FALSE_POSITIVE` verdicts) on the training split; if no setting reaches it, built-in defaults are used. Demo mode tunes its thresholds differently (see [Demo mode](#demo-mode)).
 - **Synthetic transit injections.** The `inject` mode injects trapezoidal transits into quiet stars and measures how often the search recovers them (see [Pipeline modes](#pipeline-modes)).
 - **Mission transferability (Kepler → TESS).** The `transfer` mode compares direct transfer, a transfer with mission-dependent features removed, and in-domain cross-validation on TESS. It also computes the Kolmogorov-Smirnov (K-S) shift per feature.
 - **Unsupervised anomaly detection.** Isolation Forest (Liu, Ting & Zhou, 2008) and Local Outlier Factor scan all signals, including `UNMATCHED` and `HARMONIC` ones, and report signals that both methods rank among their top 50 and that did not receive a confident verdict.
@@ -54,6 +55,17 @@ python main.py --mode demo --marked-stars 4 --unmarked-stars 4 --quick --smoke-t
 > A smoke test only checks that the code runs end to end. Its results are not scientifically meaningful.
 
 Run `python main.py --help` for the full list of arguments.
+
+## Running tests
+
+The tests are in `tests/`, need no network access, and are run from the repository root with `pytest`. pytest is not listed in `requirements.txt`, so install it separately:
+
+```bash
+pip install pytest
+pytest
+```
+
+The test files cover: outlier clipping and the extractor search flags (`test_clip_outliers.py`), period alias resolution (`test_alias_resolution.py`), feature column selection (`test_feature_columns.py`), the star-level train/control split without leakage (`test_star_split_no_leakage.py`), and prefix stability of the star selection and split when the sample size grows (`test_prefix_stability.py`).
 
 ## Pipeline modes
 
@@ -86,11 +98,11 @@ Demo mode (`--mode demo`) checks the pipeline reproducibly on a balanced sample 
 
 - **Star-level 50/50 split.** The sample is split into a training half and a control half. Each half contains the same number of marked stars (stars that appear in the KOI label table with a `CONFIRMED`, `CANDIDATE`, or `FALSE POSITIVE` disposition) and unmarked control stars (no known KOI). No star appears in both halves.
 - **Matched control stars.** Unmarked stars are drawn from the Kepler stellar catalog (`Q1_Q17_DR25_KS`, `kepmag` 11.0-15.5, data span above 1000 d, at least 10 quarters), excluding all KOI hosts. Each marked star gets a one-to-one match within its KIC-number decile, chosen as the nearest star in normalized `kepmag` and number of quarters (`st_quarters`). This prevents trivially separating the groups by instrumental noise or observation length.
-- **Isolated showcase system.** Kepler-80 (KIC 4852528, five known planets: b, c, d, e, f) is forced into the control half and is excluded from all training, which rules out data leakage. Use `--showcase-star` to choose another star.
+- **Isolated showcase system.** Kepler-80 (KIC 4852528) is forced into the control half and is excluded from all training, which rules out data leakage. Use `--showcase-star` to choose another star. The KOI label table lists five planets for this star (b, c, d, e, f), and the Kepler-80 recovery table in `summary.md` counts exactly these five, using their periods hard-coded in `3_demo_pipeline.py`. A sixth planet, Kepler-80 g (period about 14.65 d), was found by Shallue & Vanderburg (2018; reference 1) but is absent from the label table. It is therefore not counted as a known planet in the recovery table, and a signal near its period would not be matched to a catalog planet.
 - **Two-way evaluation.**
   - **Direction A:** train on the training half, evaluate on the control half.
   - **Direction B:** train on the control half (Kepler-80 removed), evaluate on the training half.
-- **Abstention thresholds.** Verdict thresholds are tuned with star-grouped (`GroupKFold`) out-of-fold predictions on the training data, targeting the accuracy set by `--target-precision` (default 0.90) on accepted signals. Confidence intervals come from a bootstrap over stars (500 resamples, 5th-95th percentile).
+- **Abstention thresholds.** Verdict thresholds are tuned with star-grouped (`GroupKFold`) out-of-fold predictions on the training data, choosing the thresholds with the largest coverage for which the accuracy on accepted signals (the share of correct verdicts among all `CANDIDATE` and `FALSE_POSITIVE` verdicts) reaches `--target-precision` (default 0.90). If no setting reaches it, the setting with the highest accuracy is used. Despite its name, `--target-precision` therefore targets accuracy on accepted signals, not class precision. Confidence intervals come from a bootstrap over stars (500 resamples, 5th-95th percentile).
 - **Immutability check.** Before and after the run, the pipeline computes SHA-256 hashes of all files in `outputs/` (excluding `outputs/demo*` and `outputs/_smoke_test`) and compares them, so the run cannot silently modify existing artifacts.
 
 ### Running
@@ -160,8 +172,6 @@ Long extraction runs can be interrupted and resumed. This applies to any environ
 |---|---|
 | `extracted_features.csv` | Main feature matrix produced by the extractor on real stars (`_quick` suffix with `--quick`). Excluded from Git. |
 | `<output>_diagnostics.csv`, `<output>_failed.csv` | Per-star diagnostics and failed stars of an extraction run. |
-| `test_features.csv` | Synthetic file of random numbers, used only to check that the code runs. It contains no scientific results. Excluded from Git. |
-| `legacy/` | Archive of obsolete files (including `legacy_mixed_features.csv`). Excluded from Git. |
 | `outputs/models/` | The serialized model `pipeline_model.joblib`. Excluded from Git. |
 | `outputs/figures/` | Plots: SHAP, coverage versus precision, transfer K-S shift and ROC, anomalies. Excluded from Git. |
 | `outputs/predictions.csv` | Test-set predictions with SHAP top factors. |
@@ -178,7 +188,7 @@ Long extraction runs can be interrupted and resumed. This applies to any environ
 
 Timings depend strongly on the star, the number of quarters, and the machine. The figures below come from specific measurements.
 
-**Per-star profile, normal mode.** Star KIC 10801249 (KOI-4611, `FALSE POSITIVE`), 18 files covering 18 unique quarters (Q00-Q17), about 65,000 points, 1 worker process on a local machine, normal mode (no `--quick`, `frequency_factor=500`, 10 duration steps). The stages add up to **366.8 s (about 6.1 min)** per star; the total with overhead was about 385 s:
+**Per-star profile, normal mode.** Star KIC 10801249 (KOI-4611, `FALSE POSITIVE`), 18 files covering 18 unique quarters (Q00-Q17), about 65,000 points, 1 worker process on a local machine, normal mode (no `--quick`, `frequency_factor=500`, 10 duration steps). The stages add up to **about 365 s (about 6.1 min)** per star; the total with overhead was about 385 s:
 
 | Stage | Time | Share |
 |---|---|---|
