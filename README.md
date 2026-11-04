@@ -142,12 +142,13 @@ With `--quick`, file names get a `_quick` suffix. With `--smoke-test`, the folde
 Two flags of `1_data_extractor.py` control details of the signal search. `main.py` does not forward them, so pass them to the extractor directly:
 
 ```bash
-python 1_data_extractor.py --mission Kepler --limit 100 --no-clip-upward --no-resolve-aliases
+python 1_data_extractor.py --mission Kepler --limit 100 --clip-upward-only --no-resolve-aliases
 ```
 
-- **Outlier clipping (default: upward only).** By default only upward outliers above 5 sigma are removed, so transit dips are kept. `--no-clip-upward` switches to symmetric 5-sigma clipping.
+- **Outlier clipping (default: symmetric).** By default, outliers beyond 5 sigma are removed on both sides. `--clip-upward-only` (experimental) removes only upward outliers, keeping transit dips. On a small bench, upward-only clipping lost known planets in multi-planet systems, so it is off by default.
 - **Alias resolution (default: on).** After each BLS peak, the extractor tests whether the true period is one half or one third of it (or twice it). A test is accepted only if the BLS power near the trial period and the box-model transit depth support it (within a 1% period tolerance). A signal whose period duplicates one already found (ratios 1, 2, 3, 1/2, or 1/3 within 1%) is not recorded, but its transits are masked and the iteration is used up. `--no-resolve-aliases` disables all of this.
 - The number of corrected periods is written to the diagnostics file (`<output>_diagnostics.csv`) as `alias_corrections`, and the applied factors as `alias_factors`. Neither column enters the feature table.
+- Bench: `bench/run_bench.bat` runs the extractor on 7 Kepler stars (`bench/targets_bench.csv`) with default settings and with `--no-resolve-aliases`, and `bench/compare_bench.py` compares the two. Recorded results are in [bench/BENCH_RESULTS.md](bench/BENCH_RESULTS.md).
 
 ## Resumable runs and fault tolerance
 
