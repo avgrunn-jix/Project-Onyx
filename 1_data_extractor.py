@@ -26,7 +26,7 @@ warnings.filterwarnings('ignore')
 logging.getLogger('lightkurve').setLevel(logging.ERROR)
 logging.getLogger('astroquery').setLevel(logging.ERROR)
 
-CLIP_UPWARD_ONLY = True
+CLIP_UPWARD_ONLY = False
 RESOLVE_ALIASES = True
 ALIAS_TOL = 0.01
 ALIAS_DEPTH_SHORT = 0.8
@@ -826,11 +826,11 @@ def main():
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
     parser.add_argument('--max-sectors', type=int, default=0, help='[DEBUG ONLY] Limit the number of sectors/quarters downloaded. Warning: alters baseline, features, and detection results; not for production training.')
     parser.add_argument('--smoke-test', action='store_true', help='[TEST ONLY] Run extractor in isolated smoke test mode, writing outputs to outputs/_smoke_test/')
-    parser.add_argument('--no-clip-upward', action='store_true')
+    parser.add_argument('--clip-upward-only', action='store_true', help='[EXPERIMENTAL] Clip only upward outliers (5 sigma) instead of symmetric 5-sigma clipping. Can remove known planets in multi-planet systems.')
     parser.add_argument('--no-resolve-aliases', action='store_true')
     args = parser.parse_args()
     global CLIP_UPWARD_ONLY, RESOLVE_ALIASES
-    CLIP_UPWARD_ONLY = not args.no_clip_upward
+    CLIP_UPWARD_ONLY = args.clip_upward_only
     RESOLVE_ALIASES = not args.no_resolve_aliases
     if args.smoke_test and args.min_free_gb == 5.0:
         args.min_free_gb = 1.0
