@@ -33,6 +33,33 @@ from onyx_features import COVERAGE_COLS, compute_feature_columns
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Segoe UI']
 plt.rcParams['axes.unicode_minus'] = False
 
+DEMO_LOG_PATH = os.path.join('logs', 'demo.log')
+_console = None
+_logger = None
+_verbose = False
+
+def emit(text, show=True, level='info'):
+    if _logger is not None:
+        getattr(_logger, level)(text)
+    if show or _verbose or _console is None:
+        if _console is not None:
+            _console.show(text)
+        else:
+            print(text, flush=True)
+
+def phase(text):
+    if _console is not None:
+        _console.phase(text)
+
+def run_child(cmd, check=False):
+    if _console is not None:
+        _console.pause()
+    try:
+        return subprocess.run(cmd, check=check)
+    finally:
+        if _console is not None:
+            _console.resume()
+
 ARTIFACT_FILTER_CONFIG = {
     'min_period_days': 0.60,
     'max_period_upper_mult': 0.95,
@@ -318,7 +345,7 @@ def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, see
     X_ts_scaled = scale_pipe.transform(X_ts) if len(X_ts) > 0 else np.zeros((0, len(feature_cols)))
 
     if len(df_train_signals) == 0:
-        print("  ВНИМАНИЕ: Обучающий набор сигналов пуст (0 сигналов). Оценка качества модели и присвоение вердиктов пропущены.", flush=True)
+        emit("  ВНИМАНИЕ: Обучающий набор сигналов пуст (0 сигналов). Оценка качества модели и присвоение вердиктов пропущены.")
         df_res = df_test_signals.copy()
         df_res['p_mean'] = np.nan
         df_res['p_std'] = np.nan
@@ -336,12 +363,12 @@ def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, see
 
     if len(unique_classes) < 2 or min_count < 5:
         classes_str = ', '.join([f"класс {c} ({'CONFIRMED/CANDIDATE' if c==1 else 'FALSE_POSITIVE'}): {class_counts.get(c, 0)}" for c in [1, 0]])
-        print(f"  ВНИМАНИЕ: Обучение невозможно: в обучающей части классы: {classes_str}, всего сигналов: {len(y_tr)} (требуется как минимум 2 класса и не менее 5 сигналов каждого класса).", flush=True)
-        print("  Сводка по классам в обучающей части:")
+        emit(f"  ВНИМАНИЕ: Обучение невозможно: в обучающей части классы: {classes_str}, всего сигналов: {len(y_tr)} (требуется как минимум 2 класса и не менее 5 сигналов каждого класса).")
+        emit("  Сводка по классам в обучающей части:")
         for c in [1, 0]:
             c_desc = 'CONFIRMED/CANDIDATE' if c == 1 else 'FALSE_POSITIVE'
-            print(f"    Класс {c} ({c_desc}): {class_counts.get(c, 0)} сигналов", flush=True)
-        print("  Оценка качества модели и присвоение вердиктов пропущены.", flush=True)
+            emit(f"    Класс {c} ({c_desc}): {class_counts.get(c, 0)} сигналов")
+        emit("  Оценка качества модели и присвоение вердиктов пропущены.")
         df_res = df_test_signals.copy()
         df_res['p_mean'] = np.nan
         df_res['p_std'] = np.nan
@@ -529,7 +556,7 @@ def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode
         baseline_days = float(bjd_max - bjd_min)
         times_flat = lc_flat.time.value
         flux_flat = lc_flat.flux.value
-        print(f"  Kepler-80: загружено файлов = {n_files}, уник. кварталов = {n_quarters}, базлайн = {baseline_days:.1f} д (BJD {bjd_min:.1f} - {bjd_max:.1f})", flush=True)
+        emit(f"  Kepler-80: загружено файлов = {n_files}, уник. кварталов = {n_quarters}, базлайн = {baseline_days:.1f} д (BJD {bjd_min:.1f} - {bjd_max:.1f})", show=False)
     except Exception as e:
         fig, ax = plt.subplots(figsize=(8, 6))
         ax.text(0.5, 0.5, f"Не удалось скачать кривую {showcase_id}: {e}", ha='center', va='center')
@@ -684,14 +711,21 @@ def main():
     parser.add_argument('--max-signals', type=int, default=4)
     parser.add_argument('--star-timeout', type=float, default=1800.0)
     parser.add_argument('--min-free-gb', type=float, default=5.0)
+    parser.add_argument('--verbose', action='store_true', help='Print detailed output to the console instead of the progress bar.')
     args = parser.parse_args()
+    global _console, _logger, _verbose
+    onyx_console.set_verbose_env(args.verbose)
+    _verbose = onyx_console.is_verbose(args.verbose)
+    _console = onyx_console.Console(total=9, unit='steps', verbose=_verbose, show_ok=False, show_eta=False)
+    _logger = onyx_console.build_logger('demo', DEMO_LOG_PATH, verbose=False)
+    _console.logger = None
 
     if args.smoke_test and args.min_free_gb == 5.0:
         args.min_free_gb = 1.0
     free_now_gb = shutil.disk_usage(os.path.abspath('.')).free / (1024**3)
-    print(f"Свободное место на диске: {free_now_gb:.2f} ГБ (требуемый минимум: {args.min_free_gb:.2f} ГБ)", flush=True)
+    emit(f"Свободное место на диске: {free_now_gb:.2f} ГБ (требуемый минимум: {args.min_free_gb:.2f} ГБ)")
     if free_now_gb < args.min_free_gb:
-        print(f"Ошибка: Недостаточно свободного места на диске ({free_now_gb:.2f} ГБ < {args.min_free_gb:.2f} ГБ). Освободите место или используйте параметр --min-free-gb.", flush=True)
+        emit(f"Ошибка: Недостаточно свободного места на диске ({free_now_gb:.2f} ГБ < {args.min_free_gb:.2f} ГБ). Освободите место или используйте параметр --min-free-gb.")
         sys.exit(1)
 
     out_dir = args.output_dir
@@ -701,20 +735,23 @@ def main():
     os.makedirs(os.path.join(out_dir, 'figures'), exist_ok=True)
 
     file_suffix = '_quick' if args.quick else ''
-    print(f"=== Project Onyx: Demonstration Pipeline (Mode Demo) ===", flush=True)
-    print(f"Config: marked_stars={args.marked_stars}, unmarked_stars={args.unmarked_stars}, quick={args.quick}, seed={args.seed}, showcase={args.showcase_star}", flush=True)
-    print(f"Output directory: {out_dir}", flush=True)
+    emit(f"=== Project Onyx: Demonstration Pipeline (Mode Demo) ===")
+    emit(f"Config: marked_stars={args.marked_stars}, unmarked_stars={args.unmarked_stars}, quick={args.quick}, seed={args.seed}, showcase={args.showcase_star}")
+    emit(f"Output directory: {out_dir}")
 
+    _console.start()
+    phase('checking EB catalog')
     eb_catalog_path = os.path.join('data', 'labels', 'kepler_eb_catalog.csv')
     eb_stars_set, n_eb_cat = verify_eb_catalog(eb_catalog_path)
-    print(f"Каталог затменных двойных Kirk+ 2016 проверен: {n_eb_cat} записей. Самопроверка: ПРОЙДЕНА.", flush=True)
+    emit(f"Каталог затменных двойных Kirk+ 2016 проверен: {n_eb_cat} записей. Самопроверка: ПРОЙДЕНА.")
 
     hashes_before = compute_immutability_hashes('outputs')
+    phase('selecting marked and unmarked stars')
 
     labels_path = os.path.join('data', 'labels', 'kepler_labels.csv')
     if not os.path.exists(labels_path):
         extractor_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), '1_data_extractor.py')
-        subprocess.run([sys.executable, extractor_script, '--mission', 'Kepler', '--limit', '1', '--cache-dir', args.cache_dir], check=False)
+        run_child([sys.executable, extractor_script, '--mission', 'Kepler', '--limit', '1', '--cache-dir', args.cache_dir], check=False)
     labels_df = pd.read_csv(labels_path, dtype={'target_id': str})
 
     marked_ids, star_prim = get_marked_stars(labels_df, args.marked_stars, args.seed, args.showcase_star)
@@ -725,14 +762,15 @@ def main():
     pool_df = get_unmarked_pool(labels_df, unmarked_pool_file, args.unmarked_file)
     unmarked_ids, unmarked_info = match_unmarked_stars(marked_ids, marked_info, pool_df, args.unmarked_stars, args.seed, labels_df=labels_df)
 
+    phase('checking sample balance')
     stats_m = compute_group_stats(marked_info)
     stats_u = compute_group_stats(unmarked_info)
     comp_table = pd.DataFrame([
         {'Группа': 'Отмеченные (KOI)', 'Звёзд': stats_m['count'], 'Kepmag (среднее)': f"{stats_m['mag_mean']:.2f} ± {stats_m['mag_std']:.2f}", 'Kepmag (медиана)': f"{stats_m['mag_median']:.2f}", 'Кварталов (среднее)': f"{stats_m['q_mean']:.1f}", 'Кварталов (медиана)': f"{stats_m['q_median']:.0f}"},
         {'Группа': 'Неотмеченные (Control)', 'Звёзд': stats_u['count'], 'Kepmag (среднее)': f"{stats_u['mag_mean']:.2f} ± {stats_u['mag_std']:.2f}", 'Kepmag (медиана)': f"{stats_u['mag_median']:.2f}", 'Кварталов (среднее)': f"{stats_u['q_mean']:.1f}", 'Кварталов (медиана)': f"{stats_u['q_median']:.0f}"}
     ])
-    print("\nТаблица сравнения распределений звёздных параметров:")
-    print(comp_table.to_string(index=False), flush=True)
+    emit("\nТаблица сравнения распределений звёздных параметров:", show=False)
+    emit(comp_table.to_string(index=False), show=False)
 
     marked_kic = [int(s) for s in marked_ids if str(s).isdigit()]
     unmarked_kic = [int(s) for s in unmarked_ids if str(s).isdigit()]
@@ -769,8 +807,8 @@ def main():
             'p-значение': f"{ks_q.pvalue:.4f}"
         }
     ])
-    print("\nРезультаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):")
-    print(ks_table.to_string(index=False), flush=True)
+    emit("\nРезультаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):", show=False)
+    emit(ks_table.to_string(index=False), show=False)
 
     tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked = split_stars(marked_ids, unmarked_ids, star_prim, args.showcase_star, args.seed)
     all_selected_stars = tr_marked + ctrl_marked + tr_unmarked + ctrl_unmarked
@@ -804,7 +842,7 @@ def main():
             pass
 
     targets_to_run = [sid for sid in all_selected_stars if sid not in already_done_stars]
-    print(f"\nСостояние выборки перед извлечением: всего по плану {len(all_selected_stars)} звёзд, уже обработано ранее: {len(all_selected_stars) - len(targets_to_run)}, осталось обработать: {len(targets_to_run)}", flush=True)
+    emit(f"\nСостояние выборки перед извлечением: всего по плану {len(all_selected_stars)} звёзд, уже обработано ранее: {len(all_selected_stars) - len(targets_to_run)}, осталось обработать: {len(targets_to_run)}")
 
     if len(targets_to_run) > 0:
         targets_run_file = os.path.join(out_dir, f"targets_to_run{file_suffix}.txt")
@@ -830,11 +868,12 @@ def main():
             cmd_ext.append('--quick')
         if args.smoke_test:
             cmd_ext.append('--smoke-test')
-        print(f"Запуск извлечения признаков для {len(targets_to_run)} звёзд...", flush=True)
-        subprocess.run(cmd_ext, check=True)
+        emit(f"Запуск извлечения признаков для {len(targets_to_run)} звёзд...")
+        phase('extracting features')
+        run_child(cmd_ext, check=True)
 
     if not os.path.exists(features_demo_csv) or os.path.getsize(features_demo_csv) == 0:
-        print(f"Ошибка: файл признаков {features_demo_csv} пуст или не найден!", flush=True)
+        emit(f"Ошибка: файл признаков {features_demo_csv} пуст или не найден!")
         sys.exit(1)
     df_features = pd.read_csv(features_demo_csv, dtype={'target_id': str})
     failed_stars = {}
@@ -864,19 +903,20 @@ def main():
     failed_ids = set(failed_stars.keys())
     planned_ids = set(all_selected_stars)
 
+    phase('verifying sample')
     missing_orchestrator_ids = planned_ids - processed_ids - failed_ids
     hard_check_ok = (len(missing_orchestrator_ids) == 0)
     if not hard_check_ok:
-        print("\n" + "!" * 70, flush=True)
-        print("ГРОМКОЕ ПРЕДУПРЕЖДЕНИЕ: ЖЁСТКАЯ ПРОВЕРКА ВЫБОРКИ НЕ ПРОЙДЕНА!", flush=True)
-        print(f"Запланировано звёзд: {len(all_selected_stars)}", flush=True)
-        print(f"Обработано успешно: {len(planned_ids.intersection(processed_ids))}", flush=True)
-        print(f"Зафиксировано сбоев в _failed.csv: {len(planned_ids.intersection(failed_ids))}", flush=True)
-        print(f"Потеряно (не обрабатывалось): {len(missing_orchestrator_ids)} звёзд!", flush=True)
-        print(f"Примеры потерянных ID: {list(missing_orchestrator_ids)[:10]}", flush=True)
-        print("!" * 70 + "\n", flush=True)
+        emit("\n" + "!" * 70)
+        emit("ГРОМКОЕ ПРЕДУПРЕЖДЕНИЕ: ЖЁСТКАЯ ПРОВЕРКА ВЫБОРКИ НЕ ПРОЙДЕНА!")
+        emit(f"Запланировано звёзд: {len(all_selected_stars)}")
+        emit(f"Обработано успешно: {len(planned_ids.intersection(processed_ids))}")
+        emit(f"Зафиксировано сбоев в _failed.csv: {len(planned_ids.intersection(failed_ids))}")
+        emit(f"Потеряно (не обрабатывалось): {len(missing_orchestrator_ids)} звёзд!")
+        emit(f"Примеры потерянных ID: {list(missing_orchestrator_ids)[:10]}")
+        emit("!" * 70 + "\n")
     else:
-        print(f"\nЖёсткая проверка выборки УСПЕШНО пройдена: запланировано {len(all_selected_stars)}, успешно обработано {len(planned_ids.intersection(processed_ids))}, сбоев {len(planned_ids.intersection(failed_ids))}, расхождений 0.\n", flush=True)
+        emit(f"\nЖёсткая проверка выборки УСПЕШНО пройдена: запланировано {len(all_selected_stars)}, успешно обработано {len(planned_ids.intersection(processed_ids))}, сбоев {len(planned_ids.intersection(failed_ids))}, расхождений 0.\n")
 
     succ_tr_m = [s for s in tr_marked if s in processed_ids]
     succ_ctrl_m = [s for s in ctrl_marked if s in processed_ids]
@@ -896,11 +936,12 @@ def main():
     final_ctrl_u = succ_ctrl_u[:n_bal]
 
     total_dropped = (len(succ_tr_m) - len(final_tr_m)) + (len(succ_ctrl_m) - (len(final_ctrl_m) - (1 if showcase_id in final_ctrl_m else 0))) + (len(succ_tr_u) - len(final_tr_u)) + (len(succ_ctrl_u) - len(final_ctrl_u))
-    print(f"\nСбалансированное разбиение по звёздам (равные половины):")
-    print(f"  Обучающая часть: {len(final_tr_m)} отмеченных, {len(final_tr_u)} неотмеченных (Всего звёзд: {len(final_tr_m)+len(final_tr_u)})")
-    print(f"  Контрольная часть: {len(final_ctrl_m)} отмеченных (включая Kepler-80), {len(final_ctrl_u)} неотмеченных (Всего звёзд: {len(final_ctrl_m)+len(final_ctrl_u)})")
+    phase('splitting stars into halves')
+    emit(f"\nСбалансированное разбиение по звёздам (равные половины):")
+    emit(f"  Обучающая часть: {len(final_tr_m)} отмеченных, {len(final_tr_u)} неотмеченных (Всего звёзд: {len(final_tr_m)+len(final_tr_u)})")
+    emit(f"  Контрольная часть: {len(final_ctrl_m)} отмеченных (включая Kepler-80), {len(final_ctrl_u)} неотмеченных (Всего звёзд: {len(final_ctrl_m)+len(final_ctrl_u)})")
     if total_dropped > 0:
-        print(f"  Отброшено звёзд для поддержания равенства половин: {total_dropped}")
+        emit(f"  Отброшено звёзд для поддержания равенства половин: {total_dropped}")
 
     split_records = []
     for s in final_tr_m: split_records.append({'target_id': s, 'star_type': 'MARKED', 'split': 'TRAIN', 'primary_label': star_prim.get(s, 'NONE')})
@@ -1022,14 +1063,16 @@ def main():
     df_tr_m_matched = df_train_all[(df_train_all['target_id'].isin(set(final_tr_m))) & (df_train_all['match_status'] == 'MATCHED')].copy() if 'match_status' in df_train_all else df_train_all[df_train_all['target_id'].isin(set(final_tr_m))].copy()
     df_ctrl_m_matched = df_ctrl_all[(df_ctrl_all['target_id'].isin(set(final_ctrl_m))) & (df_ctrl_all['match_status'] == 'MATCHED')].copy() if 'match_status' in df_ctrl_all else df_ctrl_all[df_ctrl_all['target_id'].isin(set(final_ctrl_m))].copy()
 
-    print(f"\nЧисло размеченных сигналов для обучения:", flush=True)
-    print(f"  Обучающая часть (a): {len(df_tr_m_matched)} сигналов", flush=True)
-    print(f"  Контрольная часть (b): {len(df_ctrl_m_matched)} сигналов (без Kepler-80: {len(df_ctrl_m_matched[df_ctrl_m_matched['target_id'] != showcase_id])})", flush=True)
+    emit(f"\nЧисло размеченных сигналов для обучения:")
+    emit(f"  Обучающая часть (a): {len(df_tr_m_matched)} сигналов")
+    emit(f"  Контрольная часть (b): {len(df_ctrl_m_matched)} сигналов (без Kepler-80: {len(df_ctrl_m_matched[df_ctrl_m_matched['target_id'] != showcase_id])})")
 
-    print("\n[Направление А] Обучение на обучающей половине -> проверка на контрольной...", flush=True)
+    phase('training: direction A')
+    emit("\n[Направление А] Обучение на обучающей половине -> проверка на контрольной...")
     ctrl_pred, model_a, expl_a, scaler_a, thres_a = train_and_eval_pipeline(df_tr_m_matched, df_ctrl_all, feature_cols, args.seed, full_features_pool=df_features, target_precision=args.target_precision)
 
-    print("\n[Направление Б] Обучение на контрольной половине (без Kepler-80) -> проверка на обучающей...", flush=True)
+    phase('training: direction B')
+    emit("\n[Направление Б] Обучение на контрольной половине (без Kepler-80) -> проверка на обучающей...")
     df_ctrl_m_for_b = df_ctrl_m_matched[df_ctrl_m_matched['target_id'] != showcase_id].copy()
     train_pred, model_b, expl_b, scaler_b, thres_b = train_and_eval_pipeline(df_ctrl_m_for_b, df_train_all, feature_cols, args.seed, full_features_pool=df_features, target_precision=args.target_precision)
 
@@ -1321,20 +1364,20 @@ def main():
     matched_per_marked = float(n_matched_total / tot_marked_stars) if tot_marked_stars > 0 else 0.0
 
     n_failed_stars = len(failed_stars)
-    print("\n" + "="*50, flush=True)
-    print("СВОДКА РАЗМЕЧЕННЫХ СИГНАЛОВ И КАЧЕСТВА ДАННЫХ:", flush=True)
-    print(f"  Всего размеченных сигналов (MATCHED): {n_matched_total}", flush=True)
-    print(f"    - Класс 1 (CONFIRMED/CANDIDATE): {n_matched_c1}", flush=True)
-    print(f"    - Класс 0 (FALSE_POSITIVE): {n_matched_c0}", flush=True)
-    print(f"  Размеченных сигналов по половинам:", flush=True)
-    print(f"    - Обучающая половина: {n_matched_tr} (класс 1: {n_tr_c1}, класс 0: {n_tr_c0})", flush=True)
-    print(f"    - Контрольная половина: {n_matched_ctrl} (класс 1: {n_ctrl_c1}, класс 0: {n_ctrl_c0}; без Kepler-80: {n_ctrl_no_k80})", flush=True)
-    print(f"  Число размеченных сигналов на одну отмеченную звезду: {matched_per_marked:.2f} ({n_matched_total} / {tot_marked_stars})", flush=True)
-    print(f"  Число звёзд в _failed.csv: {n_failed_stars}", flush=True)
+    emit("\n" + "="*50, show=False)
+    emit("СВОДКА РАЗМЕЧЕННЫХ СИГНАЛОВ И КАЧЕСТВА ДАННЫХ:", show=False)
+    emit(f"  Всего размеченных сигналов (MATCHED): {n_matched_total}", show=False)
+    emit(f"    - Класс 1 (CONFIRMED/CANDIDATE): {n_matched_c1}", show=False)
+    emit(f"    - Класс 0 (FALSE_POSITIVE): {n_matched_c0}", show=False)
+    emit(f"  Размеченных сигналов по половинам:", show=False)
+    emit(f"    - Обучающая половина: {n_matched_tr} (класс 1: {n_tr_c1}, класс 0: {n_tr_c0})", show=False)
+    emit(f"    - Контрольная половина: {n_matched_ctrl} (класс 1: {n_ctrl_c1}, класс 0: {n_ctrl_c0}; без Kepler-80: {n_ctrl_no_k80})", show=False)
+    emit(f"  Число размеченных сигналов на одну отмеченную звезду: {matched_per_marked:.2f} ({n_matched_total} / {tot_marked_stars})", show=False)
+    emit(f"  Число звёзд в _failed.csv: {n_failed_stars}")
     if n_failed_stars > 0:
         for f_sid, f_dat in failed_stars.items():
-            print(f"    * Звезда {f_sid} ({f_dat['stage']}): {f_dat['error']}", flush=True)
-    print("="*50 + "\n", flush=True)
+            emit(f"    * Звезда {f_sid} ({f_dat['stage']}): {f_dat['error']}", show=False)
+    emit("="*50 + "\n", show=False)
 
     showcase_signals = ctrl_pred[ctrl_pred['target_id'] == showcase_id].copy()
     showcase_plot_path = os.path.join(out_dir, f"showcase_kepler80{file_suffix}.png")
@@ -1393,6 +1436,7 @@ def main():
     failed_m_in_plan = [sid for sid in marked_ids if sid in failed_stars]
     failed_u_in_plan = [sid for sid in unmarked_ids if sid in failed_stars]
 
+    phase('building report')
     hashes_after = compute_immutability_hashes('outputs')
     hash_match = (hashes_before == hashes_after)
 
@@ -1608,13 +1652,16 @@ def main():
         f.write(f"* **Статус проверки хешей (SHA-256):** {'УСПЕШНО (Все хеши совпали)' if hash_match else 'ВНИМАНИЕ (Обнаружено несовпадение)'}\n")
         f.write(f"* Проверено исходных файлов в `outputs/`: {len(hashes_before)}\n")
 
-    print(f"\n=== Демонстрационный прогон завершён! ===", flush=True)
-    print(f"Итоговый отчёт сохранён в: {summary_md_path}", flush=True)
-    print(f"Таблица контрольных сигналов: {ctrl_csv_out}", flush=True)
-    print(f"Диагностическая таблица по звёздам: {diag_csv_out}", flush=True)
-    print(f"Таблица подозрительных сигналов: {suspects_csv_out}", flush=True)
-    print(f"Витрина Kepler-80: {showcase_plot_path}", flush=True)
-    print(f"Тест неприкосновенности outputs/: {'ПРОЙДЕН (Хеши совпадают)' if hash_match else 'НЕ ПРОЙДЕН'}", flush=True)
+    _console.set_status('done')
+    _console.complete()
+    _console.finish()
+    emit(f"\n=== Демонстрационный прогон завершён! ===")
+    emit(f"Итоговый отчёт сохранён в: {summary_md_path}")
+    emit(f"Таблица контрольных сигналов: {ctrl_csv_out}")
+    emit(f"Диагностическая таблица по звёздам: {diag_csv_out}")
+    emit(f"Таблица подозрительных сигналов: {suspects_csv_out}")
+    emit(f"Витрина Kepler-80: {showcase_plot_path}")
+    emit(f"Тест неприкосновенности outputs/: {'ПРОЙДЕН (Хеши совпадают)' if hash_match else 'НЕ ПРОЙДЕН'}")
 
 if __name__ == '__main__':
     main()

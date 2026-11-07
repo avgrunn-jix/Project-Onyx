@@ -322,6 +322,12 @@ class Console:
                 self._phase_open = False
                 self.advance()
 
+    def complete(self):
+        with self._lock:
+            self._phase_open = False
+            self.done = self.total
+            self._draw()
+
     def pause(self):
         with self._lock:
             self._erase()
