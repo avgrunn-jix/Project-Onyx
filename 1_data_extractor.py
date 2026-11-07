@@ -146,18 +146,21 @@ def init_worker(sem, clip_upward=None, resolve_aliases=None):
     if resolve_aliases is not None:
         RESOLVE_ALIASES = bool(resolve_aliases)
 
-def setup_logger():
+EXTRACTOR_LOG_PATH = os.path.join('logs', 'extractor_errors.log')
+
+def setup_logger(verbose=False):
     os.makedirs('logs', exist_ok=True)
-    log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-    file_handler = logging.FileHandler(os.path.join('logs', 'extractor_errors.log'), encoding='utf-8')
-    file_handler.setFormatter(log_formatter)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(log_formatter)
-    logger = logging.getLogger('extractor')
-    logger.setLevel(logging.INFO)
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    return logger
+    return onyx_console.build_logger('extractor', EXTRACTOR_LOG_PATH, verbose=verbose)
+
+def header_lines(args, mode, total, done, to_process, perm_failed):
+    logical = os.cpu_count() or 1
+    lines = [f"Project Onyx extractor | Mission: {args.mission} | Mode: {mode}" + (' (quick)' if args.quick else '')]
+    lines.append(f"Workers: {args.workers} ({logical} logical cores)")
+    stars = f"Stars: {total} total | {done} already done | {to_process} to process"
+    if perm_failed:
+        stars += f" | {perm_failed} permanently failed (skipped)"
+    lines.append(stars)
+    return lines
 
 def get_dir_size(path):
     total = 0
@@ -831,25 +834,32 @@ def main():
     parser.add_argument('--smoke-test', action='store_true', help='[TEST ONLY] Run extractor in isolated smoke test mode, writing outputs to outputs/_smoke_test/')
     parser.add_argument('--clip-upward-only', action='store_true', help='[EXPERIMENTAL] Clip only upward outliers (5 sigma) instead of symmetric 5-sigma clipping. Can remove known planets in multi-planet systems.')
     parser.add_argument('--no-resolve-aliases', action='store_true')
+    parser.add_argument('--verbose', action='store_true', help='Print detailed per-star output to the console instead of the progress bar.')
     args = parser.parse_args()
+    onyx_console.set_verbose_env(args.verbose)
+    verbose = onyx_console.is_verbose(args.verbose)
+    console = onyx_console.Console(total=0, workers=args.workers, verbose=verbose)
     global CLIP_UPWARD_ONLY, RESOLVE_ALIASES
     CLIP_UPWARD_ONLY = args.clip_upward_only
     RESOLVE_ALIASES = not args.no_resolve_aliases
     if args.smoke_test and args.min_free_gb == 5.0:
         args.min_free_gb = 1.0
     free_now_gb = shutil.disk_usage(os.path.abspath('.')).free / (1024**3)
-    print(f"Свободное место на диске: {free_now_gb:.2f} ГБ (требуемый минимум: {args.min_free_gb:.2f} ГБ)", flush=True)
+    console.show(f"Свободное место на диске: {free_now_gb:.2f} ГБ (требуемый минимум: {args.min_free_gb:.2f} ГБ)")
     if free_now_gb < args.min_free_gb:
-        print(f"Ошибка: Недостаточно свободного места на диске ({free_now_gb:.2f} ГБ < {args.min_free_gb:.2f} ГБ). Освободите место или используйте параметр --min-free-gb.", flush=True)
+        console.show(f"Ошибка: Недостаточно свободного места на диске ({free_now_gb:.2f} ГБ < {args.min_free_gb:.2f} ГБ). Освободите место или используйте параметр --min-free-gb.")
         sys.exit(1)
-    logger = setup_logger()
+    logger = setup_logger(verbose)
+    console.logger = logger
     flags_msg = f"Search flags: CLIP_UPWARD_ONLY={CLIP_UPWARD_ONLY}, RESOLVE_ALIASES={RESOLVE_ALIASES}"
-    print(flags_msg, flush=True)
+    if verbose:
+        print(flags_msg, flush=True)
     logger.info(flags_msg)
 
     logical_cores = os.cpu_count() or 1
     cpu_msg = f"Detected CPU cores: {logical_cores} logical. Default workers: {args.workers}. Note: on systems with Hyper-Threading (SMT), the optimal number of worker processes for CPU-bound BLS computation is typically equal to the number of physical cores."
-    print(cpu_msg, flush=True)
+    if verbose:
+        print(cpu_msg, flush=True)
     logger.info(cpu_msg)
 
     base_outputs = os.path.join('outputs', '_smoke_test') if args.smoke_test else 'outputs'
@@ -872,16 +882,14 @@ def main():
     os.makedirs(args.cache_dir, exist_ok=True)
 
     if args.quick:
-        logger.warning('WARNING: Quick mode enabled. Using coarse BLS grid (frequency_factor=5000, 4 duration steps). Outputs will have _quick suffix.')
-        print('WARNING: Quick mode enabled. Using coarse BLS grid (frequency_factor=5000, 4 duration steps). Outputs will have _quick suffix.', flush=True)
+        console.say('WARNING: Quick mode enabled. Using coarse BLS grid (frequency_factor=5000, 4 duration steps). Outputs will have _quick suffix.', 'warning')
         if not '_quick' in args.output:
             b_o, e_o = os.path.splitext(args.output)
             args.output = f"{b_o}_quick{e_o if e_o else '.csv'}"
 
     if args.max_sectors > 0:
         sec_warn = f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active. This alters the observation baseline, features, and detection results. Output files MUST NOT be used for primary model training!"
-        logger.warning(sec_warn)
-        print(sec_warn, flush=True)
+        console.say(sec_warn, 'warning')
         if not f'_sec{args.max_sectors}' in args.output and not '_sec' in args.output:
             b_o, e_o = os.path.splitext(args.output)
             args.output = f"{b_o}_sec{args.max_sectors}{e_o if e_o else '.csv'}"
@@ -901,7 +909,7 @@ def main():
             if missing_in_hdr:
                 err_msg = f"Schema mismatch in existing {args.output}! Existing file is missing current schema columns: {', '.join(missing_in_hdr)}. Use --no-resume to recompute with the new schema, or specify a different --output file."
                 logger.error(err_msg)
-                print(f"ERROR: {err_msg}", flush=True)
+                console.show(f"ERROR: {err_msg}")
                 sys.exit(1)
         except SystemExit:
             raise
@@ -951,8 +959,7 @@ def main():
 
         if args.max_sectors > 0:
             sec_warn = f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active in injection mode. This alters observation baselines. Outputs are for testing only!"
-            logger.warning(sec_warn)
-            print(sec_warn, flush=True)
+            console.say(sec_warn, 'warning')
             if not f'_sec{args.max_sectors}' in inj_out and not '_sec' in inj_out:
                 b_i, e_i = os.path.splitext(inj_out)
                 inj_out = f"{b_i}_sec{args.max_sectors}{e_i if e_i else '.csv'}"
@@ -988,8 +995,15 @@ def main():
         total_inj = len(tasks)
         done_inj = 0
         durations_inj = []
-        print(f"Injection tasks: {total_inj} stars to process (already completed: {len(completed_inj_stars)})", flush=True)
         logger.info(f"Injection tasks: {total_inj} stars to process (already completed: {len(completed_inj_stars)})")
+        if verbose:
+            print(f"Injection tasks: {total_inj} stars to process (already completed: {len(completed_inj_stars)})", flush=True)
+        console.reset(total_inj)
+        for hdr_line in header_lines(args, 'injection', total_inj + len(completed_inj_stars), len(completed_inj_stars), total_inj, 0):
+            console.show(hdr_line)
+        console.set_status('injecting')
+        if total_inj > 0:
+            console.start()
 
         import multiprocessing
         mgr_inj = multiprocessing.Manager()
@@ -1021,6 +1035,7 @@ def main():
 
                     if err:
                         logger.error(f"Injection error on {tid_str}: {err}")
+                        console.show(f"  failed {tid_str}: {onyx_console.short_error(err)}")
                     else:
                         if res:
                             append_to_csv_flush(inj_out, pd.DataFrame(res))
@@ -1032,9 +1047,10 @@ def main():
                     eta_sec = int((rem_stars * avg_t) / max(1, args.workers))
                     eta_str = str(datetime.timedelta(seconds=eta_sec))
                     p_msg = f"[{done_inj}/{total_inj}] Injection on {tid_str} ({elapsed:.1f}s) | Avg: {avg_t:.1f}s/star | ETA: {eta_str}"
-                    print(p_msg, flush=True)
+                    if verbose:
+                        print(p_msg, flush=True)
                     logger.info(p_msg)
-                    sys.stdout.flush()
+                    console.advance(ok=not err, duration=elapsed)
 
                     try:
                         next_t = next(task_iter)
@@ -1050,12 +1066,16 @@ def main():
                         done_inj += 1
                         durations_inj.append(args.star_timeout)
                         logger.error(f"Injection TIMEOUT on {tid_str}")
+                        console.show(f"  failed {tid_str}: TIMEOUT")
+                        console.advance(ok=False, duration=args.star_timeout)
                         try:
                             next_t = next(task_iter)
                             next_f = executor.submit(run_injection, *next_t)
                             active_futures[next_f] = (next_t[0], time.time())
                         except StopIteration:
                             pass
+
+        console.finish([f"Injection finished: ok {console.ok}, failed {console.failed}, elapsed {onyx_console.fmt_time(console.elapsed())}", f"Log: {EXTRACTOR_LOG_PATH}"])
 
         if os.path.exists(inj_out) and os.path.getsize(inj_out) > 0:
             df_res = pd.read_csv(inj_out)
@@ -1143,7 +1163,14 @@ def main():
     npz_path = os.path.join(os.path.dirname(args.output) or base_outputs, 'folded_curves.npz')
 
     logger.info(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= 2)} | To process: {total_tasks}")
-    print(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= 2)} | To process: {total_tasks}", flush=True)
+    if verbose:
+        print(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= 2)} | To process: {total_tasks}", flush=True)
+    console.reset(total_tasks)
+    for hdr_line in header_lines(args, 'extract', len(target_ids), len(processed_ids), total_tasks, sum(1 for v in failed_attempts.values() if v >= 2)):
+        console.show(hdr_line)
+    console.set_status('extracting')
+    if total_tasks > 0:
+        console.start()
 
     import multiprocessing
     mgr = multiprocessing.Manager()
@@ -1175,6 +1202,7 @@ def main():
 
                 if err:
                     logger.error(f"Error on {tid_str}: {err}")
+                    console.show(f"  failed {tid_str}: {onyx_console.short_error(err)}")
                     stage = 'download' if 'download' in err.lower() or 'search' in err.lower() else ('timeout' if 'timeout' in err.lower() else ('stitch' if 'stitch' in err.lower() or 'flatten' in err.lower() else 'features'))
                     log_failure(failed_csv, tid_str, err, failed_attempts, stage=stage)
                     skip_count += 1
@@ -1235,12 +1263,14 @@ def main():
                     if timings:
                         stage_timings.append(timings)
                         logger.info(f"Star {tid_str} breakdown: total={timings['total']:.1f}s | dl={timings['dl']:.1f}s | stitch={timings['stitch']:.1f}s | bls={timings['bls']:.1f}s | feats={timings['feats']:.1f}s")
-                        print(f"Star {tid_str} breakdown: total={timings['total']:.1f}s | dl={timings['dl']:.1f}s | stitch={timings['stitch']:.1f}s | bls={timings['bls']:.1f}s | feats={timings['feats']:.1f}s", flush=True)
+                        if verbose:
+                            print(f"Star {tid_str} breakdown: total={timings['total']:.1f}s | dl={timings['dl']:.1f}s | stitch={timings['stitch']:.1f}s | bls={timings['bls']:.1f}s | feats={timings['feats']:.1f}s", flush=True)
                         if 'bls_details' in timings and timings['bls_details']:
                             for b_d in timings['bls_details']:
                                 detail_msg = f"  BLS iter {b_d['iter']}: {b_d['time']:.2f}s (grid: {b_d['n_freqs']} freqs) -> P={b_d.get('period', 0):.4f}d, SDE={b_d.get('sde', 0):.1f}, SNR={b_d.get('snr', 0):.1f}"
                                 logger.info(detail_msg)
-                                print(detail_msg, flush=True)
+                                if verbose:
+                                    print(detail_msg, flush=True)
                     if feats:
                         append_to_csv_flush(args.output, pd.DataFrame(feats))
                         for item in feats:
@@ -1260,9 +1290,10 @@ def main():
                 est_rem_sec = int((remaining_stars * avg_time) / max(1, args.workers))
                 eta_str = str(datetime.timedelta(seconds=est_rem_sec))
                 progress_msg = f"[{completed_stars}/{total_tasks}] Star {tid_str} ({elapsed:.1f}s) | Avg: {avg_time:.1f}s/star | ETA: {eta_str}"
-                print(progress_msg, flush=True)
+                if verbose:
+                    print(progress_msg, flush=True)
                 logger.info(progress_msg)
-                sys.stdout.flush()
+                console.advance(ok=not err, duration=elapsed)
 
                 try:
                     next_t = next(task_iter)
@@ -1277,6 +1308,7 @@ def main():
                     f.cancel()
                     err = f"TimeoutError: Exceeded {args.star_timeout}s"
                     logger.error(f"Error on {tid_str}: {err}")
+                    console.show(f"  failed {tid_str}: {onyx_console.short_error(err)}")
                     log_failure(failed_csv, tid_str, err, failed_attempts, stage='timeout')
                     skip_count += 1
                     diag_row = {
@@ -1307,9 +1339,10 @@ def main():
                     est_rem_sec = int((remaining_stars * avg_time) / max(1, args.workers))
                     eta_str = str(datetime.timedelta(seconds=est_rem_sec))
                     progress_msg = f"[{completed_stars}/{total_tasks}] Star {tid_str} TIMEOUT ({args.star_timeout:.1f}s) | Avg: {avg_time:.1f}s/star | ETA: {eta_str}"
-                    print(progress_msg, flush=True)
+                    if verbose:
+                        print(progress_msg, flush=True)
                     logger.info(progress_msg)
-                    sys.stdout.flush()
+                    console.advance(ok=False, duration=args.star_timeout)
                     try:
                         next_t = next(task_iter)
                         next_f = executor.submit(process_single_star, *next_t)
@@ -1321,14 +1354,15 @@ def main():
             retry_targets = [t for t in tasks if t[0] in failed_attempts]
             if retry_targets:
                 logger.info(f"Повторный проход (retry pass) по {len(retry_targets)} упавшим звёздам...")
-                print(f"\nПовторный проход по {len(retry_targets)} упавшим звёздам...", flush=True)
+                console.show(f"Повторный проход по {len(retry_targets)} упавшим звёздам...")
+                console.set_status('retrying failed stars')
                 recovered_stars = set()
                 for rt in retry_targets:
                     r_tid_str = rt[0]
                     feats, curves, tid, err, dl_size, timings = process_single_star(*rt)
                     if not err:
-                        logger.info(f"Звезда {r_tid_str} успешно обработана при повторном проходе!")
-                        print(f"Звезда {r_tid_str} успешно обработана при повторном проходе!", flush=True)
+                        console.say(f"Звезда {r_tid_str} успешно обработана при повторном проходе!")
+                        console.reclassify()
                         success_count += 1
                         skip_count = max(0, skip_count - 1)
                         recovered_stars.add(r_tid_str)
@@ -1379,7 +1413,7 @@ def main():
                             append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     else:
                         logger.error(f"Звезда {r_tid_str} окончательно завершилась ошибкой: {err}")
-                        print(f"Звезда {r_tid_str} окончательно завершилась ошибкой: {err}", flush=True)
+                        console.show(f"Звезда {r_tid_str} окончательно завершилась ошибкой: {onyx_console.short_error(err)}")
                 for rec_s in recovered_stars:
                     del failed_attempts[rec_s]
                 if os.path.exists(failed_csv):
@@ -1397,8 +1431,22 @@ def main():
         avg_feats = float(np.mean([t['feats'] for t in stage_timings]))
         avg_tot = float(np.mean([t['total'] for t in stage_timings]))
         avg_report = f"Stage averages per star:\n  Download: {avg_dl:.1f}s\n  Stitch & detrend: {avg_stitch:.1f}s\n  BLS periodogram: {avg_bls:.1f}s\n  Feature computation: {avg_feats:.1f}s\n  Total per star: {avg_tot:.1f}s"
-        print(avg_report, flush=True)
+        if verbose:
+            print(avg_report, flush=True)
         logger.info(avg_report)
+        summary_avg = f"Stage averages per star: download {avg_dl:.1f}s | stitch & detrend {avg_stitch:.1f}s | BLS {avg_bls:.1f}s | features {avg_feats:.1f}s | total {avg_tot:.1f}s"
+    else:
+        summary_avg = ''
+
+    summary = ['', '=' * 40, f"Done in {onyx_console.fmt_time(console.elapsed())}", f"Processed: {success_count} | Already done (skipped): {len(processed_ids)} | Failed: {skip_count}"]
+    if skip_count > 0:
+        summary.append(f"Failed list: {failed_csv}")
+    summary.append(f"Signals: MATCHED {match_stats.get('MATCHED', 0)} | HARMONIC {match_stats.get('HARMONIC', 0)} | UNMATCHED {match_stats.get('UNMATCHED', 0)}")
+    if summary_avg and not verbose:
+        summary.append(summary_avg)
+    summary.append(f"Log: {EXTRACTOR_LOG_PATH}")
+    console.set_status('done')
+    console.finish(summary)
 
     if args.purge_lk_cache:
         purge_cache()

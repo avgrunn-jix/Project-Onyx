@@ -1,3 +1,4 @@
+import atexit
 import logging
 import os
 import shutil
@@ -229,6 +230,26 @@ class Console:
                 self._stop.clear()
                 self._thread = threading.Thread(target=self._tick, daemon=True)
                 self._thread.start()
+                atexit.register(self._on_exit)
+
+    def reset(self, total, unit=None):
+        with self._lock:
+            self.total = int(total)
+            if unit is not None:
+                self.unit = unit
+            self.done = 0
+            self.ok = 0
+            self.failed = 0
+            self.durations = []
+            self._last_report = 0
+            self.t0 = self.clock()
+            self._draw()
+
+    def reclassify(self, count=1):
+        with self._lock:
+            self.ok += count
+            self.failed = max(0, self.failed - count)
+            self._draw()
 
     def set_total(self, total):
         with self._lock:
@@ -303,6 +324,13 @@ class Console:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2.0)
         self._thread = None
+
+    def _on_exit(self):
+        self._stop.set()
+        if self._active and self._drawn:
+            self._write('\n')
+            self._drawn = False
+            self._active = False
 
     def finish(self, lines=()):
         self.stop()
