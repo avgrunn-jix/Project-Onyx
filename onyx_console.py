@@ -165,6 +165,7 @@ class Console:
         self._drawn = False
         self._active = False
         self._paused = False
+        self._phase_open = False
         self._last_report = 0
         if self.interactive:
             enable_ansi()
@@ -308,6 +309,19 @@ class Console:
         self.note(text, level)
         self.show(text)
 
+    def phase(self, text):
+        with self._lock:
+            if self._phase_open:
+                self.advance()
+            self._phase_open = True
+            self.set_status(text)
+
+    def end_phases(self):
+        with self._lock:
+            if self._phase_open:
+                self._phase_open = False
+                self.advance()
+
     def pause(self):
         with self._lock:
             self._erase()
@@ -344,6 +358,18 @@ class Console:
             self._active = False
             for line in lines:
                 self._write(line + '\n')
+
+
+class ConsoleHandler(logging.Handler):
+    def __init__(self, console, level=logging.ERROR):
+        super().__init__(level)
+        self.console = console
+
+    def emit(self, record):
+        try:
+            self.console.show(f"{record.levelname}: {record.getMessage()}")
+        except Exception:
+            pass
 
 
 def build_logger(name, log_path, verbose=False, stream=None, level=logging.INFO):

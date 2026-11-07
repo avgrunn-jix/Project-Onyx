@@ -58,7 +58,10 @@ def main():
     parser.add_argument('--max-download-workers', type=int, default=4)
     parser.add_argument('--target-precision', type=float, default=0.90)
     parser.add_argument('--min-depth-ppm', type=float, default=30.0)
+    parser.add_argument('--verbose', action='store_true', help='Print detailed output to the console instead of the progress bar.')
     args = parser.parse_args()
+    onyx_console.set_verbose_env(args.verbose)
+    verbose = onyx_console.is_verbose(args.verbose)
 
     if args.smoke_test and args.min_free_gb == 5.0:
         args.min_free_gb = 1.0
@@ -70,7 +73,8 @@ def main():
 
     logical_cores = os.cpu_count() or 1
     cpu_msg = f"Detected CPU cores: {logical_cores} logical. Default workers: {args.workers}. Note: on systems with Hyper-Threading (SMT), the optimal number of worker processes for CPU-bound BLS computation is typically equal to the number of physical cores."
-    print(cpu_msg, flush=True)
+    if verbose:
+        print(cpu_msg, flush=True)
 
     base_outputs = os.path.join('outputs', '_smoke_test') if args.smoke_test else 'outputs'
     os.makedirs(base_outputs, exist_ok=True)
@@ -82,7 +86,14 @@ def main():
     if args.output:
         os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
 
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    os.makedirs('logs', exist_ok=True)
+    main_file_handler = logging.FileHandler(os.path.join('logs', 'main.log'), encoding='utf-8')
+    main_file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    main_console_handler = logging.StreamHandler(sys.stdout)
+    main_console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s' if verbose else '%(message)s'))
+    logging.basicConfig(level=logging.INFO, handlers=[main_file_handler])
+    logging.info(cpu_msg)
+    logging.getLogger().addHandler(main_console_handler)
     logging.info(f'Starting Project Onyx pipeline in {args.mode} mode')
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -106,7 +117,6 @@ def main():
         out_csv = get_effective_output(args.output, 'extracted_features', args.quick, args.max_sectors, args.smoke_test)
         if args.max_sectors > 0:
             logging.warning(f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active. This alters baseline and features. Output files MUST NOT be used for primary model training!")
-            print(f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active. This alters baseline and features. Output files MUST NOT be used for primary model training!", flush=True)
 
         cmd1 = [sys.executable, extractor_script, '--mission', args.mission, '--limit', str(args.limit), '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv, '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--max-sectors', str(args.max_sectors)]
         if args.targets_file: cmd1.extend(['--targets-file', args.targets_file])
@@ -133,7 +143,6 @@ def main():
         out_csv = get_effective_output(args.output, default_base, args.quick, args.max_sectors, args.smoke_test)
         if args.max_sectors > 0:
             logging.warning(f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active. This alters baseline and features. Output files MUST NOT be used for primary model training!")
-            print(f"WARNING: [DEBUG MODE] --max-sectors={args.max_sectors} is active. This alters baseline and features. Output files MUST NOT be used for primary model training!", flush=True)
         cmd1 = [sys.executable, extractor_script, '--mission', args.mission, '--limit', str(args.limit), '--workers', str(args.workers), '--min-free-gb', str(args.min_free_gb), '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--output', out_csv, '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--max-sectors', str(args.max_sectors)]
         if args.targets_file: cmd1.extend(['--targets-file', args.targets_file])
         if args.keep_raw: cmd1.append('--keep-raw')

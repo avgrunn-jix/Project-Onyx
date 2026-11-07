@@ -2,6 +2,8 @@ import argparse
 import json
 import logging
 import os
+import sys
+import time
 import warnings
 import onyx_console
 onyx_console.setup_warnings()
@@ -23,14 +25,22 @@ from onyx_features import compute_feature_columns
 
 warnings.filterwarnings('ignore')
 
-def setup_logger():
-    os.makedirs('logs', exist_ok=True)
-    log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(log_formatter)
-    logger = logging.getLogger('ml_pipeline')
-    logger.setLevel(logging.INFO)
-    logger.addHandler(console_handler)
+ML_LOG_PATH = os.path.join('logs', 'ml_pipeline.log')
+_console = None
+
+def _phase(text):
+    if _console is not None:
+        _console.phase(text)
+
+def _done(logger, msg):
+    logger.info(msg)
+    if _console is not None and not _console.verbose:
+        _console.show(msg)
+
+def setup_logger(verbose=False, console=None):
+    logger = onyx_console.build_logger('ml_pipeline', ML_LOG_PATH, verbose=verbose, stream=sys.stderr)
+    if not verbose and console is not None:
+        logger.addHandler(onyx_console.ConsoleHandler(console))
     return logger
 
 def apply_log1p(X):
@@ -65,6 +75,7 @@ def run_ml(args, logger, is_retrain=False):
     if not os.path.exists(args.input):
         logger.error(f'Input file {args.input} not found')
         return
+    _phase('loading features')
     df = pd.read_csv(args.input)
     df_matched = df[df['match_status'] == 'MATCHED'].copy()
     if len(df_matched) == 0:
@@ -81,7 +92,8 @@ def run_ml(args, logger, is_retrain=False):
     if len(df_matched) < 10 or len(unique_groups) < 5 or len(unique_classes) < 2 or min(class_counts.values()) < 2:
         msg = f"Insufficient data for training: found {len(df_matched)} matched signals across {len(unique_groups)} stars with class distribution {class_counts}. StratifiedGroupKFold requires at least 5 stars and 2 examples per class. Run extraction on more targets or check your labels."
         logger.error(msg)
-        print(f"ERROR: {msg}", flush=True)
+        if _console is None or _console.verbose:
+            print(f"ERROR: {msg}", flush=True)
         return
     cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
     train_idx, test_idx = next(cv.split(X_raw, y, groups))
@@ -99,6 +111,7 @@ def run_ml(args, logger, is_retrain=False):
     }
     pipe_xgb = get_pipeline(xgb)
     search = RandomizedSearchCV(pipe_xgb, param_grid, n_iter=2, scoring='roc_auc', cv=cv, random_state=42, n_jobs=1)
+    _phase('training: hyperparameter search')
     search.fit(X_train_raw, y_train, groups=groups[train_idx])
     best_xgb_pipe = search.best_estimator_
     try:
@@ -109,6 +122,7 @@ def run_ml(args, logger, is_retrain=False):
     calibrated = CalibratedClassifierCV(**xgb_cal_kwargs)
     calibrated.fit(X_test_raw, y_test)
     xgb_shap = XGBClassifier(**best_xgb_pipe.named_steps['model'].get_params())
+    _phase('computing explanations (SHAP)')
     xgb_shap.fit(X_train_scaled, y_train)
     explainer = shap.TreeExplainer(xgb_shap)
     shap_values = explainer.shap_values(X_test_scaled)
@@ -121,6 +135,7 @@ def run_ml(args, logger, is_retrain=False):
     plt.savefig(os.path.join(base_outputs, 'figures', 'shap_bar.png'), bbox_inches='tight')
     plt.close()
     ensemble_models = []
+    _phase('training: bootstrap ensemble')
     n_models = 20
     for i in range(n_models):
         unique_groups = np.unique(groups[train_idx])
@@ -230,6 +245,7 @@ def run_ml(args, logger, is_retrain=False):
     }
     with open(os.path.join(base_outputs, 'metrics.json'), 'w', encoding='utf-8') as f:
         json.dump(metrics, f, indent=4)
+    _phase('anomaly detection')
     logger.info('Running anomaly detection on all signals (Step J)...')
     try:
         X_all = df[feature_cols].values
@@ -278,13 +294,14 @@ def run_ml(args, logger, is_retrain=False):
             plt.close()
     except Exception as e:
         logger.error(f'Anomaly detection failed: {e}')
-    logger.info('Training completed.')
+    _done(logger, 'Training completed.')
 
 def transfer_mode(args, logger):
     base_outputs = getattr(args, 'base_outputs', os.path.join('outputs', '_smoke_test') if getattr(args, 'smoke_test', False) else 'outputs')
     if not args.train_csv or not args.test_csv:
         logger.error('--train-csv and --test-csv required for transfer mode')
         return
+    _phase('transfer experiments')
     df_train = pd.read_csv(args.train_csv)
     df_test = pd.read_csv(args.test_csv)
     df_train = df_train[df_train['match_status'] == 'MATCHED'].copy()
@@ -356,7 +373,7 @@ def transfer_mode(args, logger):
     plt.legend()
     plt.savefig(os.path.join(base_outputs, 'figures', 'transfer_roc.png'))
     plt.close()
-    logger.info('Transfer experiments completed.')
+    _done(logger, 'Transfer experiments completed.')
 
 def predict_mode(args, logger):
     base_outputs = getattr(args, 'base_outputs', os.path.join('outputs', '_smoke_test') if getattr(args, 'smoke_test', False) else 'outputs')
@@ -369,6 +386,7 @@ def predict_mode(args, logger):
     if not os.path.exists(args.input):
         logger.error(f'Input file {args.input} not found')
         return
+    _phase('loading model')
     model_dict = joblib.load(model_path)
     scale_pipe = model_dict['scale_pipe']
     ensemble_models = model_dict['ensemble']
@@ -376,12 +394,14 @@ def predict_mode(args, logger):
     feature_cols = model_dict['feature_cols']
     thresholds = model_dict['thresholds']
     explainer = model_dict.get('explainer', None)
+    _phase('scoring signals')
     df = pd.read_csv(args.input)
     missing_cols = [c for c in feature_cols if c not in df.columns]
     if missing_cols:
         msg = f"Input file {args.input} is missing {len(missing_cols)} feature columns required by trained model: {', '.join(missing_cols)}. Please re-extract features with the matching pipeline schema."
         logger.error(msg)
-        print(f"ERROR: {msg}", flush=True)
+        if _console is None or _console.verbose:
+            print(f"ERROR: {msg}", flush=True)
         return
     X = df[feature_cols].values
     X_scaled = scale_pipe.transform(X)
@@ -416,7 +436,7 @@ def predict_mode(args, logger):
         out_file = os.path.join(base_outputs, os.path.basename(out_file))
     os.makedirs(os.path.dirname(out_file) or '.', exist_ok=True)
     df.to_csv(out_file, index=False, encoding='utf-8')
-    logger.info(f'Prediction completed. Saved to {out_file}')
+    _done(logger, f'Prediction completed. Saved to {out_file}')
 
 def score_file_mode(args, logger):
     predict_mode(args, logger)
@@ -429,20 +449,34 @@ def main():
     parser.add_argument('--test-csv', default='')
     parser.add_argument('--mode', default='train', choices=['train', 'predict', 'score-file', 'retrain', 'transfer'])
     parser.add_argument('--smoke-test', action='store_true', help='[TEST ONLY] Run pipeline in isolated smoke test mode, writing outputs to outputs/_smoke_test/')
+    parser.add_argument('--verbose', action='store_true', help='Print detailed output to the console instead of the status bar.')
     args = parser.parse_args()
-    logger = setup_logger()
+    onyx_console.set_verbose_env(args.verbose)
+    verbose = onyx_console.is_verbose(args.verbose)
+    global _console
+    phases_total = {'train': 5, 'retrain': 5, 'predict': 2, 'score-file': 2, 'transfer': 1}[args.mode]
+    _console = onyx_console.Console(total=phases_total, unit='steps', verbose=verbose, show_ok=False, show_eta=False)
+    logger = setup_logger(verbose, _console)
+    _console.logger = logger
     base_outputs = os.path.join('outputs', '_smoke_test') if args.smoke_test else 'outputs'
     os.makedirs(base_outputs, exist_ok=True)
     os.makedirs(os.path.join(base_outputs, 'models'), exist_ok=True)
     os.makedirs(os.path.join(base_outputs, 'figures'), exist_ok=True)
     os.makedirs(os.path.join(base_outputs, 'explanations'), exist_ok=True)
     args.base_outputs = base_outputs
-    if args.mode in ['train', 'retrain']:
-        run_ml(args, logger, is_retrain=(args.mode == 'retrain'))
-    elif args.mode in ['predict', 'score-file']:
-        predict_mode(args, logger)
-    elif args.mode == 'transfer':
-        transfer_mode(args, logger)
+    _console.show(f"Project Onyx ML pipeline | Mode: {args.mode} | Input: {args.input if args.mode != 'transfer' else args.train_csv}")
+    _console.start()
+    try:
+        if args.mode in ['train', 'retrain']:
+            run_ml(args, logger, is_retrain=(args.mode == 'retrain'))
+        elif args.mode in ['predict', 'score-file']:
+            predict_mode(args, logger)
+        elif args.mode == 'transfer':
+            transfer_mode(args, logger)
+    finally:
+        _console.end_phases()
+        _console.set_status('done')
+        _console.finish([f"ML pipeline finished in {onyx_console.fmt_time(_console.elapsed())} | Outputs: {base_outputs} | Log: {ML_LOG_PATH}"])
 
 if __name__ == '__main__':
     main()
