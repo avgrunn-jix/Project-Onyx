@@ -5,6 +5,8 @@ import logging
 import os
 import tempfile
 import shutil
+import onyx_console
+onyx_console.setup_warnings()
 
 def get_effective_output(out_path, default_base, is_quick, max_sectors, is_smoke):
     base_dir = os.path.join('outputs', '_smoke_test') if is_smoke else ''

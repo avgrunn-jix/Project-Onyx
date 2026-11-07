@@ -8,6 +8,9 @@ import tempfile
 import time
 import warnings
 
+import onyx_console
+onyx_console.setup_warnings()
+
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'

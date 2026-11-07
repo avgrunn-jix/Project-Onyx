@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import warnings
+import onyx_console
+onyx_console.setup_warnings()
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt

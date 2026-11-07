@@ -12,6 +12,8 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+import onyx_console
+onyx_console.setup_warnings()
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
