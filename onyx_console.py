@@ -190,7 +190,7 @@ class Console:
             pass
 
     def eta(self):
-        if self.total > 0 and self.done >= self.total:
+        if self.total <= 0 or self.done >= self.total:
             return 0
         if not self.durations:
             return None
