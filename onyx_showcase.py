@@ -258,7 +258,7 @@ def _render_wide(data, out_path, labels):
     times_raw, flux_raw = data['times_raw'], data['flux_raw']
     times_flat, flux_flat = data['times_flat'], data['flux_flat']
     n_sigs = min(4, len(signals))
-    fs_title, fs_label, fs_tick, fs_leg = 10.5, 10, 9.5, 8.5
+    fs_title, fs_label, fs_tick, fs_leg = 10, 10, 9.5, 9
     fig = plt.figure(figsize=(11, 6.6), constrained_layout=True)
     fig.get_layout_engine().set(w_pad=0.03, h_pad=0.04, wspace=0.04, hspace=0.06)
     gs = fig.add_gridspec(3, 4)
@@ -286,9 +286,10 @@ def _render_wide(data, out_path, labels):
         p_val = float(s_row.get('bls_period_d', 0))
         ax3.axvline(p_val, color='g', linestyle='--', alpha=0.8, label=labels['peak_short'].format(p=p_val))
     if n_sigs > 0:
-        ax3.legend(loc='upper right', fontsize=fs_leg, ncol=n_sigs)
+        ax3.legend(loc='upper left', fontsize=fs_leg, ncol=2)
 
     axes_all = [ax1, ax2, ax3]
+    legend_src = None
     for idx in range(4):
         ax_f = fig.add_subplot(gs[2, idx])
         axes_all.append(ax_f)
@@ -300,10 +301,10 @@ def _render_wide(data, out_path, labels):
             dec_str = _verdict_text(s_row.get('decision'), labels, 'n/a')
             fold = _fold_signal(data, signals, idx, s_row)
             _plot_fold(ax_f, fold, depth_ppm, labels, True)
-            ax_f.set_title(labels['sig_wide'].format(i=idx + 1, p=p_val, d=depth_ppm, prob=prob_str, dec=dec_str), fontsize=fs_title)
+            ax_f.set_title(labels['sig_wide'].format(i=idx + 1, p=p_val, d=depth_ppm, prob=prob_str, dec=dec_str), fontsize=fs_title - 1)
             if idx == 0:
                 ax_f.set_ylabel(labels['flux_rel'], fontsize=fs_label)
-                ax_f.legend(loc='lower left', fontsize=fs_leg - 1, handlelength=1.2, borderpad=0.3, labelspacing=0.2)
+                legend_src = ax_f
         else:
             ax_f.text(0.5, 0.5, labels['no_signal'], ha='center', va='center', fontsize=fs_label)
             ax_f.set_xticks([])
@@ -311,6 +312,10 @@ def _render_wide(data, out_path, labels):
         ax_f.set_xlabel(labels['transit_axis_wide'], fontsize=fs_label)
     for ax in axes_all:
         ax.tick_params(labelsize=fs_tick)
+        ax.ticklabel_format(useOffset=False, style='plain', axis='y')
+    if legend_src is not None:
+        handles, names = legend_src.get_legend_handles_labels()
+        fig.legend(handles, names, loc='outside lower center', ncol=3, fontsize=fs_leg, frameon=False)
 
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     fig.savefig(out_path, dpi=300)
