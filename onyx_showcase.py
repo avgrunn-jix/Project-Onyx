@@ -3,6 +3,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.ticker import MaxNLocator
 
 LABELS = {
     'ru': {
@@ -28,7 +29,7 @@ LABELS = {
         'expected': "Ожидаемый транзит (глубина {d:.0f} ppm, длительность {h:.1f} ч)",
         'expected_short': "Ожидаемый транзит",
         'sig_tall': "Сигнал {i}: P = {p:.4f} д | Глубина = {d:.0f} ppm | Транзитов: ~{n} | Вердикт: {dec} (p = {prob})",
-        'sig_wide': "Сигнал {i}: P = {p:.4f} д, {d:.0f} ppm\np = {prob}, {dec}",
+        'sig_wide': "Сигнал {i}\nP = {p:.4f} д, {d:.0f} ppm\np = {prob}, {dec}",
         'transit_axis': "Время от центра транзита (часы)",
         'transit_axis_wide': "Время от центра транзита (ч)",
         'no_signals': "В текущем тестовом режиме сигналы не обнаружены",
@@ -59,7 +60,7 @@ LABELS = {
         'expected': "Expected transit (depth {d:.0f} ppm, duration {h:.1f} h)",
         'expected_short': "Expected transit",
         'sig_tall': "Signal {i}: P = {p:.4f} d | Depth = {d:.0f} ppm | Transits: ~{n} | Verdict: {dec} (p = {prob})",
-        'sig_wide': "Signal {i}: P = {p:.4f} d, {d:.0f} ppm\np = {prob}, {dec}",
+        'sig_wide': "Signal {i}\nP = {p:.4f} d, {d:.0f} ppm\np = {prob}, {dec}",
         'transit_axis': "Time from transit centre (hours)",
         'transit_axis_wide': "Time from transit centre (h)",
         'no_signals': "No signals were detected in the current test mode",
@@ -258,9 +259,9 @@ def _render_wide(data, out_path, labels):
     times_raw, flux_raw = data['times_raw'], data['flux_raw']
     times_flat, flux_flat = data['times_flat'], data['flux_flat']
     n_sigs = min(4, len(signals))
-    fs_title, fs_label, fs_tick, fs_leg = 10, 10, 9.5, 9
-    fig = plt.figure(figsize=(11, 6.6), constrained_layout=True)
-    fig.get_layout_engine().set(w_pad=0.03, h_pad=0.04, wspace=0.04, hspace=0.06)
+    fs_title, fs_label, fs_tick, fs_leg = 9.5, 9, 8.6, 8.6
+    fig = plt.figure(figsize=(8.5, 6.4), constrained_layout=True)
+    fig.get_layout_engine().set(w_pad=0.03, h_pad=0.04, wspace=0.04, hspace=0.04)
     gs = fig.add_gridspec(3, 4)
     sub_step = max(1, len(times_raw) // 15000)
 
@@ -301,7 +302,8 @@ def _render_wide(data, out_path, labels):
             dec_str = _verdict_text(s_row.get('decision'), labels, 'n/a')
             fold = _fold_signal(data, signals, idx, s_row)
             _plot_fold(ax_f, fold, depth_ppm, labels, True)
-            ax_f.set_title(labels['sig_wide'].format(i=idx + 1, p=p_val, d=depth_ppm, prob=prob_str, dec=dec_str), fontsize=fs_title - 1)
+            ax_f.set_title(labels['sig_wide'].format(i=idx + 1, p=p_val, d=depth_ppm, prob=prob_str, dec=dec_str), fontsize=fs_title, linespacing=1.15)
+            ax_f.title.set_x(0.3)
             if idx == 0:
                 ax_f.set_ylabel(labels['flux_rel'], fontsize=fs_label)
                 legend_src = ax_f
@@ -309,13 +311,16 @@ def _render_wide(data, out_path, labels):
             ax_f.text(0.5, 0.5, labels['no_signal'], ha='center', va='center', fontsize=fs_label)
             ax_f.set_xticks([])
             ax_f.set_yticks([])
-        ax_f.set_xlabel(labels['transit_axis_wide'], fontsize=fs_label)
     for ax in axes_all:
         ax.tick_params(labelsize=fs_tick)
         ax.ticklabel_format(useOffset=False, style='plain', axis='y')
+    for ax in axes_all[3:]:
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=4, integer=True))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
     if legend_src is not None:
         handles, names = legend_src.get_legend_handles_labels()
-        fig.legend(handles, names, loc='outside lower center', ncol=3, fontsize=fs_leg, frameon=False)
+        fig.legend(handles, names, loc='outside upper center', ncol=3, fontsize=fs_leg, frameon=False)
+    fig.supxlabel(labels['transit_axis_wide'], fontsize=fs_label)
 
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     fig.savefig(out_path, dpi=300)

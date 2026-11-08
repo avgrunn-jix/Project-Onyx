@@ -53,7 +53,7 @@ def test_wide_is_wider_than_tall_and_has_seven_panels(tmp_path):
     assert len(fig.axes) == 7
     plt.close(fig)
     with Image.open(out) as im:
-        assert im.size == (3300, 1980)
+        assert im.size == (2550, 1920)
 
 
 @pytest.mark.parametrize('layout', ['wide', 'tall'])
@@ -78,7 +78,7 @@ def test_wide_titles(tmp_path):
     fig = onyx_showcase.render_showcase(make_data(), str(tmp_path / 't.png'), layout='wide', lang='en', close=False)
     titles = [ax.get_title() for ax in fig.axes]
     plt.close(fig)
-    assert 'Signal 1: P = 9.5215 d, 1351 ppm\np = 0.84, REVIEW' in titles
+    assert 'Signal 1\nP = 9.5215 d, 1351 ppm\np = 0.84, REVIEW' in titles
 
 
 def test_tall_matches_reference_render(tmp_path):
@@ -142,7 +142,7 @@ def test_missing_match_gives_na_title(tmp_path):
     fig = onyx_showcase.render_showcase(data, str(tmp_path / 'n.png'), layout='wide', lang='en', close=False)
     titles = [ax.get_title() for ax in fig.axes]
     plt.close(fig)
-    assert 'Signal 1: P = 9.5215 d, 1351 ppm\np = n/a, n/a' in titles
+    assert 'Signal 1\nP = 9.5215 d, 1351 ppm\np = n/a, n/a' in titles
 
 
 def test_make_showcase_reads_signals(tmp_path):
@@ -153,3 +153,62 @@ def test_make_showcase_reads_signals(tmp_path):
     df = ms.read_star_signals(str(feats))
     assert list(df['bls_period_d']) == [9.52, 7.05, 4.6]
     assert ms.read_scored_signals(str(tmp_path / 'missing.csv')) is None
+
+
+def text_objects(fig):
+    objs = []
+    for ax in fig.axes:
+        objs.append(ax.title)
+        objs.append(ax.xaxis.label)
+        objs.append(ax.yaxis.label)
+        objs.extend(ax.texts)
+        objs.extend(ax.get_xticklabels())
+        objs.extend(ax.get_yticklabels())
+        leg = ax.get_legend()
+        if leg is not None:
+            objs.extend(leg.get_texts())
+    for leg in fig.legends:
+        objs.extend(leg.get_texts())
+    objs.extend(fig.texts)
+    return [o for o in objs if o.get_text().strip()]
+
+
+@pytest.mark.parametrize('lang', ['ru', 'en'])
+def test_wide_fonts_and_height_fit_page(tmp_path, lang):
+    fig = onyx_showcase.render_showcase(make_data(), str(tmp_path / 'f.png'), layout='wide', lang=lang, close=False)
+    w, h = fig.get_size_inches()
+    min_font = min(o.get_fontsize() for o in text_objects(fig))
+    plt.close(fig)
+    assert min_font * 6.27 / w >= 6.3
+    assert h * 6.27 / w <= 4.8
+
+
+@pytest.mark.parametrize('lang', ['ru', 'en'])
+def test_wide_text_inside_figure_and_not_overlapping(tmp_path, lang):
+    fig = onyx_showcase.render_showcase(make_data(), str(tmp_path / 'o.png'), layout='wide', lang=lang, close=False)
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    fb = fig.bbox
+    items = []
+    for ax in fig.axes:
+        items.append(ax.title)
+        items.append(ax.xaxis.label)
+        items.append(ax.yaxis.label)
+    items.extend(fig.texts)
+    for leg in fig.legends:
+        items.extend(leg.get_texts())
+    for ax in fig.axes:
+        if ax.get_legend() is not None:
+            items.extend(ax.get_legend().get_texts())
+    boxes = []
+    for o in items:
+        if not o.get_text().strip():
+            continue
+        bb = o.get_window_extent(renderer)
+        boxes.append((o, bb))
+        assert bb.x0 >= fb.x0 - 1 and bb.x1 <= fb.x1 + 1
+        assert bb.y0 >= fb.y0 - 1 and bb.y1 <= fb.y1 + 1
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            assert not boxes[i][1].overlaps(boxes[j][1]), (boxes[i][0].get_text(), boxes[j][0].get_text())
+    plt.close(fig)
