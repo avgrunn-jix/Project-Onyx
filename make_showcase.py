@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
 import onyx_console
 onyx_console.setup_warnings()
 
-from onyx_showcase import match_verdicts, render_showcase
+from onyx_showcase import match_verdicts, period_column, render_showcase
 
 STAR_ID = '4852528'
 FLATTEN_DAYS = 3.0
@@ -44,8 +44,11 @@ def read_scored_signals(signals_file, star_id=STAR_ID):
     if not signals_file or not os.path.isfile(signals_file):
         return None
     df = pd.read_csv(signals_file, dtype={'target_id': str})
-    if 'target_id' not in df.columns:
-        return None
+    missing = [c for c in ('target_id', 'p_mean', 'decision') if c not in df.columns]
+    if period_column(df) is None:
+        missing.append('period_d (or bls_period_d)')
+    if missing:
+        raise ValueError(f"Signals file {signals_file} lacks required columns: {', '.join(missing)}. Found columns: {', '.join(map(str, df.columns))}")
     return df[df['target_id'].str.strip() == str(star_id)].reset_index(drop=True)
 
 
@@ -120,11 +123,23 @@ def parse_args(argv=None):
     parser.add_argument('--features-file', required=True)
     parser.add_argument('--signals-file', default='')
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
-    parser.add_argument('--output', default=os.path.join('outputs', 'showcase_kepler80_wide.png'))
+    parser.add_argument('--output', default='')
+    parser.add_argument('--output-dir', default='')
     parser.add_argument('--layout', choices=['tall', 'wide'], default='wide')
-    parser.add_argument('--lang', choices=['ru', 'en'], default='ru')
+    parser.add_argument('--lang', choices=['ru', 'en', 'both'], default='ru')
     parser.add_argument('--no-resolve-aliases', action='store_true')
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.lang == 'both' and args.output:
+        parser.error('--output cannot be combined with --lang both; use --output-dir')
+    return args
+
+
+def output_paths(args):
+    langs = ['ru', 'en'] if args.lang == 'both' else [args.lang]
+    if args.output:
+        return [(args.lang, args.output)]
+    out_dir = args.output_dir or 'outputs'
+    return [(lang, os.path.join(out_dir, f'showcase_kepler80_{args.layout}_{lang}.png')) for lang in langs]
 
 
 def main(argv=None):
@@ -137,14 +152,19 @@ def main(argv=None):
     if len(signals) == 0:
         print(f'No rows for star {STAR_ID} in {args.features_file}', file=sys.stderr)
         return 1
-    scored = read_scored_signals(args.signals_file)
+    try:
+        scored = read_scored_signals(args.signals_file)
+    except ValueError as err:
+        print(str(err), file=sys.stderr)
+        return 2
     signals = match_verdicts(signals, scored)
 
     data = build_curves(extractor, STAR_ID, args.cache_dir)
     data['showcase_id'] = STAR_ID
     data['signals'] = signals
-    render_showcase(data, args.output, layout=args.layout, lang=args.lang)
-    print(f'Saved {args.output}')
+    for lang, path in output_paths(args):
+        render_showcase(data, path, layout=args.layout, lang=lang)
+        print(f'Saved {path}')
     return 0
 
 

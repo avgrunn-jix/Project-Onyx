@@ -1,4 +1,5 @@
 import os
+import re
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -73,21 +74,46 @@ LABELS = {
 RU_NOT_SCORED = 'НЕ_ОЦЕНИВАЛСЯ'
 
 
+VERDICT_ALIASES = {
+    'CANDIDATE': 'CANDIDATE',
+    'FALSE POSITIVE': 'FALSE_POSITIVE',
+    'REVIEW': 'REVIEW',
+    '\u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442': 'CANDIDATE',
+    '\u043b\u043e\u0436\u043d\u043e\u0435 \u0441\u0440\u0430\u0431\u0430\u0442\u044b\u0432\u0430\u043d\u0438\u0435': 'FALSE_POSITIVE',
+    '\u043d\u0430 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0443': 'REVIEW',
+}
+CYRILLIC_RE = re.compile('[\u0400-\u04FF]')
+
+
+def normalize_verdict(value):
+    if value is None or (not isinstance(value, str) and pd.isnull(value)):
+        return None
+    key = ' '.join(str(value).replace('_', ' ').split()).upper()
+    return VERDICT_ALIASES.get(key)
+
+
+def period_column(df):
+    for name in ('period_d', 'bls_period_d'):
+        if name in df.columns:
+            return name
+    return None
+
+
 def match_verdicts(signals_df, scored_df, tol=0.01):
     p_means = []
     verdicts = []
+    pcol = period_column(scored_df) if scored_df is not None else None
     for _, row in signals_df.iterrows():
         p = float(row['bls_period_d'])
         p_mean = None
         verdict = None
-        if scored_df is not None and len(scored_df) > 0:
+        if scored_df is not None and len(scored_df) > 0 and pcol is not None:
             for _, cand in scored_df.iterrows():
-                cp = float(cand['bls_period_d'])
+                cp = float(cand[pcol])
                 if cp > 0 and abs(p / cp - 1.0) < tol:
                     pm = cand.get('p_mean')
                     p_mean = float(pm) if pd.notnull(pm) else None
-                    dv = cand.get('decision')
-                    verdict = str(dv) if pd.notnull(dv) else None
+                    verdict = normalize_verdict(cand.get('decision'))
                     break
         p_means.append(p_mean)
         verdicts.append(verdict)
@@ -191,6 +217,8 @@ def _verdict_text(value, labels, missing):
     text = str(value)
     if text == RU_NOT_SCORED:
         return labels['not_scored']
+    if labels is LABELS['en'] and CYRILLIC_RE.search(text):
+        return normalize_verdict(text) or missing
     return text
 
 
