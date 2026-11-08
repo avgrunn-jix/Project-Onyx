@@ -29,6 +29,7 @@ from sklearn.model_selection import GroupKFold
 from xgboost import XGBClassifier
 import shap
 from onyx_features import COVERAGE_COLS, compute_feature_columns
+from onyx_showcase import render_showcase
 
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Segoe UI']
 plt.rcParams['axes.unicode_minus'] = False
@@ -528,7 +529,7 @@ def bootstrap_star_metrics(df_eval, n_boot=1000, seed=42):
     cov_ci = (float(np.percentile(cov_list, 5)), float(np.percentile(cov_list, 95))) if cov_list else (0.0, 0.0)
     return {'acc_ci': acc_ci, 'auc_ci': auc_ci, 'cov_ci': cov_ci}
 
-def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode, cache_dir=None):
+def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode, cache_dir=None, layout='tall', lang='ru'):
     import lightkurve as lk
     try:
         sr = lk.search_lightcurve(f"KIC {showcase_id}", mission='Kepler', author='Kepler', cadence='long')
@@ -571,122 +572,20 @@ def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode
     pow_std = float(np.nanstd(pow_vals))
     sde_curve = (pow_vals - pow_mean) / (pow_std if pow_std > 0 else 1.0)
 
-    n_sigs = min(4, len(showcase_signals))
-    total_panels = 3 + max(1, n_sigs)
-    fig = plt.figure(figsize=(15, 3.8 * total_panels))
-    gs = fig.add_gridspec(total_panels, 1)
-
-    ax1 = fig.add_subplot(gs[0, 0])
-    sub_step = max(1, len(times_raw) // 15000)
-    ax1.plot(times_raw[::sub_step], flux_raw[::sub_step], 'k.', markersize=1, alpha=0.5)
-    ax1.set_title(f"Kepler-80 (KIC {showcase_id}): Исходная фотометрия ({n_files} файлов, {n_quarters} уник. кварталов, базлайн {baseline_days:.1f} д)")
-    ax1.set_xlabel("Время (BJD - 2454833)")
-    ax1.set_ylabel("Нормированный поток")
-
-    ax2 = fig.add_subplot(gs[1, 0])
-    ax2.plot(times_flat[::sub_step], flux_flat[::sub_step], 'b.', markersize=1, alpha=0.5)
-    ax2.set_title("Сглаженная и выровненная кривая блеска (Flattened, spline window=3.0d)")
-    ax2.set_xlabel("Время (BJD - 2454833)")
-    ax2.set_ylabel("Относительный поток")
-
-    ax3 = fig.add_subplot(gs[2, 0])
-    ax3.plot(bls.period.value, sde_curve, 'r-', linewidth=0.8, label='BLS SDE')
-    ax3.set_xlim(0.5, 12.0)
-    ax3.set_title("Периодограмма BLS (нормализованная мощность SDE = (P - μ)/σ)\nДиапазон поиска: 0.5–100.0 д | Отображаемый фрагмент: 0.5–12.0 д")
-    ax3.set_xlabel("Период (дни)")
-    ax3.set_ylabel("Нормализованная мощность SDE")
-    if n_sigs > 0:
-        for _, s_row in showcase_signals.head(n_sigs).iterrows():
-            p_val = float(s_row.get('bls_period_d', 0))
-            sde_sig = float(s_row.get('bls_sde', 0))
-            ax3.axvline(p_val, color='g', linestyle='--', alpha=0.8, label=f"Пик: {p_val:.4f} д (SDE={sde_sig:.1f})")
-    ax3.legend(loc='upper right', fontsize=8)
-
-    if n_sigs > 0:
-        for idx, (_, s_row) in enumerate(showcase_signals.head(n_sigs).iterrows()):
-            ax_f = fig.add_subplot(gs[3 + idx, 0])
-            p_val = float(s_row.get('bls_period_d', 1.0))
-            t0_val = float(s_row.get('bls_epoch', 0.0))
-            dur_val = float(s_row.get('bls_duration_d', 0.1))
-            depth_ppm = float(s_row.get('bls_depth_ppm', 0.0))
-            depth_frac = depth_ppm * 1e-6
-            p_mean_val = s_row.get('p_mean')
-            prob_str = f"{float(p_mean_val):.1%}" if (pd.notnull(p_mean_val) and not np.isnan(float(p_mean_val))) else "N/A"
-            dec_str = str(s_row.get('decision', 'НЕ_ОЦЕНИВАЛСЯ'))
-            dur_hours = dur_val * 24.0
-            n_transits = int(round(baseline_days / p_val)) if p_val > 0 else 0
-
-            mask_other = np.zeros(len(times_flat), dtype=bool)
-            for other_idx, (_, other_row) in enumerate(showcase_signals.iterrows()):
-                if other_idx == idx:
-                    continue
-                op = float(other_row.get('bls_period_d', 0))
-                ot0 = float(other_row.get('bls_epoch', 0))
-                odur = float(other_row.get('bls_duration_d', 0))
-                if op > 0:
-                    oph = ((times_flat - ot0 + 0.5 * op) % op) - 0.5 * op
-                    mask_other |= (np.abs(oph) < 0.6 * odur)
-
-            t_clean = times_flat[~mask_other]
-            f_clean = flux_flat[~mask_other]
-
-            phase_d = ((t_clean - t0_val + 0.5 * p_val) % p_val) - 0.5 * p_val
-            hours_from_mid = phase_d * 24.0
-            win_hours = max(4.0 * dur_hours, 6.0)
-            m_win = np.abs(hours_from_mid) <= win_hours
-            x_win = hours_from_mid[m_win]
-            y_win = f_clean[m_win]
-
-            if len(y_win) > 10:
-                med_y = float(np.median(y_win))
-                mad_y = float(np.median(np.abs(y_win - med_y)))
-                sig_y = 1.4826 * mad_y if mad_y > 0 else float(np.std(y_win))
-                if sig_y > 0:
-                    in_5sig = np.abs(y_win - med_y) <= 5.0 * sig_y
-                    x_win = x_win[in_5sig]
-                    y_win = y_win[in_5sig]
-
-            bin_width = 0.3
-            n_bins = int(np.ceil((2.0 * win_hours) / bin_width))
-            bin_edges = np.linspace(-win_hours, win_hours, n_bins + 1)
-            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-            bin_medians = []
-            valid_centers = []
-            for bi in range(len(bin_centers)):
-                bm = (x_win >= bin_edges[bi]) & (x_win < bin_edges[bi + 1])
-                if np.any(bm):
-                    bin_medians.append(float(np.nanmedian(y_win[bm])))
-                    valid_centers.append(bin_centers[bi])
-            valid_centers = np.array(valid_centers)
-            bin_medians = np.array(bin_medians)
-
-            ax_f.plot(x_win, y_win, 'k.', markersize=2, alpha=0.25, label='Фотометрия (чужие транзиты маскированы)')
-            if len(bin_medians) > 0:
-                ax_f.plot(valid_centers, bin_medians, 'r-', linewidth=1.8, label='Биннированный профиль (~18 мин)')
-                y_p1 = float(np.percentile(bin_medians, 1))
-                y_p99 = float(np.percentile(bin_medians, 99))
-                margin = max(0.0003, (y_p99 - y_p1) * 0.4)
-                ax_f.set_ylim(y_p1 - margin, y_p99 + margin)
-
-            t_half_dur = dur_hours / 2.0
-            ax_f.plot([-t_half_dur, -t_half_dur, t_half_dur, t_half_dur],
-                      [1.0, 1.0 - depth_frac, 1.0 - depth_frac, 1.0],
-                      color='tab:cyan', linestyle='--', linewidth=1.5,
-                      label=f'Ожидаемый транзит (глубина {depth_ppm:.0f} ppm, длительность {dur_hours:.1f} ч)')
-
-            ax_f.set_title(f"Сигнал {idx+1}: P = {p_val:.4f} д | Глубина = {depth_ppm:.0f} ppm | Транзитов: ~{n_transits} | Вердикт: {dec_str} (p = {prob_str})")
-            ax_f.set_xlabel("Время от центра транзита (часы)")
-            ax_f.set_ylabel("Относительный поток")
-            ax_f.set_xlim(-win_hours, win_hours)
-            ax_f.legend(loc='lower right', fontsize=8)
-    else:
-        ax_f = fig.add_subplot(gs[3, 0])
-        ax_f.text(0.5, 0.5, "В текущем тестовом режиме сигналы не обнаружены", ha='center', va='center')
-
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    plt.savefig(out_path, dpi=150)
-    plt.close()
+    showcase_data = {
+        'showcase_id': showcase_id,
+        'signals': showcase_signals,
+        'times_raw': times_raw,
+        'flux_raw': flux_raw,
+        'times_flat': times_flat,
+        'flux_flat': flux_flat,
+        'bls_period': bls.period.value,
+        'sde_curve': sde_curve,
+        'n_files': n_files,
+        'n_quarters': n_quarters,
+        'baseline_days': baseline_days,
+    }
+    render_showcase(showcase_data, out_path, layout=layout, lang=lang)
     return n_files, n_quarters, baseline_days, bjd_min, bjd_max
 
 def main():
