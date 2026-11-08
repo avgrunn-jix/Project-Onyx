@@ -75,9 +75,9 @@ RU_NOT_SCORED = 'НЕ_ОЦЕНИВАЛСЯ'
 
 
 VERDICT_ALIASES = {
-    'CANDIDATE': 'CANDIDATE',
-    'FALSE POSITIVE': 'FALSE_POSITIVE',
-    'REVIEW': 'REVIEW',
+    'candidate': 'CANDIDATE',
+    'false positive': 'FALSE_POSITIVE',
+    'review': 'REVIEW',
     '\u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442': 'CANDIDATE',
     '\u043b\u043e\u0436\u043d\u043e\u0435 \u0441\u0440\u0430\u0431\u0430\u0442\u044b\u0432\u0430\u043d\u0438\u0435': 'FALSE_POSITIVE',
     '\u043d\u0430 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0443': 'REVIEW',
@@ -88,7 +88,7 @@ CYRILLIC_RE = re.compile('[\u0400-\u04FF]')
 def normalize_verdict(value):
     if value is None or (not isinstance(value, str) and pd.isnull(value)):
         return None
-    key = ' '.join(str(value).replace('_', ' ').split()).upper()
+    key = ' '.join(str(value).replace('_', ' ').split()).lower()
     return VERDICT_ALIASES.get(key)
 
 

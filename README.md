@@ -123,10 +123,10 @@ Other demo options: `--seed`, `--showcase-star`, `--unmarked-file`, `--output-di
 
 ### Showcase figure
 
-`make_showcase.py` redraws the Kepler-80 (KIC 4852528) showcase figure for a finished run, with a choice of layout (`tall` or `wide`, the wide one is about 11 x 6.6 inches at 300 dpi and suits a journal page) and of label language (`ru` or `en`). It takes the detected signals from the features table of the run and, optionally, the verdicts and `p_mean` values from `control_signals_quick.csv`, matched by period within 1%; when no match is found, the panel title shows `p = n/a`. It downloads the Kepler light curve with the same settings as the quick extractor mode, so network access and the light curve cache are needed.
+`make_showcase.py` redraws the Kepler-80 (KIC 4852528) showcase figure for a finished run, with a choice of layout (`tall` or `wide`, the wide one is about 11 x 6.6 inches at 300 dpi and suits a journal page) and of label language (`ru` or `en`). It takes the detected signals from the features table of the run and, optionally, the verdicts and `p_mean` values from `control_signals_quick.csv`, matched by period within 1%; when no match is found, the panel title shows `p = n/a`. With `--lang both` the light curve and periodogram are computed once and two files, `showcase_kepler80_wide_ru.png` and `showcase_kepler80_wide_en.png`, are written to `--output-dir`; `--output` writes a single file instead. Verdicts are shown as `CANDIDATE`, `FALSE_POSITIVE` or `REVIEW`, and anything else as `n/a`. It downloads the Kepler light curve with the same settings as the quick extractor mode, so network access and the light curve cache are needed.
 
 ```bash
-python make_showcase.py --features-file outputs/demo/features_demo_quick.csv --signals-file outputs/demo/control_signals_quick.csv --layout wide --lang en --output outputs/showcase_kepler80_wide_en.png
+python make_showcase.py --features-file outputs/demo/features_demo_quick.csv --signals-file outputs/demo/control_signals_quick.csv --layout wide --lang both --output-dir outputs/showcase
 ```
 
 ### Output files (`outputs/demo/`)
