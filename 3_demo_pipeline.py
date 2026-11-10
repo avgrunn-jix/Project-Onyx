@@ -22,13 +22,11 @@ from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, r
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import FunctionTransformer, RobustScaler
-from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import LocalOutlierFactor
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupKFold
 from xgboost import XGBClassifier
 import shap
-from onyx_features import COVERAGE_COLS, compute_feature_columns
+from onyx_features import COVERAGE_COLS, PipelineVersionError, build_pipeline_version, check_pipeline_version, compute_feature_columns
 from onyx_showcase import render_showcase
 
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Segoe UI']
@@ -82,8 +80,8 @@ def verify_eb_catalog(catalog_path):
         norm = str(tid).upper().replace('KIC', '').strip().lstrip('0')
         if norm not in eb_set:
             raise RuntimeError(f"EB catalog self-test failed on positive ID: {tid}")
-    if '6541920' in eb_set:
-        raise RuntimeError("EB catalog self-test failed on negative control (Kepler-80)")
+    if '4852528' in eb_set:
+        raise RuntimeError("EB catalog self-test failed on negative control (Kepler-80, KIC 4852528)")
     return eb_set, len(df_eb)
 
 def is_eclipsing_binary(target_id, eb_set):
@@ -298,27 +296,145 @@ def compute_group_stats(info_dict):
         'q_max': int(np.max(qs)) if qs else 0
     }
 
-def split_stars(marked_stars, unmarked_stars, star_prim, showcase_star, seed):
+def split_stars(marked_stars, unmarked_stars, star_prim, showcase_star, seed, balance=False):
     showcase_id = str(showcase_star)
     tr_marked = [marked_stars[i] for i in range(len(marked_stars)) if i % 2 == 0]
     ctrl_marked = [marked_stars[i] for i in range(len(marked_stars)) if i % 2 == 1]
     tr_unmarked = [unmarked_stars[i] for i in range(len(unmarked_stars)) if i % 2 == 0]
     ctrl_unmarked = [unmarked_stars[i] for i in range(len(unmarked_stars)) if i % 2 == 1]
 
-    n_bal_m = min(len(tr_marked), len(ctrl_marked))
-    n_bal_u = min(len(tr_unmarked), len(ctrl_unmarked))
-    n_bal = min(n_bal_m, n_bal_u)
-
-    tr_marked = tr_marked[:n_bal]
-    ctrl_marked = ctrl_marked[:n_bal]
-    tr_unmarked = tr_unmarked[:n_bal]
-    ctrl_unmarked = ctrl_unmarked[:n_bal]
+    if balance:
+        n_bal_m = min(len(tr_marked), len(ctrl_marked))
+        n_bal_u = min(len(tr_unmarked), len(ctrl_unmarked))
+        n_bal = min(n_bal_m, n_bal_u)
+        tr_marked = tr_marked[:n_bal]
+        ctrl_marked = ctrl_marked[:n_bal]
+        tr_unmarked = tr_unmarked[:n_bal]
+        ctrl_unmarked = ctrl_unmarked[:n_bal]
 
     assert len(set(tr_marked).intersection(set(ctrl_marked))) == 0
     assert len(set(tr_unmarked).intersection(set(ctrl_unmarked))) == 0
     assert showcase_id in ctrl_marked
     assert showcase_id not in tr_marked
     return tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked
+
+MAX_FAILED_ATTEMPTS = 3
+SPLIT_LABELS_RU = {'TRAIN': 'Обучающая', 'CONTROL': 'Контрольная'}
+TYPE_LABELS_RU = {'MARKED': 'Отмеченная (KOI)', 'UNMARKED': 'Неотмеченная (Control)'}
+
+def shuffled_order(stars, seed):
+    order = list(stars)
+    np.random.RandomState(seed).shuffle(order)
+    return order
+
+def plan_group_map(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked):
+    group_map = {}
+    for lst, st_type, split in ((tr_marked, 'MARKED', 'TRAIN'), (ctrl_marked, 'MARKED', 'CONTROL'), (tr_unmarked, 'UNMARKED', 'TRAIN'), (ctrl_unmarked, 'UNMARKED', 'CONTROL')):
+        for sid in lst:
+            group_map[str(sid)] = (st_type, split)
+    return group_map
+
+def annotate_failed_table(failed_csv, group_map):
+    if not os.path.exists(failed_csv) or os.path.getsize(failed_csv) == 0:
+        return 0
+    df = pd.read_csv(failed_csv, dtype={'target_id': str, 'star_type': str, 'split': str})
+    for col in ('star_type', 'split'):
+        if col not in df.columns:
+            df[col] = 'UNKNOWN'
+        df[col] = df[col].fillna('UNKNOWN')
+    n_set = 0
+    for i, tid in enumerate(df['target_id'].astype(str)):
+        if tid in group_map:
+            st_type, split = group_map[tid]
+            if df.at[i, 'star_type'] != st_type or df.at[i, 'split'] != split:
+                df.at[i, 'star_type'] = st_type
+                df.at[i, 'split'] = split
+                n_set += 1
+    if n_set > 0:
+        df.to_csv(failed_csv, index=False, encoding='utf-8')
+    return n_set
+
+def stars_done_for_run(features_csv, diag_csv, failed_csv, max_attempts=MAX_FAILED_ATTEMPTS):
+    done = set()
+    if os.path.exists(features_csv) and os.path.getsize(features_csv) > 0:
+        try:
+            done.update(pd.read_csv(features_csv, usecols=['target_id'], dtype=str)['target_id'].dropna().astype(str).unique())
+        except Exception:
+            pass
+    if os.path.exists(diag_csv) and os.path.getsize(diag_csv) > 0:
+        try:
+            df_d = pd.read_csv(diag_csv, dtype={'target_id': str})
+            done.update(df_d[df_d['status'] == 'OK']['target_id'].dropna().astype(str).unique())
+        except Exception:
+            pass
+    if os.path.exists(failed_csv) and os.path.getsize(failed_csv) > 0:
+        try:
+            df_f = pd.read_csv(failed_csv, dtype={'target_id': str})
+            if 'attempts' not in df_f.columns:
+                df_f['attempts'] = 1
+            df_f['attempts'] = pd.to_numeric(df_f['attempts'], errors='coerce').fillna(1)
+            best = df_f.groupby('target_id')['attempts'].max()
+            done.update(str(t) for t, a in best.items() if a >= max_attempts)
+        except Exception:
+            pass
+    return done
+
+def finalize_groups(tr_m, ctrl_m, tr_u, ctrl_u, processed_ids, showcase_id, balance=False):
+    s_tr_m = [s for s in tr_m if s in processed_ids]
+    s_ctrl_m = [s for s in ctrl_m if s in processed_ids]
+    s_tr_u = [s for s in tr_u if s in processed_ids]
+    s_ctrl_u = [s for s in ctrl_u if s in processed_ids]
+    if balance:
+        n_bal = min(len(s_tr_m), len(s_ctrl_m), len(s_tr_u), len(s_ctrl_u))
+        rest_m = [s for s in s_ctrl_m if s != showcase_id]
+        if showcase_id in s_ctrl_m:
+            f_ctrl_m = [showcase_id] + rest_m[:max(0, n_bal - 1)]
+        else:
+            f_ctrl_m = rest_m[:n_bal]
+        f_tr_m = s_tr_m[:n_bal]
+        f_tr_u = s_tr_u[:n_bal]
+        f_ctrl_u = s_ctrl_u[:n_bal]
+    else:
+        f_tr_m, f_ctrl_m, f_tr_u, f_ctrl_u = s_tr_m, s_ctrl_m, s_tr_u, s_ctrl_u
+    kept = set(f_tr_m) | set(f_ctrl_m) | set(f_tr_u) | set(f_ctrl_u)
+    dropped = [s for s in s_tr_m + s_ctrl_m + s_tr_u + s_ctrl_u if s not in kept]
+    return {'tr_m': f_tr_m, 'ctrl_m': f_ctrl_m, 'tr_u': f_tr_u, 'ctrl_u': f_ctrl_u, 'dropped': dropped,
+            'succ': {'tr_m': s_tr_m, 'ctrl_m': s_ctrl_m, 'tr_u': s_tr_u, 'ctrl_u': s_ctrl_u}}
+
+def load_report_plan(out_dir, file_suffix, star_prim):
+    split_path = os.path.join(out_dir, f"demo_stars_split{file_suffix}.csv")
+    failed_path = os.path.join(out_dir, f"features_demo{file_suffix}_failed.csv")
+    targets_path = os.path.join(out_dir, f"targets_demo{file_suffix}.txt")
+    groups = {'tr_m': [], 'ctrl_m': [], 'tr_u': [], 'ctrl_u': []}
+    seen = set()
+    def add(sid, st_type, split):
+        if sid in seen:
+            return
+        key = ('tr' if split == 'TRAIN' else 'ctrl') + ('_m' if st_type == 'MARKED' else '_u')
+        groups[key].append(sid)
+        seen.add(sid)
+    if os.path.exists(split_path) and os.path.getsize(split_path) > 0:
+        df_sp = pd.read_csv(split_path, dtype={'target_id': str})
+        for r in df_sp.to_dict('records'):
+            add(str(r['target_id']), str(r['star_type']), str(r['split']))
+    failed_ids = []
+    if os.path.exists(failed_path) and os.path.getsize(failed_path) > 0:
+        df_fl = pd.read_csv(failed_path, dtype={'target_id': str, 'star_type': str, 'split': str})
+        for r in df_fl.to_dict('records'):
+            sid = str(r['target_id'])
+            failed_ids.append(sid)
+            if str(r.get('star_type')) in ('MARKED', 'UNMARKED') and str(r.get('split')) in ('TRAIN', 'CONTROL'):
+                add(sid, str(r['star_type']), str(r['split']))
+    planned = []
+    if os.path.exists(targets_path):
+        with open(targets_path, 'r', encoding='utf-8') as fh:
+            planned = [ln.strip() for ln in fh if ln.strip()]
+    for sid in groups['tr_m'] + groups['ctrl_m'] + groups['tr_u'] + groups['ctrl_u'] + failed_ids:
+        if sid not in planned:
+            planned.append(sid)
+    marked_ids = [s for s in planned if s in set(groups['tr_m'] + groups['ctrl_m']) or (s not in seen and s in star_prim)]
+    unmarked_ids = [s for s in planned if s not in set(marked_ids)]
+    return groups, planned, marked_ids, unmarked_ids
 
 def apply_log1p(X):
     return np.log1p(np.maximum(X, 0))
@@ -610,6 +726,9 @@ def main():
     parser.add_argument('--max-signals', type=int, default=4)
     parser.add_argument('--star-timeout', type=float, default=1800.0)
     parser.add_argument('--min-free-gb', type=float, default=5.0)
+    parser.add_argument('--report-only', action='store_true', help='Rebuild the report and tables from existing feature and split files; no extraction, retries or downloads.')
+    parser.add_argument('--allow-legacy', action='store_true', help='Resume extraction into a features file whose pipeline_version differs or is missing, with a warning.')
+    parser.add_argument('--balance-halves', action='store_true', help='Trim the four star groups to the size of the smallest one (previous behaviour).')
     parser.add_argument('--verbose', action='store_true', help='Print detailed output to the console instead of the progress bar.')
     args = parser.parse_args()
     global _console, _logger, _verbose
@@ -634,6 +753,7 @@ def main():
     os.makedirs(os.path.join(out_dir, 'figures'), exist_ok=True)
 
     file_suffix = '_quick' if args.quick else ''
+    out_suffix = file_suffix + ('_report' if args.report_only else '')
     emit(f"=== Project Onyx: Demonstration Pipeline (Mode Demo) ===")
     emit(f"Config: marked_stars={args.marked_stars}, unmarked_stars={args.unmarked_stars}, quick={args.quick}, seed={args.seed}, showcase={args.showcase_star}")
     emit(f"Output directory: {out_dir}")
@@ -648,102 +768,115 @@ def main():
     phase('selecting marked and unmarked stars')
 
     labels_path = os.path.join('data', 'labels', 'kepler_labels.csv')
+    if not os.path.exists(labels_path) and args.report_only:
+        emit(f"Ошибка: в режиме --report-only нужен локальный файл меток {labels_path}.")
+        sys.exit(1)
     if not os.path.exists(labels_path):
         extractor_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), '1_data_extractor.py')
         run_child([sys.executable, extractor_script, '--mission', 'Kepler', '--limit', '1', '--cache-dir', args.cache_dir], check=False)
     labels_df = pd.read_csv(labels_path, dtype={'target_id': str})
 
-    marked_ids, star_prim = get_marked_stars(labels_df, args.marked_stars, args.seed, args.showcase_star)
-    stellar_cache = os.path.join('data', 'labels', 'kepler_stellar_cache.csv')
-    marked_info = fetch_stellar_params(marked_ids, stellar_cache)
+    if args.report_only:
+        _, star_prim = get_marked_stars(labels_df, 1, args.seed, args.showcase_star)
+        report_groups, all_selected_stars, marked_ids, unmarked_ids = load_report_plan(out_dir, file_suffix, star_prim)
+        tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked = report_groups['tr_m'], report_groups['ctrl_m'], report_groups['tr_u'], report_groups['ctrl_u']
+        planned_order = list(all_selected_stars)
+        comp_table = None
+        ks_table = None
+        emit("Режим --report-only: выбор звёзд и таблицы баланса выборки пропущены, план взят из файлов разбиения и сбоев.")
+    else:
+        marked_ids, star_prim = get_marked_stars(labels_df, args.marked_stars, args.seed, args.showcase_star)
+        stellar_cache = os.path.join('data', 'labels', 'kepler_stellar_cache.csv')
+        marked_info = fetch_stellar_params(marked_ids, stellar_cache)
 
-    unmarked_pool_file = os.path.join('data', 'labels', 'kepler_stellar_unmarked_pool.csv')
-    pool_df = get_unmarked_pool(labels_df, unmarked_pool_file, args.unmarked_file)
-    unmarked_ids, unmarked_info = match_unmarked_stars(marked_ids, marked_info, pool_df, args.unmarked_stars, args.seed, labels_df=labels_df)
+        unmarked_pool_file = os.path.join('data', 'labels', 'kepler_stellar_unmarked_pool.csv')
+        pool_df = get_unmarked_pool(labels_df, unmarked_pool_file, args.unmarked_file)
+        unmarked_ids, unmarked_info = match_unmarked_stars(marked_ids, marked_info, pool_df, args.unmarked_stars, args.seed, labels_df=labels_df)
 
-    phase('checking sample balance')
-    stats_m = compute_group_stats(marked_info)
-    stats_u = compute_group_stats(unmarked_info)
-    comp_table = pd.DataFrame([
-        {'Группа': 'Отмеченные (KOI)', 'Звёзд': stats_m['count'], 'Kepmag (среднее)': f"{stats_m['mag_mean']:.2f} ± {stats_m['mag_std']:.2f}", 'Kepmag (медиана)': f"{stats_m['mag_median']:.2f}", 'Кварталов (среднее)': f"{stats_m['q_mean']:.1f}", 'Кварталов (медиана)': f"{stats_m['q_median']:.0f}"},
-        {'Группа': 'Неотмеченные (Control)', 'Звёзд': stats_u['count'], 'Kepmag (среднее)': f"{stats_u['mag_mean']:.2f} ± {stats_u['mag_std']:.2f}", 'Kepmag (медиана)': f"{stats_u['mag_median']:.2f}", 'Кварталов (среднее)': f"{stats_u['q_mean']:.1f}", 'Кварталов (медиана)': f"{stats_u['q_median']:.0f}"}
-    ])
-    emit("\nТаблица сравнения распределений звёздных параметров:", show=False)
-    emit(comp_table.to_string(index=False), show=False)
+        phase('checking sample balance')
+        stats_m = compute_group_stats(marked_info)
+        stats_u = compute_group_stats(unmarked_info)
+        comp_table = pd.DataFrame([
+            {'Группа': 'Отмеченные (KOI)', 'Звёзд': stats_m['count'], 'Kepmag (среднее)': f"{stats_m['mag_mean']:.2f} ± {stats_m['mag_std']:.2f}", 'Kepmag (медиана)': f"{stats_m['mag_median']:.2f}", 'Кварталов (среднее)': f"{stats_m['q_mean']:.1f}", 'Кварталов (медиана)': f"{stats_m['q_median']:.0f}"},
+            {'Группа': 'Неотмеченные (Control)', 'Звёзд': stats_u['count'], 'Kepmag (среднее)': f"{stats_u['mag_mean']:.2f} ± {stats_u['mag_std']:.2f}", 'Kepmag (медиана)': f"{stats_u['mag_median']:.2f}", 'Кварталов (среднее)': f"{stats_u['q_mean']:.1f}", 'Кварталов (медиана)': f"{stats_u['q_median']:.0f}"}
+        ])
+        emit("\nТаблица сравнения распределений звёздных параметров:", show=False)
+        emit(comp_table.to_string(index=False), show=False)
 
-    marked_kic = [int(s) for s in marked_ids if str(s).isdigit()]
-    unmarked_kic = [int(s) for s in unmarked_ids if str(s).isdigit()]
-    ks_kic = ks_2samp(marked_kic, unmarked_kic)
+        marked_kic = [int(s) for s in marked_ids if str(s).isdigit()]
+        unmarked_kic = [int(s) for s in unmarked_ids if str(s).isdigit()]
+        ks_kic = ks_2samp(marked_kic, unmarked_kic)
 
-    m_mags = [marked_info[s][0] for s in marked_ids if s in marked_info]
-    u_mags = [unmarked_info[s][0] for s in unmarked_ids if s in unmarked_info]
-    ks_mag = ks_2samp(m_mags, u_mags)
+        m_mags = [marked_info[s][0] for s in marked_ids if s in marked_info]
+        u_mags = [unmarked_info[s][0] for s in unmarked_ids if s in unmarked_info]
+        ks_mag = ks_2samp(m_mags, u_mags)
 
-    m_qs = [marked_info[s][1] for s in marked_ids if s in marked_info]
-    u_qs = [unmarked_info[s][1] for s in unmarked_ids if s in unmarked_info]
-    ks_q = ks_2samp(m_qs, u_qs)
+        m_qs = [marked_info[s][1] for s in marked_ids if s in marked_info]
+        u_qs = [unmarked_info[s][1] for s in unmarked_ids if s in unmarked_info]
+        ks_q = ks_2samp(m_qs, u_qs)
 
-    ks_table = pd.DataFrame([
-        {
-            'Параметр': 'KIC-номер',
-            'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(marked_kic)} / {int(np.percentile(marked_kic, 25))} / {int(np.median(marked_kic))} / {int(np.percentile(marked_kic, 75))} / {np.max(marked_kic)}",
-            'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(unmarked_kic)} / {int(np.percentile(unmarked_kic, 25))} / {int(np.median(unmarked_kic))} / {int(np.percentile(unmarked_kic, 75))} / {np.max(unmarked_kic)}",
-            'Статистика KS (D)': f"{ks_kic.statistic:.3f}",
-            'p-значение': f"{ks_kic.pvalue:.4f}"
-        },
-        {
-            'Параметр': 'Яркость (kepmag)',
-            'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(m_mags):.2f} / {np.percentile(m_mags, 25):.2f} / {np.median(m_mags):.2f} / {np.percentile(m_mags, 75):.2f} / {np.max(m_mags):.2f}",
-            'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(u_mags):.2f} / {np.percentile(u_mags, 25):.2f} / {np.median(u_mags):.2f} / {np.percentile(u_mags, 75):.2f} / {np.max(u_mags):.2f}",
-            'Статистика KS (D)': f"{ks_mag.statistic:.3f}",
-            'p-значение': f"{ks_mag.pvalue:.4f}"
-        },
-        {
-            'Параметр': 'Кварталов (quarters)',
-            'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(m_qs)} / {int(np.percentile(m_qs, 25))} / {int(np.median(m_qs))} / {int(np.percentile(m_qs, 75))} / {np.max(m_qs)}",
-            'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(u_qs)} / {int(np.percentile(u_qs, 25))} / {int(np.median(u_qs))} / {int(np.percentile(u_qs, 75))} / {np.max(u_qs)}",
-            'Статистика KS (D)': f"{ks_q.statistic:.3f}",
-            'p-значение': f"{ks_q.pvalue:.4f}"
-        }
-    ])
-    emit("\nРезультаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):", show=False)
-    emit(ks_table.to_string(index=False), show=False)
+        ks_table = pd.DataFrame([
+            {
+                'Параметр': 'KIC-номер',
+                'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(marked_kic)} / {int(np.percentile(marked_kic, 25))} / {int(np.median(marked_kic))} / {int(np.percentile(marked_kic, 75))} / {np.max(marked_kic)}",
+                'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(unmarked_kic)} / {int(np.percentile(unmarked_kic, 25))} / {int(np.median(unmarked_kic))} / {int(np.percentile(unmarked_kic, 75))} / {np.max(unmarked_kic)}",
+                'Статистика KS (D)': f"{ks_kic.statistic:.3f}",
+                'p-значение': f"{ks_kic.pvalue:.4f}"
+            },
+            {
+                'Параметр': 'Яркость (kepmag)',
+                'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(m_mags):.2f} / {np.percentile(m_mags, 25):.2f} / {np.median(m_mags):.2f} / {np.percentile(m_mags, 75):.2f} / {np.max(m_mags):.2f}",
+                'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(u_mags):.2f} / {np.percentile(u_mags, 25):.2f} / {np.median(u_mags):.2f} / {np.percentile(u_mags, 75):.2f} / {np.max(u_mags):.2f}",
+                'Статистика KS (D)': f"{ks_mag.statistic:.3f}",
+                'p-значение': f"{ks_mag.pvalue:.4f}"
+            },
+            {
+                'Параметр': 'Кварталов (quarters)',
+                'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(m_qs)} / {int(np.percentile(m_qs, 25))} / {int(np.median(m_qs))} / {int(np.percentile(m_qs, 75))} / {np.max(m_qs)}",
+                'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(u_qs)} / {int(np.percentile(u_qs, 25))} / {int(np.median(u_qs))} / {int(np.percentile(u_qs, 75))} / {np.max(u_qs)}",
+                'Статистика KS (D)': f"{ks_q.statistic:.3f}",
+                'p-значение': f"{ks_q.pvalue:.4f}"
+            }
+        ])
+        emit("\nРезультаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):", show=False)
+        emit(ks_table.to_string(index=False), show=False)
 
-    tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked = split_stars(marked_ids, unmarked_ids, star_prim, args.showcase_star, args.seed)
-    all_selected_stars = tr_marked + ctrl_marked + tr_unmarked + ctrl_unmarked
-    targets_demo_file = os.path.join(out_dir, f"targets_demo{file_suffix}.txt")
-    with open(targets_demo_file, 'w', encoding='utf-8') as f:
-        for sid in all_selected_stars:
-            f.write(f"{sid}\n")
+        tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked = split_stars(marked_ids, unmarked_ids, star_prim, args.showcase_star, args.seed, balance=args.balance_halves)
+        planned_order = tr_marked + ctrl_marked + tr_unmarked + ctrl_unmarked
+        all_selected_stars = shuffled_order(planned_order, args.seed)
+        targets_demo_file = os.path.join(out_dir, f"targets_demo{file_suffix}.txt")
+        with open(targets_demo_file, 'w', encoding='utf-8') as f:
+            for sid in all_selected_stars:
+                f.write(f"{sid}\n")
 
     features_demo_csv = os.path.join(out_dir, f"features_demo{file_suffix}.csv")
     failed_csv = os.path.join(out_dir, f"features_demo{file_suffix}_failed.csv")
     diag_source_csv = os.path.join(out_dir, f"features_demo{file_suffix}_diagnostics.csv")
 
-    already_done_stars = set()
-    if os.path.exists(features_demo_csv) and os.path.getsize(features_demo_csv) > 0:
-        try:
-            df_existing = pd.read_csv(features_demo_csv, dtype={'target_id': str})
-            already_done_stars.update(df_existing['target_id'].dropna().astype(str).unique())
-        except Exception:
-            pass
-    if os.path.exists(diag_source_csv) and os.path.getsize(diag_source_csv) > 0:
-        try:
-            df_diag_ex = pd.read_csv(diag_source_csv, dtype={'target_id': str})
-            already_done_stars.update(df_diag_ex[df_diag_ex['status'] == 'OK']['target_id'].dropna().astype(str).unique())
-        except Exception:
-            pass
-    if os.path.exists(failed_csv) and os.path.getsize(failed_csv) > 0:
-        try:
-            df_failed_existing = pd.read_csv(failed_csv, dtype={'target_id': str})
-            already_done_stars.update(df_failed_existing['target_id'].dropna().astype(str).unique())
-        except Exception:
-            pass
-
-    targets_to_run = [sid for sid in all_selected_stars if sid not in already_done_stars]
-    emit(f"\nСостояние выборки перед извлечением: всего по плану {len(all_selected_stars)} звёзд, уже обработано ранее: {len(all_selected_stars) - len(targets_to_run)}, осталось обработать: {len(targets_to_run)}")
+    pipeline_ver = build_pipeline_version(args.quick, args.flatten_days, args.max_signals)
+    report_version_note = ''
+    if args.report_only:
+        if os.path.exists(features_demo_csv):
+            ver_note = check_pipeline_version(features_demo_csv, pipeline_ver, report_only=True)
+            report_version_note = ver_note or ''
+            if ver_note:
+                emit(f"ВНИМАНИЕ: {ver_note}")
+        emit("Режим --report-only: извлечение признаков, повторы и скачивание не выполняются.")
+        targets_to_run = []
+    else:
+        annotate_failed_table(failed_csv, plan_group_map(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked))
+        already_done_stars = stars_done_for_run(features_demo_csv, diag_source_csv, failed_csv)
+        targets_to_run = [sid for sid in all_selected_stars if sid not in already_done_stars]
+        emit(f"\nСостояние выборки перед извлечением: всего по плану {len(all_selected_stars)} звёзд, уже обработано ранее: {len(all_selected_stars) - len(targets_to_run)}, осталось обработать: {len(targets_to_run)}")
 
     if len(targets_to_run) > 0:
+        try:
+            ver_note = check_pipeline_version(features_demo_csv, pipeline_ver, allow_legacy=args.allow_legacy)
+        except PipelineVersionError as ver_err:
+            emit(f"Ошибка: {ver_err}")
+            sys.exit(1)
+        if ver_note:
+            emit(f"ВНИМАНИЕ: {ver_note}")
         targets_run_file = os.path.join(out_dir, f"targets_to_run{file_suffix}.txt")
         with open(targets_run_file, 'w', encoding='utf-8') as f:
             for sid in targets_to_run:
@@ -767,9 +900,12 @@ def main():
             cmd_ext.append('--quick')
         if args.smoke_test:
             cmd_ext.append('--smoke-test')
+        if args.allow_legacy:
+            cmd_ext.append('--allow-legacy')
         emit(f"Запуск извлечения признаков для {len(targets_to_run)} звёзд...")
         phase('extracting features')
         run_child(cmd_ext, check=True)
+        annotate_failed_table(failed_csv, plan_group_map(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked))
 
     if not os.path.exists(features_demo_csv) or os.path.getsize(features_demo_csv) == 0:
         emit(f"Ошибка: файл признаков {features_demo_csv} пуст или не найден!")
@@ -817,26 +953,14 @@ def main():
     else:
         emit(f"\nЖёсткая проверка выборки УСПЕШНО пройдена: запланировано {len(all_selected_stars)}, успешно обработано {len(planned_ids.intersection(processed_ids))}, сбоев {len(planned_ids.intersection(failed_ids))}, расхождений 0.\n")
 
-    succ_tr_m = [s for s in tr_marked if s in processed_ids]
-    succ_ctrl_m = [s for s in ctrl_marked if s in processed_ids]
-    succ_tr_u = [s for s in tr_unmarked if s in processed_ids]
-    succ_ctrl_u = [s for s in ctrl_unmarked if s in processed_ids]
-
-    n_bal = min(len(succ_tr_m), len(succ_ctrl_m), len(succ_tr_u), len(succ_ctrl_u))
     showcase_id = str(args.showcase_star)
-
-    if showcase_id in succ_ctrl_m:
-        succ_ctrl_m.remove(showcase_id)
-        final_ctrl_m = [showcase_id] + succ_ctrl_m[:max(0, n_bal - 1)]
-    else:
-        final_ctrl_m = succ_ctrl_m[:n_bal]
-    final_tr_m = succ_tr_m[:n_bal]
-    final_tr_u = succ_tr_u[:n_bal]
-    final_ctrl_u = succ_ctrl_u[:n_bal]
-
-    total_dropped = (len(succ_tr_m) - len(final_tr_m)) + (len(succ_ctrl_m) - (len(final_ctrl_m) - (1 if showcase_id in final_ctrl_m else 0))) + (len(succ_tr_u) - len(final_tr_u)) + (len(succ_ctrl_u) - len(final_ctrl_u))
+    fin = finalize_groups(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked, processed_ids, showcase_id, balance=args.balance_halves)
+    final_tr_m, final_ctrl_m, final_tr_u, final_ctrl_u = fin['tr_m'], fin['ctrl_m'], fin['tr_u'], fin['ctrl_u']
+    succ_tr_m, succ_ctrl_m, succ_tr_u, succ_ctrl_u = fin['succ']['tr_m'], fin['succ']['ctrl_m'], fin['succ']['tr_u'], fin['succ']['ctrl_u']
+    dropped_balance = set(fin['dropped'])
+    total_dropped = len(dropped_balance)
     phase('splitting stars into halves')
-    emit(f"\nСбалансированное разбиение по звёздам (равные половины):")
+    emit(f"\n{'Сбалансированное разбиение по звёздам (равные половины, --balance-halves)' if args.balance_halves else 'Разбиение по звёздам (группы не усекаются)'}:")
     emit(f"  Обучающая часть: {len(final_tr_m)} отмеченных, {len(final_tr_u)} неотмеченных (Всего звёзд: {len(final_tr_m)+len(final_tr_u)})")
     emit(f"  Контрольная часть: {len(final_ctrl_m)} отмеченных (включая Kepler-80), {len(final_ctrl_u)} неотмеченных (Всего звёзд: {len(final_ctrl_m)+len(final_ctrl_u)})")
     if total_dropped > 0:
@@ -847,7 +971,8 @@ def main():
     for s in final_tr_u: split_records.append({'target_id': s, 'star_type': 'UNMARKED', 'split': 'TRAIN', 'primary_label': 'NONE'})
     for s in final_ctrl_m: split_records.append({'target_id': s, 'star_type': 'MARKED', 'split': 'CONTROL', 'primary_label': star_prim.get(s, 'NONE')})
     for s in final_ctrl_u: split_records.append({'target_id': s, 'star_type': 'UNMARKED', 'split': 'CONTROL', 'primary_label': 'NONE'})
-    pd.DataFrame(split_records).to_csv(os.path.join(out_dir, f"demo_stars_split{file_suffix}.csv"), index=False, encoding='utf-8')
+    if not args.report_only:
+        pd.DataFrame(split_records).to_csv(os.path.join(out_dir, f"demo_stars_split{file_suffix}.csv"), index=False, encoding='utf-8')
 
     diag_source_csv = os.path.join(out_dir, f"features_demo{file_suffix}_diagnostics.csv")
     diag_map = {}
@@ -861,7 +986,8 @@ def main():
 
     diag_rows_csv = []
     diag_rows_md = []
-    for sid in all_selected_stars:
+    group_map = plan_group_map(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked)
+    for sid in planned_order:
         is_m = (sid in marked_ids)
         st_type_str = 'Отмеченная (KOI)' if is_m else 'Неотмеченная (Control)'
         if sid in (final_tr_m + final_tr_u):
@@ -869,9 +995,11 @@ def main():
         elif sid in (final_ctrl_m + final_ctrl_u):
             split_str = 'Контрольная'
         else:
-            split_str = 'Отброшена для баланса'
+            split_str = 'Отброшена для баланса' if sid in dropped_balance else 'Вне половин (сбой или не обработана)'
 
         is_eb = 'ДА' if is_eclipsing_binary(sid, eb_stars_set) else 'НЕТ'
+        plan_type, plan_split = group_map.get(sid, ('MARKED' if is_m else 'UNMARKED', None))
+        plan_group_str = f"{TYPE_LABELS_RU[plan_type]} / {SPLIT_LABELS_RU.get(plan_split, 'не определена')}"
 
         d_info = diag_map.get(sid)
         if d_info is not None:
@@ -911,7 +1039,9 @@ def main():
         diag_rows_csv.append({
             'target_id': sid,
             'тип': st_type_str,
+            'плановая группа': plan_group_str,
             'половина': split_str,
+            'pipeline_version': str(d_info.get('pipeline_version', '')) if d_info is not None else '',
             'число файлов': nf,
             'число уникальных кварталов': nq,
             'базлайн в сутках': round(bd, 2),
@@ -945,7 +1075,7 @@ def main():
 
     df_diag_csv = pd.DataFrame(diag_rows_csv)
     df_diag_md = pd.DataFrame(diag_rows_md)
-    diag_csv_out = os.path.join(out_dir, f"diagnostics_stars{file_suffix}.csv")
+    diag_csv_out = os.path.join(out_dir, f"diagnostics_stars{out_suffix}.csv")
     df_diag_csv.to_csv(diag_csv_out, index=False, encoding='utf-8')
 
     df_features['target_bin'] = df_features['label'].apply(lambda x: 1 if str(x).upper() in ['CONFIRMED', 'CANDIDATE'] else 0)
@@ -1186,8 +1316,8 @@ def main():
     control_table = ctrl_pred[[c for c in out_table_cols if c in ctrl_pred]].copy()
     control_table.rename(columns={'bls_period_d': 'period_d', 'bls_depth_ppm': 'depth_ppm', 'label': 'catalog_label'}, inplace=True)
     control_table['catalog_label'] = control_table['catalog_label'].fillna('NONE')
-    ctrl_csv_out = os.path.join(out_dir, f"control_signals{file_suffix}.csv")
-    ctrl_md_out = os.path.join(out_dir, f"control_signals{file_suffix}.md")
+    ctrl_csv_out = os.path.join(out_dir, f"control_signals{out_suffix}.csv")
+    ctrl_md_out = os.path.join(out_dir, f"control_signals{out_suffix}.md")
     control_table.to_csv(ctrl_csv_out, index=False, encoding='utf-8')
     with open(ctrl_md_out, 'w', encoding='utf-8') as f:
         f.write(df_to_markdown(control_table) + "\n")
@@ -1230,7 +1360,7 @@ def main():
                 'причина подозрения': '; '.join(suspect_reason)
             })
     df_suspects = pd.DataFrame(suspect_rows)
-    suspects_csv_out = os.path.join(out_dir, f"suspects{file_suffix}.csv")
+    suspects_csv_out = os.path.join(out_dir, f"suspects{out_suffix}.csv")
     df_suspects.to_csv(suspects_csv_out, index=False, encoding='utf-8')
 
     df_features['is_artifact'] = (df_features['match_status'] == 'UNMATCHED') & ((df_features['bls_period_d'] >= 90.0) | (df_features['bls_depth_snr'] > 100.0))
@@ -1280,7 +1410,16 @@ def main():
 
     showcase_signals = ctrl_pred[ctrl_pred['target_id'] == showcase_id].copy()
     showcase_plot_path = os.path.join(out_dir, f"showcase_kepler80{file_suffix}.png")
-    showcase_n_files, showcase_quarters, showcase_baseline, showcase_bjd_min, showcase_bjd_max = generate_showcase_figure(showcase_id, showcase_signals, showcase_plot_path, args.quick, cache_dir=args.cache_dir)
+    showcase_skipped_note = ''
+    if args.report_only:
+        showcase_n_files, showcase_quarters, showcase_baseline, showcase_bjd_min, showcase_bjd_max = 0, 0, 0.0, 0.0, 0.0
+        if os.path.exists(showcase_plot_path):
+            showcase_skipped_note = f"Режим --report-only: витрина Kepler-80 не перестраивалась (для неё нужна загрузка кривой блеска); использован ранее созданный файл `{showcase_plot_path}`."
+        else:
+            showcase_skipped_note = "Режим --report-only: витрина Kepler-80 пропущена, так как локального кэша кривой блеска и готового рисунка нет, а для построения нужна загрузка."
+        emit(showcase_skipped_note)
+    else:
+        showcase_n_files, showcase_quarters, showcase_baseline, showcase_bjd_min, showcase_bjd_max = generate_showcase_figure(showcase_id, showcase_signals, showcase_plot_path, args.quick, cache_dir=args.cache_dir)
 
     known_planets = [
         {'planet': 'Kepler-80 b', 'koi': 'KOI-500.01', 'period_d': 7.053527},
@@ -1339,7 +1478,7 @@ def main():
     hashes_after = compute_immutability_hashes('outputs')
     hash_match = (hashes_before == hashes_after)
 
-    summary_md_path = os.path.join(out_dir, f"summary{file_suffix}.md")
+    summary_md_path = os.path.join(out_dir, f"summary{out_suffix}.md")
     h1 = chr(35) + " "
     h2 = chr(35) * 2 + " "
     h3 = chr(35) * 3 + " "
@@ -1354,7 +1493,13 @@ def main():
         f.write(f"* **Параметры классификации и фильтрации:** `--target-precision = {args.target_precision:.2f}`, `--min-depth-ppm = {args.min_depth_ppm:.1f}`\n")
         f.write(f"* **Случайный seed:** `{args.seed}`\n")
         f.write(f"* **Показательная система:** Kepler-80 (KIC {args.showcase_star}, статус CONFIRMED, 5 планет)\n")
-        f.write(f"* **Выходная директория:** `{out_dir}`\n\n")
+        f.write(f"* **Выходная директория:** `{out_dir}`\n")
+        f.write(f"* **Версия конвейера (pipeline_version):** `{pipeline_ver}`\n")
+        if args.report_only:
+            f.write("* **Режим `--report-only`:** отчёт пересобран по готовым файлам признаков и разбиения; извлечение, повторные попытки и скачивание не выполнялись.\n")
+            if report_version_note:
+                f.write(f"  * Предупреждение о pipeline_version: {report_version_note}\n")
+        f.write("\n")
 
         f.write(f"{h2}2. Состав выборки и балансировка звёздных параметров\n")
         f.write(f"Выборка неотмеченных звёзд сформирована со стратификацией по 10 децилям KIC-номеров отмеченных звёзд для обеспечения пространственной равномерности по всему полю Kepler, с жадным подбором распределений яркости (`kepmag`) и числа кварталов (`quarters`).\n\n")
@@ -1363,7 +1508,10 @@ def main():
         f.write(f"  * Неотмеченные звёзды (Control): план **{args.unmarked_stars}**, успешно обработано **{len(succ_tr_u) + len(succ_ctrl_u)}**, с ошибками в `_failed.csv`: **{len(failed_u_in_plan)}**\n")
         f.write(f"  * Обучающая половина: **{len(final_tr_m)}** отмеченных + **{len(final_tr_u)}** неотмеченных звёзд\n")
         f.write(f"  * Контрольная половина: **{len(final_ctrl_m)}** отмеченных (включая Kepler-80) + **{len(final_ctrl_u)}** неотмеченных звёзд\n")
-        f.write(f"  * Отброшено звёзд для поддержания строгого равенства половин: **{total_dropped}**\n")
+        if args.balance_halves:
+            f.write(f"  * Отброшено звёзд для поддержания строгого равенства половин (`--balance-halves`): **{total_dropped}**\n")
+        else:
+            f.write("  * Группы не усекаются до размера наименьшей (флаг `--balance-halves` не задан); звёзды со сбоем не уменьшают остальные группы\n")
         f.write(f"* **Временные затраты прогона:**\n")
         f.write(f"  * Астрономическое время запуска (Wall-clock time): **{total_wall_s:.1f} с** ({total_wall_s / 60.0:.2f} мин)\n")
         f.write(f"  * Суммарное процессорное время обработки звёзд: **{sum_star_total_s:.1f} с** ({sum_star_total_s / 60.0:.2f} мин)\n")
@@ -1383,12 +1531,15 @@ def main():
                 })
             f.write(df_to_markdown(pd.DataFrame(failed_table_rows)) + "\n\n")
 
-        f.write(f"{h3}Сравнение распределений яркости и наблюдаемости:\n\n")
-        f.write(df_to_markdown(comp_table) + "\n\n")
+        if comp_table is not None and ks_table is not None:
+            f.write(f"{h3}Сравнение распределений яркости и наблюдаемости:\n\n")
+            f.write(df_to_markdown(comp_table) + "\n\n")
 
-        f.write(f"{h3}Результаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):\n\n")
-        f.write(df_to_markdown(ks_table) + "\n\n")
+            f.write(f"{h3}Результаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):\n\n")
+            f.write(df_to_markdown(ks_table) + "\n\n")
 
+        else:
+            f.write("Таблицы сравнения распределений и критерия Колмогорова-Смирнова пропущены: режим `--report-only` не повторяет выбор звёзд и не обращается к сети.\n\n")
         f.write(f"{h2}2.1. Диагностика обнаружения периодических сигналов по каждой звезде\n")
         f.write(f"В таблице ниже приведены детальные результаты фотометрической обработки и поиска сигналов алгоритмом Box Least Squares (BLS) для каждой звезды выборки.\n\n")
         f.write(df_to_markdown(df_diag_md) + "\n\n")
@@ -1511,7 +1662,10 @@ def main():
             f.write("* Модельная оценка вероятностей пропущена, так как классификатор машинного обучения не обучался из-за малого числа размеченных сигналов (< 5 на класс).\n\n")
 
         f.write(f"{h2}5. Результаты по витринной системе Kepler-80 (KIC {showcase_id})\n")
-        f.write(f"Для витринной системы Kepler-80 загружено {showcase_n_files} файлов ({showcase_quarters} уникальных кварталов Kepler, базлайн: {showcase_baseline:.1f} суток, диапазон BJD {showcase_bjd_min:.1f} – {showcase_bjd_max:.1f}). Система содержит 5 известных подтверждённых планет в резонансной цепочке периодов. Графическая панель сохранена в файл `{showcase_plot_path}`.\n\n")
+        if showcase_skipped_note:
+            f.write(showcase_skipped_note + "\n\n")
+        else:
+            f.write(f"Для витринной системы Kepler-80 загружено {showcase_n_files} файлов ({showcase_quarters} уникальных кварталов Kepler, базлайн: {showcase_baseline:.1f} суток, диапазон BJD {showcase_bjd_min:.1f} – {showcase_bjd_max:.1f}). Система содержит 5 известных подтверждённых планет в резонансной цепочке периодов. Графическая панель сохранена в файл `{showcase_plot_path}`.\n\n")
         f.write(df_to_markdown(df_k80_rec) + "\n\n")
         f.write(f"* **Итог валидации Kepler-80:** **{k80_summary_str}** (найдено точно: {n_exact}, по гармонике: {n_harmonic}, не найдено: {n_not_found}).\n")
         if n_exact + n_harmonic < 5:

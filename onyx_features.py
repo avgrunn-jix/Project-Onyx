@@ -1,3 +1,9 @@
+import os
+
+import pandas as pd
+
+PIPELINE_VERSION = '2'
+
 EXCLUDE_COLS = [
     'signal_id',
     'target_id',
@@ -12,6 +18,7 @@ EXCLUDE_COLS = [
     'koi_fpflag_ec',
     'p_candidate',
     'n_signals_star',
+    'pipeline_version',
 ]
 
 COVERAGE_COLS = [
@@ -53,3 +60,39 @@ def compute_feature_columns(df_or_cols, exclude_coverage=False, other_cols=None,
             continue
         result.append(c)
     return result
+
+
+class PipelineVersionError(RuntimeError):
+    pass
+
+
+def build_pipeline_version(quick, flatten_days, max_signals):
+    return f"{PIPELINE_VERSION}|quick={int(bool(quick))}|flatten_days={float(flatten_days):g}|max_signals={int(max_signals)}"
+
+
+def read_pipeline_versions(path):
+    header = pd.read_csv(path, nrows=0)
+    if 'pipeline_version' not in header.columns:
+        return None
+    col = pd.read_csv(path, usecols=['pipeline_version'], dtype=str)['pipeline_version']
+    return sorted(set(col.dropna().astype(str)))
+
+
+def check_pipeline_version(path, expected, allow_legacy=False, report_only=False):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    found = read_pipeline_versions(path)
+    if found is not None and found == [expected]:
+        return None
+    if found is None:
+        what = 'has no pipeline_version column'
+    elif len(found) == 0:
+        what = 'has an empty pipeline_version column'
+    else:
+        what = 'has pipeline_version ' + ', '.join(found)
+    msg = f"Features file {path} {what}; current version is {expected}."
+    if report_only:
+        return msg + ' Report-only mode continues with these files as they are.'
+    if allow_legacy:
+        return msg + ' Continuing because --allow-legacy is set.'
+    raise PipelineVersionError(msg + ' Resuming would mix incompatible rows. Use --no-resume, a different --output, or --allow-legacy.')

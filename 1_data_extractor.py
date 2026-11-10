@@ -9,6 +9,7 @@ import time
 import warnings
 
 import onyx_console
+from onyx_features import PipelineVersionError, build_pipeline_version, check_pipeline_version
 onyx_console.setup_warnings()
 
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -24,6 +25,7 @@ import astropy.units as u
 import lightkurve as lk
 from astroquery.ipac.nexsci.nasa_exoplanet_archive import NasaExoplanetArchive
 import concurrent.futures
+import re
 
 warnings.filterwarnings('ignore')
 logging.getLogger('lightkurve').setLevel(logging.ERROR)
@@ -145,6 +147,113 @@ def init_worker(sem, clip_upward=None, resolve_aliases=None):
         CLIP_UPWARD_ONLY = bool(clip_upward)
     if resolve_aliases is not None:
         RESOLVE_ALIASES = bool(resolve_aliases)
+
+MAX_FAILED_ATTEMPTS = 3
+DISK_WAIT_MAX_S = 600.0
+DISK_WAIT_INTERVAL_S = 30.0
+EMERGENCY_TIMEOUT_FACTOR = 3.0
+FAILED_TABLE_COLS = ['target_id', 'star_type', 'split', 'stage', 'error', 'attempts']
+
+def wait_for_disk(min_free_gb, max_wait_s=None, interval_s=None, free_fn=None, sleep_fn=None, clock_fn=None):
+    max_wait_s = DISK_WAIT_MAX_S if max_wait_s is None else max_wait_s
+    interval_s = DISK_WAIT_INTERVAL_S if interval_s is None else interval_s
+    free_fn = free_fn or (lambda: shutil.disk_usage(os.path.abspath('.')).free)
+    sleep_fn = sleep_fn or time.sleep
+    clock_fn = clock_fn or time.time
+    need = min_free_gb * 1024**3
+    t0 = clock_fn()
+    while True:
+        if free_fn() >= need:
+            return True
+        waited = clock_fn() - t0
+        if waited >= max_wait_s:
+            return False
+        sleep_fn(min(interval_s, max(0.0, max_wait_s - waited)))
+
+def target_name_matches(tid, target_name):
+    want = re.findall(r'\d+', str(tid))
+    got = re.findall(r'\d+', str(target_name))
+    if not want or not got:
+        return False
+    return int(want[-1]) in {int(g) for g in got}
+
+def not_enough_points_message(n_files, n_raw, n_finite, n_clipped, min_points):
+    return f'Not enough valid points: files={n_files}, raw={n_raw}, finite={n_finite}, clipped={n_clipped}, min={min_points}'
+
+def classify_failure_stage(err):
+    low = str(err).lower()
+    if 'download' in low or 'search' in low:
+        return 'download'
+    if 'timeout' in low:
+        return 'timeout'
+    if 'stitch' in low or 'flatten' in low:
+        return 'stitch'
+    return 'features'
+
+def process_star_task(starts, *task):
+    t0 = time.time()
+    try:
+        starts[str(task[0])] = t0
+    except Exception:
+        pass
+    return t0, process_single_star(*task)
+
+def find_emergency_expired(active, starts, now, star_timeout, factor=None):
+    factor = EMERGENCY_TIMEOUT_FACTOR if factor is None else factor
+    limit = factor * star_timeout
+    expired = []
+    for f, (tid_str, submit_t) in list(active.items()):
+        started = starts.get(str(tid_str))
+        if started is not None and now - started > limit:
+            expired.append((f, tid_str, started))
+    return expired
+
+def failed_diag_row(tid_str, err, elapsed, pipeline_ver):
+    return {
+        'target_id': tid_str,
+        'pipeline_version': pipeline_ver,
+        'n_files': 0,
+        'n_quarters': 0,
+        'baseline_d': 0.0,
+        'signals_found': 0,
+        'matched_count': 0,
+        'harmonic_count': 0,
+        'unmatched_count': 0,
+        'status': f'FAILED: {err}',
+        'max_sde': 0.0,
+        'max_snr': 0.0,
+        'time_dl_s': 0.0,
+        'time_stitch_s': 0.0,
+        'time_bls_s': 0.0,
+        'time_feats_s': 0.0,
+        'time_total_s': round(elapsed, 2),
+        'alias_corrections': 0,
+        'alias_factors': ''
+    }
+
+def update_failed_table(path, recovered, updates):
+    rows = {}
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        df_old = pd.read_csv(path, dtype={'target_id': str, 'star_type': str, 'split': str, 'stage': str, 'error': str})
+        for rec in df_old.to_dict('records'):
+            rows[str(rec['target_id'])] = rec
+    for tid in recovered:
+        rows.pop(str(tid), None)
+    for tid, (err, stage, att) in updates.items():
+        base = rows.get(str(tid), {'target_id': str(tid), 'star_type': 'UNKNOWN', 'split': 'UNKNOWN'})
+        base['stage'] = str(stage)
+        base['error'] = str(err)
+        base['attempts'] = int(att)
+        rows[str(tid)] = base
+    if not rows:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    out = pd.DataFrame(list(rows.values()))
+    for c in FAILED_TABLE_COLS:
+        if c not in out.columns:
+            out[c] = 'UNKNOWN' if c in ('star_type', 'split') else ''
+    out[FAILED_TABLE_COLS].to_csv(path, index=False, encoding='utf-8')
 
 EXTRACTOR_LOG_PATH = os.path.join('logs', 'extractor_errors.log')
 
@@ -445,9 +554,9 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
 def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0, clip_upward=None, resolve_aliases=None):
     use_clip_upward = CLIP_UPWARD_ONLY if clip_upward is None else bool(clip_upward)
     use_resolve_aliases = RESOLVE_ALIASES if resolve_aliases is None else bool(resolve_aliases)
-    free_bytes = shutil.disk_usage(os.path.abspath('.')).free
-    if free_bytes < min_free_gb * 1024**3:
-        return None, None, tid, 'Disk space below threshold', 0, None
+    pipeline_ver = build_pipeline_version(quick_mode, flatten_days, max_signals)
+    if not wait_for_disk(min_free_gb):
+        return None, None, tid, f'Disk space below threshold (waited {DISK_WAIT_MAX_S:.0f}s)', 0, None
     start_t = time.time()
     deadline = start_t + star_timeout
     base_cache = cache_dir if cache_dir else tempfile.gettempdir()
@@ -478,8 +587,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             if len(search_result) == 0:
                 return None, None, tid, 'DownloadError: No lightcurves found', dl_size, None
             if mission == 'Kepler' and 'target_name' in search_result.table.colnames:
-                tid_digits = str(tid).lstrip('0')
-                target_mask = [tid_digits in str(t_name).lstrip('0') for t_name in search_result.table['target_name']]
+                target_mask = [target_name_matches(tid, t_name) for t_name in search_result.table['target_name']]
                 if any(target_mask):
                     search_result = search_result[target_mask]
             if max_sectors > 0 and len(search_result) > max_sectors:
@@ -532,9 +640,11 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         t_stitch_start = time.time()
         detrend_centroids(lc_col, flatten_days)
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
+        n_raw_points = len(lc)
+        n_finite_points = int(np.sum(np.isfinite(np.asarray(lc.flux.value, dtype=float))))
         lc = clip_outliers(lc.remove_nans(), upward_only=use_clip_upward)
         if len(lc) < 500:
-            return None, None, tid, 'Not enough valid points', dl_size, None
+            return None, None, tid, not_enough_points_message(n_files, n_raw_points, n_finite_points, len(lc), 500), dl_size, None
         times = np.asarray(lc.time.value, dtype=float)
         baseline_d = float(np.nanmax(times) - np.nanmin(times))
         if baseline_d <= 0:
@@ -722,7 +832,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             c_shift_col_sig, c_shift_row_sig, c_shift_tot_sig, c_shift_tot_arcsec = compute_centroid_shift(times_search, col_det, row_det, bls_period_d, bls_epoch, bls_duration_d, mission)
 
             feat = {
-                'signal_id': sig_id, 'target_id': tid, 'signal_index': rec_idx, 
+                'signal_id': sig_id, 'target_id': tid, 'signal_index': rec_idx, 'pipeline_version': pipeline_ver,
                 'mission': mission, 'label': match_label, 'match_status': match_status,
                 'bls_period_d': bls_period_d, 'bls_epoch': bls_epoch, 'bls_duration_d': bls_duration_d,
                 'bls_depth_ppm': bls_depth_ppm, 'bls_depth_snr': bls_depth_snr,
@@ -828,6 +938,7 @@ def main():
     parser.add_argument('--injection-output', default='outputs/injection_results.csv')
     parser.add_argument('--quick', action='store_true')
     parser.add_argument('--no-resume', action='store_true')
+    parser.add_argument('--allow-legacy', action='store_true', help='Resume into a features file whose pipeline_version differs or is missing, with a warning instead of stopping.')
     parser.add_argument('--star-timeout', type=float, default=1800.0)
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
     parser.add_argument('--max-sectors', type=int, default=0, help='[DEBUG ONLY] Limit the number of sectors/quarters downloaded. Warning: alters baseline, features, and detection results; not for production training.')
@@ -915,6 +1026,18 @@ def main():
             raise
         except Exception:
             pass
+
+    pipeline_ver = build_pipeline_version(args.quick, args.flatten_days, args.max_signals)
+    if resume and os.path.exists(args.output) and os.path.getsize(args.output) > 0 and not args.inject:
+        try:
+            ver_warn = check_pipeline_version(args.output, pipeline_ver, allow_legacy=args.allow_legacy)
+        except PipelineVersionError as ver_err:
+            logger.error(str(ver_err))
+            console.show(f"ERROR: {ver_err}")
+            sys.exit(1)
+        if ver_warn:
+            logger.warning(ver_warn)
+            console.show(f"WARNING: {ver_warn}")
 
     if not resume:
         if os.path.exists(args.output):
@@ -1148,7 +1271,7 @@ def main():
         tid_str = str(tid)
         if tid_str in processed_ids:
             continue
-        if tid_str in failed_attempts and failed_attempts[tid_str] >= 2:
+        if tid_str in failed_attempts and failed_attempts[tid_str] >= MAX_FAILED_ATTEMPTS:
             continue
         rows = labels_df[labels_df['target_id'] == tid_str].to_dict('records')
         tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout, args.max_sectors, CLIP_UPWARD_ONLY, RESOLVE_ALIASES))
@@ -1162,11 +1285,11 @@ def main():
     match_stats = {'MATCHED': 0, 'HARMONIC': 0, 'UNMATCHED': 0}
     npz_path = os.path.join(os.path.dirname(args.output) or base_outputs, 'folded_curves.npz')
 
-    logger.info(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= 2)} | To process: {total_tasks}")
+    logger.info(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= MAX_FAILED_ATTEMPTS)} | To process: {total_tasks}")
     if verbose:
-        print(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= 2)} | To process: {total_tasks}", flush=True)
+        print(f"Targets: {len(target_ids)} total | Already processed: {len(processed_ids)} | Failed (permanent): {sum(1 for v in failed_attempts.values() if v >= MAX_FAILED_ATTEMPTS)} | To process: {total_tasks}", flush=True)
     console.reset(total_tasks)
-    for hdr_line in header_lines(args, 'extract', len(target_ids), len(processed_ids), total_tasks, sum(1 for v in failed_attempts.values() if v >= 2)):
+    for hdr_line in header_lines(args, 'extract', len(target_ids), len(processed_ids), total_tasks, sum(1 for v in failed_attempts.values() if v >= MAX_FAILED_ATTEMPTS)):
         console.show(hdr_line)
     console.set_status('extracting')
     if total_tasks > 0:
@@ -1175,13 +1298,15 @@ def main():
     import multiprocessing
     mgr = multiprocessing.Manager()
     dl_sem = mgr.Semaphore(args.max_download_workers)
+    star_starts = mgr.dict()
+    failure_info = {}
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(dl_sem, CLIP_UPWARD_ONLY, RESOLVE_ALIASES)) as executor:
         task_iter = iter(tasks)
         active_futures = {}
         for _ in range(min(args.workers * 2, total_tasks)):
             try:
                 t = next(task_iter)
-                f = executor.submit(process_single_star, *t)
+                f = executor.submit(process_star_task, star_starts, *t)
                 active_futures[f] = (t[0], time.time())
             except StopIteration:
                 break
@@ -1190,43 +1315,26 @@ def main():
             done, _ = concurrent.futures.wait(active_futures.keys(), timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
             now = time.time()
             for f in done:
-                tid_str, start_t = active_futures.pop(f)
-                elapsed = now - start_t
-                durations.append(elapsed)
-                completed_stars += 1
+                tid_str, submit_t = active_futures.pop(f)
+                worker_start = star_starts.pop(str(tid_str), None)
                 try:
-                    feats, curves, r_tid, err, dl_size, timings = f.result()
+                    worker_start, star_res = f.result()
+                    feats, curves, r_tid, err, dl_size, timings = star_res
                 except Exception as exc:
                     err = f"{type(exc).__name__}: {str(exc)}"
                     feats, curves, dl_size, timings = None, None, 0, None
+                elapsed = now - (worker_start if worker_start is not None else submit_t)
+                durations.append(elapsed)
+                completed_stars += 1
 
                 if err:
                     logger.error(f"Error on {tid_str}: {err}")
                     console.show(f"  failed {tid_str}: {onyx_console.short_error(err)}")
-                    stage = 'download' if 'download' in err.lower() or 'search' in err.lower() else ('timeout' if 'timeout' in err.lower() else ('stitch' if 'stitch' in err.lower() or 'flatten' in err.lower() else 'features'))
+                    stage = classify_failure_stage(err)
                     log_failure(failed_csv, tid_str, err, failed_attempts, stage=stage)
+                    failure_info[tid_str] = (err, stage)
                     skip_count += 1
-                    diag_row = {
-                        'target_id': tid_str,
-                        'n_files': 0,
-                        'n_quarters': 0,
-                        'baseline_d': 0.0,
-                        'signals_found': 0,
-                        'matched_count': 0,
-                        'harmonic_count': 0,
-                        'unmatched_count': 0,
-                        'status': f'FAILED: {err}',
-                        'max_sde': 0.0,
-                        'max_snr': 0.0,
-                        'time_dl_s': 0.0,
-                        'time_stitch_s': 0.0,
-                        'time_bls_s': 0.0,
-                        'time_feats_s': 0.0,
-                        'time_total_s': round(elapsed, 2),
-                        'alias_corrections': 0,
-                        'alias_factors': ''
-                    }
-                    append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
+                    append_to_csv_flush(diag_csv, pd.DataFrame([failed_diag_row(tid_str, err, elapsed, pipeline_ver)]))
                 else:
                     success_count += 1
                     n_f = timings.get('n_files', 0) if timings else 0
@@ -1241,6 +1349,7 @@ def main():
                     m_snr = max([d.get('snr', 0.0) for d in b_details]) if b_details else 0.0
                     diag_row = {
                         'target_id': tid_str,
+                        'pipeline_version': pipeline_ver,
                         'n_files': n_f,
                         'n_quarters': n_q,
                         'baseline_d': round(b_d, 2),
@@ -1297,61 +1406,42 @@ def main():
 
                 try:
                     next_t = next(task_iter)
-                    next_f = executor.submit(process_single_star, *next_t)
+                    next_f = executor.submit(process_star_task, star_starts, *next_t)
                     active_futures[next_f] = (next_t[0], time.time())
                 except StopIteration:
                     pass
 
-            for f, (tid_str, start_t) in list(active_futures.items()):
-                if now - start_t > args.star_timeout:
-                    active_futures.pop(f)
-                    f.cancel()
-                    err = f"TimeoutError: Exceeded {args.star_timeout}s"
-                    logger.error(f"Error on {tid_str}: {err}")
-                    console.show(f"  failed {tid_str}: {onyx_console.short_error(err)}")
-                    log_failure(failed_csv, tid_str, err, failed_attempts, stage='timeout')
-                    skip_count += 1
-                    diag_row = {
-                        'target_id': tid_str,
-                        'n_files': 0,
-                        'n_quarters': 0,
-                        'baseline_d': 0.0,
-                        'signals_found': 0,
-                        'matched_count': 0,
-                        'harmonic_count': 0,
-                        'unmatched_count': 0,
-                        'status': f'FAILED: {err}',
-                        'max_sde': 0.0,
-                        'max_snr': 0.0,
-                        'time_dl_s': 0.0,
-                        'time_stitch_s': 0.0,
-                        'time_bls_s': 0.0,
-                        'time_feats_s': 0.0,
-                        'time_total_s': round(args.star_timeout, 2),
-                        'alias_corrections': 0,
-                        'alias_factors': ''
-                    }
-                    append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
-                    completed_stars += 1
-                    durations.append(args.star_timeout)
-                    avg_time = sum(durations) / len(durations)
-                    remaining_stars = total_tasks - completed_stars
-                    est_rem_sec = int((remaining_stars * avg_time) / max(1, args.workers))
-                    eta_str = str(datetime.timedelta(seconds=est_rem_sec))
-                    progress_msg = f"[{completed_stars}/{total_tasks}] Star {tid_str} TIMEOUT ({args.star_timeout:.1f}s) | Avg: {avg_time:.1f}s/star | ETA: {eta_str}"
-                    if verbose:
-                        print(progress_msg, flush=True)
-                    logger.info(progress_msg)
-                    console.advance(ok=False, duration=args.star_timeout)
-                    try:
-                        next_t = next(task_iter)
-                        next_f = executor.submit(process_single_star, *next_t)
-                        active_futures[next_f] = (next_t[0], time.time())
-                    except StopIteration:
-                        pass
+            for f, tid_str, worker_start in find_emergency_expired(active_futures, star_starts, now, args.star_timeout):
+                active_futures.pop(f, None)
+                star_starts.pop(str(tid_str), None)
+                err = f"TimeoutError: Emergency limit of {EMERGENCY_TIMEOUT_FACTOR * args.star_timeout:.0f}s exceeded since worker start; worker did not stop at its own {args.star_timeout:.0f}s deadline, task abandoned"
+                logger.error(f"Error on {tid_str}: {err}")
+                console.show(f"  failed {tid_str}: {onyx_console.short_error(err)}")
+                log_failure(failed_csv, tid_str, err, failed_attempts, stage='timeout')
+                failure_info[tid_str] = (err, 'timeout')
+                skip_count += 1
+                emerg_elapsed = now - worker_start
+                append_to_csv_flush(diag_csv, pd.DataFrame([failed_diag_row(tid_str, err, emerg_elapsed, pipeline_ver)]))
+                completed_stars += 1
+                durations.append(emerg_elapsed)
+                avg_time = sum(durations) / len(durations)
+                remaining_stars = total_tasks - completed_stars
+                est_rem_sec = int((remaining_stars * avg_time) / max(1, args.workers))
+                eta_str = str(datetime.timedelta(seconds=est_rem_sec))
+                progress_msg = f"[{completed_stars}/{total_tasks}] Star {tid_str} TIMEOUT-EMERGENCY ({emerg_elapsed:.1f}s) | Avg: {avg_time:.1f}s/star | ETA: {eta_str}"
+                if verbose:
+                    print(progress_msg, flush=True)
+                logger.info(progress_msg)
+                console.advance(ok=False, duration=emerg_elapsed)
+                try:
+                    next_t = next(task_iter)
+                    next_f = executor.submit(process_star_task, star_starts, *next_t)
+                    active_futures[next_f] = (next_t[0], time.time())
+                except StopIteration:
+                    pass
 
         if failed_attempts:
-            retry_targets = [t for t in tasks if t[0] in failed_attempts]
+            retry_targets = [t for t in tasks if t[0] in failure_info]
             if retry_targets:
                 logger.info(f"Повторный проход (retry pass) по {len(retry_targets)} упавшим звёздам...")
                 console.show(f"Повторный проход по {len(retry_targets)} упавшим звёздам...")
@@ -1392,6 +1482,7 @@ def main():
                             m_snr = max([d.get('snr', 0.0) for d in b_details]) if b_details else 0.0
                             diag_row = {
                                 'target_id': r_tid_str,
+                                'pipeline_version': pipeline_ver,
                                 'n_files': n_f,
                                 'n_quarters': n_q,
                                 'baseline_d': round(b_d, 2),
@@ -1412,14 +1503,19 @@ def main():
                             }
                             append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     else:
+                        failure_info[r_tid_str] = (err, classify_failure_stage(err))
                         logger.error(f"Звезда {r_tid_str} окончательно завершилась ошибкой: {err}")
                         console.show(f"Звезда {r_tid_str} окончательно завершилась ошибкой: {onyx_console.short_error(err)}")
+                retry_updates = {}
                 for rec_s in recovered_stars:
-                    del failed_attempts[rec_s]
-                if os.path.exists(failed_csv):
-                    os.remove(failed_csv)
-                for f_tid, f_att in failed_attempts.items():
-                    log_failure(failed_csv, f_tid, 'Persistent failure after retries', {f_tid: f_att - 1}, stage='retry_failed')
+                    failed_attempts.pop(rec_s, None)
+                    failure_info.pop(rec_s, None)
+                retried_ids = {rt[0] for rt in retry_targets}
+                for r_tid_str, (r_err, r_stage) in failure_info.items():
+                    if r_tid_str in retried_ids:
+                        failed_attempts[r_tid_str] = failed_attempts.get(r_tid_str, 0) + 1
+                        retry_updates[r_tid_str] = (r_err, r_stage, failed_attempts[r_tid_str])
+                update_failed_table(failed_csv, recovered_stars, retry_updates)
 
     logger.info(f'Total processed: {success_count}')
     logger.info(f'Total skipped: {skip_count}')
