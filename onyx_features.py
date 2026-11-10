@@ -2,7 +2,7 @@ import os
 
 import pandas as pd
 
-PIPELINE_VERSION = '2'
+PIPELINE_VERSION = '3'
 
 EXCLUDE_COLS = [
     'signal_id',
@@ -20,6 +20,7 @@ EXCLUDE_COLS = [
     'n_signals_star',
     'pipeline_version',
     'bls_epoch',
+    'bls_sde_raw',
 ]
 
 COVERAGE_COLS = [

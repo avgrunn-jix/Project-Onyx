@@ -81,6 +81,15 @@ def test_koi_recovery_summary_counts_and_end_to_end():
     assert list(by_bin['Группа']) == ['P 0.5–3 д', 'P 3–10 д', 'P 10–30 д', 'P 30–100 д']
 
 
+def test_koi_recovery_counts_third_and_triple_as_harmonic():
+    koi = pd.DataFrame([{'target_id': '7', 'label': 'CONFIRMED', 'catalog_period': 9.0},
+                        {'target_id': '8', 'label': 'CONFIRMED', 'catalog_period': 3.0}])
+    sig = pd.DataFrame([{'target_id': '7', 'bls_period_d': 3.01, 'decision': 'REVIEW'},
+                        {'target_id': '8', 'bls_period_d': 9.02, 'decision': 'REVIEW'}])
+    rec = onyx_report.build_koi_recovery(koi, sig)
+    assert list(rec['status']) == ['гармоника', 'гармоника']
+
+
 def test_koi_without_any_signal_is_not_found():
     koi = pd.DataFrame([{'target_id': '9', 'label': 'CONFIRMED', 'catalog_period': 4.0}])
     sig = pd.DataFrame(columns=['target_id', 'bls_period_d', 'decision'])

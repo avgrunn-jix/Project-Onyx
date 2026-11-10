@@ -44,7 +44,7 @@ def period_status(cat_period, signal_periods, tol=PERIOD_TOL):
         ratio = sp / cat_period
         if abs(ratio - 1.0) < tol:
             return 'точно', idx
-        if status == 'не найден' and (abs(ratio - 0.5) < tol or abs(ratio - 2.0) < tol):
+        if status == 'не найден' and (abs(ratio - 0.5) < tol or abs(ratio - 2.0) < tol or abs(ratio * 3.0 - 1.0) < tol or abs(ratio / 3.0 - 1.0) < tol):
             status = 'гармоника'
             best = idx
     return status, best

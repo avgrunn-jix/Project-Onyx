@@ -26,6 +26,8 @@ import lightkurve as lk
 from astroquery.ipac.nexsci.nasa_exoplanet_archive import NasaExoplanetArchive
 import concurrent.futures
 import re
+from astropy.timeseries import BoxLeastSquares
+from scipy.ndimage import median_filter
 
 warnings.filterwarnings('ignore')
 logging.getLogger('lightkurve').setLevel(logging.ERROR)
@@ -139,6 +141,424 @@ def is_alias_duplicate(period, found_periods, tol=ALIAS_TOL):
             if abs(ratio / m - 1.0) < tol:
                 return True
     return False
+
+SEARCH_MIN_PERIOD_D = 0.5
+SEARCH_MAX_PERIOD_D = 100.0
+DUR_GRID_MIN_D = 0.04
+DUR_GRID_MAX_D = 0.5
+DUR_GRID_N_QUICK = 6
+DUR_GRID_N_FULL = 12
+MAX_DUTY_CYCLE = 0.3
+FREQ_FACTOR_QUICK = 5000
+FREQ_FACTOR_FULL = 500
+SDE_MEDIAN_WINDOW = 501
+MIN_SDE = 7.0
+MIN_SNR = 7.1
+MIN_TRANSITS_OBSERVED = 3
+TRANSIT_COVERAGE_MIN = 0.5
+REFINE_HALF_WIDTH_STEPS = 1.5
+REFINE_STEP_FRACTION = 0.25
+REFINE_MAX_POINTS = 4000
+BLS_OVERSAMPLE = 10
+DUR_BIN_D = DUR_GRID_MIN_D / BLS_OVERSAMPLE
+HARMONIC_RATIOS = (0.5, 2.0, 1.0 / 3.0, 3.0)
+
+def duration_grid(quick_mode):
+    n = DUR_GRID_N_QUICK if quick_mode else DUR_GRID_N_FULL
+    return np.geomspace(DUR_GRID_MIN_D, DUR_GRID_MAX_D, n)
+
+def lc_arrays(lc):
+    t = np.asarray(lc.time.value, dtype=float)
+    f = np.asarray(lc.flux.value, dtype=float)
+    if 'flux_err' in lc.columns:
+        e = np.asarray(lc.flux_err.value, dtype=float)
+    else:
+        e = np.full(len(t), np.nan)
+    ok = np.isfinite(t) & np.isfinite(f)
+    t, f, e = t[ok], f[ok], e[ok]
+    dy = e if (len(e) > 0 and np.all(np.isfinite(e)) and np.all(e > 0)) else None
+    return t, f, dy
+
+def bls_spectrum(t, f, dy, dur_grid, min_period, max_period, freq_factor, max_duty=MAX_DUTY_CYCLE):
+    dur_grid = np.sort(np.asarray(dur_grid, dtype=float))
+    bls = BoxLeastSquares(t, f, dy)
+    periods = np.asarray(bls.autoperiod(dur_grid, minimum_period=min_period, maximum_period=max_period, frequency_factor=freq_factor), dtype=float)
+    n = len(periods)
+    spec = {
+        'bls': bls,
+        'dur_grid': dur_grid,
+        'max_duty': float(max_duty),
+        'period': periods,
+        'power': np.full(n, np.nan),
+        'duration': np.full(n, np.nan),
+        'transit_time': np.full(n, np.nan),
+        'depth': np.full(n, np.nan),
+        'depth_snr': np.full(n, np.nan),
+    }
+    n_allowed = np.searchsorted(dur_grid, max_duty * periods, side='right')
+    for k in np.unique(n_allowed):
+        if k <= 0:
+            continue
+        m = n_allowed == k
+        r = bls.power(periods[m], dur_grid[:k])
+        spec['power'][m] = np.asarray(r.power, dtype=float)
+        spec['duration'][m] = np.asarray(r.duration, dtype=float)
+        spec['transit_time'][m] = np.asarray(r.transit_time, dtype=float)
+        spec['depth'][m] = np.asarray(r.depth, dtype=float)
+        spec['depth_snr'][m] = np.asarray(r.depth_snr, dtype=float)
+    return spec
+
+def allowed_durations(dur_grid, period, max_duty=MAX_DUTY_CYCLE):
+    dur_grid = np.sort(np.asarray(dur_grid, dtype=float))
+    return dur_grid[dur_grid <= max_duty * period]
+
+def peak_index(power):
+    p = np.asarray(power, dtype=float)
+    if len(p) == 0 or not np.any(np.isfinite(p)):
+        return None
+    return int(np.nanargmax(p))
+
+def raw_sde(power, idx):
+    p = np.asarray(power, dtype=float)
+    sd = np.nanstd(p)
+    return float((p[idx] - np.nanmean(p)) / sd) if sd > 0 else 0.0
+
+def median_window(n, window=SDE_MEDIAN_WINDOW):
+    w = int(min(window, max(11, n // 10)))
+    return w if w % 2 == 1 else w + 1
+
+def detrended_power(power, window=SDE_MEDIAN_WINDOW):
+    p = np.asarray(power, dtype=float)
+    ok = np.isfinite(p)
+    out = np.full(len(p), np.nan)
+    if not np.any(ok):
+        return out
+    vals = p[ok]
+    trend = median_filter(vals, size=median_window(len(vals), window), mode='nearest')
+    out[ok] = vals - trend
+    return out
+
+def detrended_sde(power, idx, window=SDE_MEDIAN_WINDOW):
+    resid = detrended_power(power, window)
+    sd = np.nanstd(resid)
+    if not np.isfinite(resid[idx]) or not sd > 0:
+        return 0.0
+    return float((resid[idx] - np.nanmean(resid)) / sd)
+
+def coarse_step_at(periods, idx):
+    p = np.asarray(periods, dtype=float)
+    if len(p) < 2:
+        return 0.0
+    if 0 < idx < len(p) - 1:
+        return float(abs(p[idx + 1] - p[idx - 1]) / 2.0)
+    j = idx + 1 if idx == 0 else idx - 1
+    return float(abs(p[idx] - p[j]))
+
+def peak_values(spec, idx):
+    return {
+        'period': float(spec['period'][idx]),
+        'epoch': float(spec['transit_time'][idx]),
+        'duration': float(spec['duration'][idx]),
+        'depth': float(spec['depth'][idx]),
+        'depth_snr': float(spec['depth_snr'][idx]),
+        'power': float(spec['power'][idx]),
+        'refined': False,
+    }
+
+def refine_peak(spec, idx, baseline_d):
+    coarse = peak_values(spec, idx)
+    p0 = coarse['period']
+    d0 = coarse['duration']
+    step_c = coarse_step_at(spec['period'], idx)
+    if not (baseline_d > 0 and p0 > 0 and d0 > 0 and step_c > 0):
+        return coarse
+    half = REFINE_HALF_WIDTH_STEPS * step_c
+    fine = REFINE_STEP_FRACTION * d0 * p0 / baseline_d
+    n = int(np.ceil(2.0 * half / fine)) + 1
+    n = int(min(max(n, 3), REFINE_MAX_POINTS))
+    lo = max(p0 - half, float(np.min(spec['period'])) * 0.999)
+    grid = np.linspace(lo, p0 + half, n)
+    durs = allowed_durations(spec['dur_grid'], float(np.min(grid)), spec['max_duty'])
+    if len(durs) == 0:
+        return coarse
+    r = spec['bls'].power(grid, durs)
+    pw = np.asarray(r.power, dtype=float)
+    j = peak_index(pw)
+    if j is None or not pw[j] > coarse['power']:
+        return coarse
+    return {
+        'period': float(np.asarray(r.period)[j]),
+        'epoch': float(np.asarray(r.transit_time)[j]),
+        'duration': float(np.asarray(r.duration)[j]),
+        'depth': float(np.asarray(r.depth)[j]),
+        'depth_snr': float(np.asarray(r.depth_snr)[j]),
+        'power': float(pw[j]),
+        'refined': True,
+    }
+
+def duration_at_grid_edge(duration, dur_grid, period, max_duty=MAX_DUTY_CYCLE):
+    allowed = allowed_durations(dur_grid, period, max_duty)
+    if len(allowed) == 0:
+        return 1
+    edges = (float(allowed[0]), float(allowed[-1]))
+    tol = DUR_BIN_D + 1e-9
+    return int(any(abs(float(duration) - e) <= tol for e in edges))
+
+def transit_windows(t, period, epoch, duration):
+    t = np.asarray(t, dtype=float)
+    if len(t) == 0 or not period > 0:
+        return []
+    k_lo = int(np.floor((np.min(t) - epoch) / period)) - 1
+    k_hi = int(np.ceil((np.max(t) - epoch) / period)) + 1
+    out = []
+    for k in range(k_lo, k_hi + 1):
+        mid = epoch + k * period
+        if mid + duration / 2.0 < np.min(t) or mid - duration / 2.0 > np.max(t):
+            continue
+        out.append((k, np.abs(t - mid) < duration / 2.0))
+    return out
+
+def count_observed_transits(t, period, epoch, duration, cadence_d, coverage=TRANSIT_COVERAGE_MIN):
+    if not (cadence_d > 0 and duration > 0):
+        return 0
+    expected = duration / cadence_d
+    need = coverage * expected
+    return int(sum(1 for _, m in transit_windows(t, period, epoch, duration) if np.sum(m) >= need and np.sum(m) > 0))
+
+def single_event_fraction(t, f, period, epoch, duration, cadence_d, coverage=TRANSIT_COVERAGE_MIN):
+    t = np.asarray(t, dtype=float)
+    f = np.asarray(f, dtype=float)
+    wins = transit_windows(t, period, epoch, duration)
+    if not wins:
+        return np.nan
+    in_any = np.zeros(len(t), dtype=bool)
+    for _, m in wins:
+        in_any |= m
+    base = float(np.nanmedian(f[~in_any])) if np.any(~in_any) else float(np.nanmedian(f))
+    need = coverage * duration / cadence_d if cadence_d > 0 else 1.0
+    signals = []
+    for _, m in wins:
+        if np.sum(m) >= need and np.sum(m) > 0:
+            signals.append(max(0.0, float(np.nansum(base - f[m]))))
+    total = float(np.sum(signals))
+    if not signals or not total > 0:
+        return np.nan
+    return float(max(signals) / total)
+
+def match_period_ratio(ratio, tol=ALIAS_TOL):
+    if abs(ratio - 1.0) < tol:
+        return 'MATCHED'
+    if abs(ratio - 0.5) < tol or abs(ratio - 2.0) < tol or abs(ratio * 3.0 - 1.0) < tol or abs(ratio / 3.0 - 1.0) < tol:
+        return 'HARMONIC'
+    return None
+
+def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=False):
+    lc_search = lc_flat.copy()
+    features_list = []
+    curves_dict = {}
+    freq_factor = FREQ_FACTOR_QUICK if quick_mode else FREQ_FACTOR_FULL
+    dur_grid = duration_grid(quick_mode)
+    max_p = min(SEARCH_MAX_PERIOD_D, baseline_d / 2.0)
+    timing_bls = []
+    timing_bls_details = []
+    timing_feats = []
+    alias_corrections = 0
+    alias_factors_list = []
+    found_periods = []
+    n_refined = 0
+    n_few_transits = 0
+
+    for sig_idx in range(max_signals):
+        if time.time() > deadline:
+            break
+        if max_p <= SEARCH_MIN_PERIOD_D or len(lc_search) < 100:
+            break
+        t_bls_start = time.time()
+        t_s, f_s, dy_s = lc_arrays(lc_search)
+        spec = bls_spectrum(t_s, f_s, dy_s, dur_grid, SEARCH_MIN_PERIOD_D, max_p, freq_factor)
+        power_values = spec['power']
+        idx = peak_index(power_values)
+        if idx is None:
+            bls_iter_time = time.time() - t_bls_start
+            timing_bls.append(bls_iter_time)
+            timing_bls_details.append({'iter': sig_idx + 1, 'time': bls_iter_time, 'n_freqs': len(power_values), 'period': 0.0, 'sde': 0.0, 'snr': 0.0})
+            break
+        bls_power_peak = float(power_values[idx])
+        bls_sde_raw = raw_sde(power_values, idx)
+        bls_sde = detrended_sde(power_values, idx)
+        peak = refine_peak(spec, idx, baseline_d)
+        if peak['refined']:
+            n_refined += 1
+        bls_period_d = peak['period']
+        bls_epoch = peak['epoch']
+        bls_duration_d = peak['duration']
+        bls_depth_ppm = float(peak['depth'] * 1e6)
+        bls_depth_snr = float(peak['depth_snr'])
+        bls_iter_time = time.time() - t_bls_start
+        timing_bls.append(bls_iter_time)
+        timing_bls_details.append({
+            'iter': sig_idx + 1,
+            'time': bls_iter_time,
+            'n_freqs': len(power_values),
+            'period': bls_period_d,
+            'sde': bls_sde,
+            'snr': bls_depth_snr
+        })
+        if bls_sde < MIN_SDE or bls_depth_snr < MIN_SNR:
+            break
+        if use_resolve_aliases:
+            s_err = np.asarray(lc_search.flux_err.value, dtype=float) if 'flux_err' in lc_search.columns else None
+            alias_res = resolve_alias_period(np.asarray(lc_search.time.value, dtype=float), np.asarray(lc_search.flux.value, dtype=float), s_err, bls_period_d, bls_epoch, bls_duration_d, spec['period'], power_values)
+            if alias_res['factor'] != 1.0:
+                bls_period_d = alias_res['period']
+                bls_epoch = alias_res['epoch']
+                bls_depth_ppm = float(alias_res['depth'] * 1e6)
+                alias_corrections += 1
+                alias_factors_list.append(str(round(float(alias_res['factor']), 4)))
+            if is_alias_duplicate(bls_period_d, found_periods):
+                dup_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=bls_epoch, duration=bls_duration_d * 1.5)
+                lc_search = lc_search[~dup_mask]
+                continue
+        times_search = np.asarray(lc_search.time.value, dtype=float)
+        flux_search = np.asarray(lc_search.flux.value, dtype=float)
+        n_transits_observed = count_observed_transits(times_search, bls_period_d, bls_epoch, bls_duration_d, cadence_d)
+        if n_transits_observed < MIN_TRANSITS_OBSERVED:
+            n_few_transits += 1
+            few_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=bls_epoch, duration=bls_duration_d * 1.5)
+            lc_search = lc_search[~few_mask]
+            continue
+        if use_resolve_aliases:
+            found_periods.append(bls_period_d)
+        sef = single_event_fraction(times_search, flux_search, bls_period_d, bls_epoch, bls_duration_d, cadence_d)
+        dur_edge = duration_at_grid_edge(bls_duration_d, dur_grid, bls_period_d)
+        transit_count = int(baseline_d / bls_period_d)
+        duty_cycle = float(bls_duration_d / bls_period_d)
+        rec_idx = len(features_list)
+
+        t_feat_start = time.time()
+        folded = lc_search.fold(period=bls_period_d, epoch_time=bls_epoch, normalize_phase=False)
+        phase_times = np.asarray(folded.time.value, dtype=float)
+        fold_flux = np.asarray(folded.flux.value, dtype=float)
+        norm_phase = phase_times / bls_period_d
+        norm_phase = (norm_phase + 0.5) % 1.0 - 0.5
+        binned_phase = bin_folded_curve(norm_phase, fold_flux)
+        sig_id = f'{tid}_inv{rec_idx}' if inverted else f'{tid}_{rec_idx}'
+        zoom_mask = np.abs(phase_times) <= (bls_duration_d * 2.0)
+        if np.any(zoom_mask):
+            zoom_phase = phase_times[zoom_mask] / (bls_duration_d * 2.0)
+            zoom_phase = (zoom_phase + 0.5) % 1.0 - 0.5
+            binned_zoom = bin_folded_curve(zoom_phase, fold_flux[zoom_mask])
+        else:
+            binned_zoom = np.ones(201)
+        curves_dict[sig_id] = np.stack([binned_phase, binned_zoom])
+        match_flags = {'koi_fpflag_nt': 0, 'koi_fpflag_ss': 0, 'koi_fpflag_co': 0, 'koi_fpflag_ec': 0}
+        if inverted:
+            match_status = 'INVERTED'
+            match_label = 'INVERTED'
+        else:
+            match_status = 'UNMATCHED'
+            match_label = 'UNMATCHED'
+            for r in row_dicts:
+                cat_p = r.get('catalog_period', np.nan)
+                if pd.isna(cat_p):
+                    continue
+                kind = match_period_ratio(bls_period_d / float(cat_p))
+                if kind == 'MATCHED':
+                    match_status = 'MATCHED'
+                    match_label = r.get('label', 'UNMATCHED')
+                    if mission == 'Kepler':
+                        match_flags = {
+                            'koi_fpflag_nt': r.get('koi_fpflag_nt', 0),
+                            'koi_fpflag_ss': r.get('koi_fpflag_ss', 0),
+                            'koi_fpflag_co': r.get('koi_fpflag_co', 0),
+                            'koi_fpflag_ec': r.get('koi_fpflag_ec', 0)
+                        }
+                    break
+                elif kind == 'HARMONIC':
+                    match_status = 'HARMONIC'
+                    match_label = 'HARMONIC'
+        folded_double = lc_search.fold(period=bls_period_d * 2, epoch_time=bls_epoch, normalize_phase=False)
+        odd_mask = np.abs(folded_double.time.value) < (bls_duration_d / 2)
+        even_mask = np.abs(folded_double.time.value - bls_period_d) < (bls_duration_d / 2)
+        flux_odd = folded_double.flux.value[odd_mask]
+        flux_even = folded_double.flux.value[even_mask]
+        med_odd = np.nanmedian(flux_odd) if len(flux_odd) > 0 else 1.0
+        med_even = np.nanmedian(flux_even) if len(flux_even) > 0 else 1.0
+        odd_even_depth_diff_ppm = abs(med_odd - med_even) * 1e6
+        combined_std = np.nanstd(folded_double.flux.value)
+        odd_even_sigma = float(abs(med_odd - med_even) / combined_std) if combined_std > 0 else 0.0
+        sec_mask = (np.abs(folded.time.value - bls_period_d/2) < (bls_duration_d / 2))
+        flux_sec = folded.flux.value[sec_mask]
+        sec_depth = 1.0 - np.nanmedian(flux_sec) if len(flux_sec) > 0 else 0.0
+        secondary_depth_ppm = float(sec_depth * 1e6)
+        secondary_snr = float(sec_depth / combined_std) if combined_std > 0 else 0.0
+        idx_p = np.argmin(np.abs(spec['period'] - bls_period_d))
+        idx_half = np.argmin(np.abs(spec['period'] - (bls_period_d / 2)))
+        idx_double = np.argmin(np.abs(spec['period'] - (bls_period_d * 2)))
+        power_p = power_values[idx_p]
+        harmonic_power_ratio = float((np.nan_to_num(power_values[idx_half]) + np.nan_to_num(power_values[idx_double])) / power_p) if power_p > 0 else 0.0
+        in_trans_mask = np.abs(folded.time.value) < (bls_duration_d / 2)
+        flux_in_trans = folded.flux.value[in_trans_mask]
+        cent_mask = np.abs(folded.time.value) < (bls_duration_d / 4)
+        flux_cent = folded.flux.value[cent_mask]
+        depth_full = 1.0 - np.nanmean(flux_in_trans) if len(flux_in_trans) > 0 else 1e-9
+        depth_cent = 1.0 - np.nanmean(flux_cent) if len(flux_cent) > 0 else 1e-9
+        shape_v_u_ratio = float(depth_cent / depth_full)
+        in_transit_scatter_ppm = float(np.nanstd(flux_in_trans) * 1e6) if len(flux_in_trans) > 0 else 0.0
+        transit_depths = []
+        for i in range(transit_count):
+            mid = bls_epoch + i * bls_period_d
+            mask = np.abs(times_search - mid) < (bls_duration_d / 2)
+            if np.any(mask):
+                transit_depths.append(1.0 - np.nanmean(flux_search[mask]))
+        depth_scatter_ppm = float(np.nanstd(transit_depths) * 1e6) if len(transit_depths) > 0 else 0.0
+
+        col_det = np.asarray(lc_search['centroid_col_detrended'].value, dtype=float) if 'centroid_col_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
+        row_det = np.asarray(lc_search['centroid_row_detrended'].value, dtype=float) if 'centroid_row_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
+        c_shift_col_sig, c_shift_row_sig, c_shift_tot_sig, c_shift_tot_arcsec = compute_centroid_shift(times_search, col_det, row_det, bls_period_d, bls_epoch, bls_duration_d, mission)
+
+        feat = {
+            'signal_id': sig_id, 'target_id': tid, 'signal_index': rec_idx, 'pipeline_version': pipeline_ver,
+            'mission': mission, 'label': match_label, 'match_status': match_status,
+            'bls_period_d': bls_period_d, 'bls_epoch': bls_epoch, 'bls_duration_d': bls_duration_d,
+            'bls_depth_ppm': bls_depth_ppm, 'bls_depth_snr': bls_depth_snr,
+            'bls_power_peak': bls_power_peak, 'bls_sde': bls_sde, 'bls_sde_raw': bls_sde_raw,
+            'transit_count': transit_count, 'n_transits_observed': n_transits_observed,
+            'single_event_fraction': sef, 'dur_at_grid_edge': dur_edge,
+            'duty_cycle': duty_cycle, 'odd_even_depth_diff_ppm': odd_even_depth_diff_ppm,
+            'odd_even_sigma': odd_even_sigma, 'secondary_depth_ppm': secondary_depth_ppm,
+            'secondary_snr': secondary_snr, 'harmonic_power_ratio': harmonic_power_ratio,
+            'shape_v_u_ratio': shape_v_u_ratio, 'in_transit_scatter_ppm': in_transit_scatter_ppm,
+            'depth_scatter_ppm': depth_scatter_ppm,
+        }
+        feat.update(star_feats)
+        feat.update({
+            'centroid_shift_col_sigma': c_shift_col_sig,
+            'centroid_shift_row_sigma': c_shift_row_sig,
+            'centroid_shift_total_sigma': c_shift_tot_sig,
+            'centroid_shift_total_arcsec': c_shift_tot_arcsec
+        })
+        if mission == 'Kepler':
+            feat.update(match_flags)
+        features_list.append(feat)
+        timing_feats.append(time.time() - t_feat_start)
+
+        transit_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=bls_epoch, duration=bls_duration_d * 1.5)
+        lc_search = lc_search[~transit_mask]
+
+    for f_item in features_list:
+        f_item['n_signals_star'] = len(features_list)
+    return {
+        'features': features_list,
+        'curves': curves_dict,
+        'timing_bls': timing_bls,
+        'bls_details': timing_bls_details,
+        'timing_feats': timing_feats,
+        'alias_corrections': alias_corrections,
+        'alias_factors': alias_factors_list,
+        'n_refined': n_refined,
+        'n_few_transits': n_few_transits,
+    }
 
 def init_worker(sem, clip_upward=None, resolve_aliases=None):
     global _dl_sem, CLIP_UPWARD_ONLY, RESOLVE_ALIASES
@@ -682,187 +1102,20 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         star_teff = float(lc.meta.get('TEFF', np.nan)) if lc.meta.get('TEFF') is not None else np.nan
         star_radius = float(lc.meta.get('RADIUS', np.nan)) if lc.meta.get('RADIUS') is not None else np.nan
         star_logg = float(lc.meta.get('LOGG', np.nan)) if lc.meta.get('LOGG') is not None else np.nan
-        lc_search = lc_flat.copy()
-        features_list = []
-        curves_dict = {}
-        freq_factor = 5000 if quick_mode else 500
-        dur_grid = np.linspace(0.05, 0.40, 4) if quick_mode else np.linspace(0.04, 0.45, 10)
-        timing_bls = []
-        timing_bls_details = []
-        timing_feats = []
-        alias_corrections = 0
-        alias_factors_list = []
-        found_periods = []
-
-        for sig_idx in range(max_signals):
-            if time.time() > deadline:
-                break
-            if max_p <= 0.5 or len(lc_search) < 100:
-                break
-            t_bls_start = time.time()
-            bls = lc_search.to_periodogram(method='bls', minimum_period=0.5, maximum_period=max_p, frequency_factor=freq_factor, duration=dur_grid)
-            t_bls_end = time.time()
-            bls_iter_time = t_bls_end - t_bls_start
-            timing_bls.append(bls_iter_time)
-            if len(bls.power) == 0 or np.isnan(bls.power).all():
-                timing_bls_details.append({
-                    'iter': sig_idx + 1,
-                    'time': bls_iter_time,
-                    'n_freqs': len(bls.frequency) if hasattr(bls, 'frequency') else 0,
-                    'period': 0.0,
-                    'sde': 0.0,
-                    'snr': 0.0
-                })
-                break
-            power_values = np.array(bls.power.value)
-            bls_power_peak = float(np.nanmax(power_values))
-            bls_sde = float((bls_power_peak - np.nanmean(power_values)) / np.nanstd(power_values))
-            bls_depth_snr = float(np.nanmax(bls.snr))
-            bls_period_d = float(bls.period_at_max_power.value)
-            timing_bls_details.append({
-                'iter': sig_idx + 1,
-                'time': bls_iter_time,
-                'n_freqs': len(bls.frequency),
-                'period': bls_period_d,
-                'sde': bls_sde,
-                'snr': bls_depth_snr
-            })
-            if bls_sde < 7.0 or bls_depth_snr < 7.1:
-                break
-            bls_period_d = float(bls.period_at_max_power.value)
-            bls_epoch = float(bls.transit_time_at_max_power.value)
-            bls_duration_d = float(bls.duration_at_max_power.value)
-            bls_depth_ppm = float(bls.depth_at_max_power.value * 1e6)
-            if use_resolve_aliases:
-                s_err = np.asarray(lc_search.flux_err.value, dtype=float) if 'flux_err' in lc_search.columns else None
-                alias_res = resolve_alias_period(np.asarray(lc_search.time.value, dtype=float), np.asarray(lc_search.flux.value, dtype=float), s_err, bls_period_d, bls_epoch, bls_duration_d, np.asarray(bls.period.value, dtype=float), power_values)
-                if alias_res['factor'] != 1.0:
-                    bls_period_d = alias_res['period']
-                    bls_epoch = alias_res['epoch']
-                    bls_depth_ppm = float(alias_res['depth'] * 1e6)
-                    alias_corrections += 1
-                    alias_factors_list.append(str(round(float(alias_res['factor']), 4)))
-                if is_alias_duplicate(bls_period_d, found_periods):
-                    dup_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=bls_epoch, duration=bls_duration_d * 1.5)
-                    lc_search = lc_search[~dup_mask]
-                    continue
-                found_periods.append(bls_period_d)
-            transit_count = int(baseline_d / bls_period_d)
-            duty_cycle = float(bls_duration_d / bls_period_d)
-            rec_idx = len(features_list)
-
-            t_feat_start = time.time()
-            folded = lc_search.fold(period=bls_period_d, epoch_time=bls_epoch, normalize_phase=False)
-            phase_times = np.asarray(folded.time.value, dtype=float)
-            fold_flux = np.asarray(folded.flux.value, dtype=float)
-            norm_phase = phase_times / bls_period_d
-            norm_phase = (norm_phase + 0.5) % 1.0 - 0.5
-            binned_phase = bin_folded_curve(norm_phase, fold_flux)
-            sig_id = f'{tid}_{rec_idx}'
-            zoom_mask = np.abs(phase_times) <= (bls_duration_d * 2.0)
-            if np.any(zoom_mask):
-                zoom_phase = phase_times[zoom_mask] / (bls_duration_d * 2.0)
-                zoom_phase = (zoom_phase + 0.5) % 1.0 - 0.5
-                binned_zoom = bin_folded_curve(zoom_phase, fold_flux[zoom_mask])
-            else:
-                binned_zoom = np.ones(201)
-            curves_dict[sig_id] = np.stack([binned_phase, binned_zoom])
-            match_status = 'UNMATCHED'
-            match_label = 'UNMATCHED'
-            match_flags = {'koi_fpflag_nt': 0, 'koi_fpflag_ss': 0, 'koi_fpflag_co': 0, 'koi_fpflag_ec': 0}
-            for r in row_dicts:
-                cat_p = r.get('catalog_period', np.nan)
-                if pd.isna(cat_p):
-                    continue
-                ratio = bls_period_d / float(cat_p)
-                if abs(ratio - 1.0) < 0.01:
-                    match_status = 'MATCHED'
-                    match_label = r.get('label', 'UNMATCHED')
-                    if mission == 'Kepler':
-                        match_flags = {
-                            'koi_fpflag_nt': r.get('koi_fpflag_nt', 0),
-                            'koi_fpflag_ss': r.get('koi_fpflag_ss', 0),
-                            'koi_fpflag_co': r.get('koi_fpflag_co', 0),
-                            'koi_fpflag_ec': r.get('koi_fpflag_ec', 0)
-                        }
-                    break
-                elif abs(ratio - 0.5) < 0.01 or abs(ratio - 2.0) < 0.01:
-                    match_status = 'HARMONIC'
-                    match_label = 'HARMONIC'
-            folded_double = lc_search.fold(period=bls_period_d * 2, epoch_time=bls_epoch, normalize_phase=False)
-            odd_mask = np.abs(folded_double.time.value) < (bls_duration_d / 2)
-            even_mask = np.abs(folded_double.time.value - bls_period_d) < (bls_duration_d / 2)
-            flux_odd = folded_double.flux.value[odd_mask]
-            flux_even = folded_double.flux.value[even_mask]
-            med_odd = np.nanmedian(flux_odd) if len(flux_odd) > 0 else 1.0
-            med_even = np.nanmedian(flux_even) if len(flux_even) > 0 else 1.0
-            odd_even_depth_diff_ppm = abs(med_odd - med_even) * 1e6
-            combined_std = np.nanstd(folded_double.flux.value)
-            odd_even_sigma = float(abs(med_odd - med_even) / combined_std) if combined_std > 0 else 0.0
-            sec_mask = (np.abs(folded.time.value - bls_period_d/2) < (bls_duration_d / 2))
-            flux_sec = folded.flux.value[sec_mask]
-            sec_depth = 1.0 - np.nanmedian(flux_sec) if len(flux_sec) > 0 else 0.0
-            secondary_depth_ppm = float(sec_depth * 1e6)
-            secondary_snr = float(sec_depth / combined_std) if combined_std > 0 else 0.0
-            idx_p = np.argmin(np.abs(bls.period.value - bls_period_d))
-            idx_half = np.argmin(np.abs(bls.period.value - (bls_period_d / 2)))
-            idx_double = np.argmin(np.abs(bls.period.value - (bls_period_d * 2)))
-            power_p = power_values[idx_p]
-            harmonic_power_ratio = float((power_values[idx_half] + power_values[idx_double]) / power_p) if power_p > 0 else 0.0
-            in_trans_mask = np.abs(folded.time.value) < (bls_duration_d / 2)
-            flux_in_trans = folded.flux.value[in_trans_mask]
-            cent_mask = np.abs(folded.time.value) < (bls_duration_d / 4)
-            flux_cent = folded.flux.value[cent_mask]
-            depth_full = 1.0 - np.nanmean(flux_in_trans) if len(flux_in_trans) > 0 else 1e-9
-            depth_cent = 1.0 - np.nanmean(flux_cent) if len(flux_cent) > 0 else 1e-9
-            shape_v_u_ratio = float(depth_cent / depth_full)
-            in_transit_scatter_ppm = float(np.nanstd(flux_in_trans) * 1e6) if len(flux_in_trans) > 0 else 0.0
-            times_search = np.asarray(lc_search.time.value, dtype=float)
-            flux_search = np.asarray(lc_search.flux.value, dtype=float)
-            transit_depths = []
-            for i in range(transit_count):
-                mid = bls_epoch + i * bls_period_d
-                mask = np.abs(times_search - mid) < (bls_duration_d / 2)
-                if np.any(mask):
-                    transit_depths.append(1.0 - np.nanmean(flux_search[mask]))
-            depth_scatter_ppm = float(np.nanstd(transit_depths) * 1e6) if len(transit_depths) > 0 else 0.0
-
-            col_det = np.asarray(lc_search['centroid_col_detrended'].value, dtype=float) if 'centroid_col_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
-            row_det = np.asarray(lc_search['centroid_row_detrended'].value, dtype=float) if 'centroid_row_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
-            c_shift_col_sig, c_shift_row_sig, c_shift_tot_sig, c_shift_tot_arcsec = compute_centroid_shift(times_search, col_det, row_det, bls_period_d, bls_epoch, bls_duration_d, mission)
-
-            feat = {
-                'signal_id': sig_id, 'target_id': tid, 'signal_index': rec_idx, 'pipeline_version': pipeline_ver,
-                'mission': mission, 'label': match_label, 'match_status': match_status,
-                'bls_period_d': bls_period_d, 'bls_epoch': bls_epoch, 'bls_duration_d': bls_duration_d,
-                'bls_depth_ppm': bls_depth_ppm, 'bls_depth_snr': bls_depth_snr,
-                'bls_power_peak': bls_power_peak, 'bls_sde': bls_sde, 'transit_count': transit_count,
-                'duty_cycle': duty_cycle, 'odd_even_depth_diff_ppm': odd_even_depth_diff_ppm,
-                'odd_even_sigma': odd_even_sigma, 'secondary_depth_ppm': secondary_depth_ppm,
-                'secondary_snr': secondary_snr, 'harmonic_power_ratio': harmonic_power_ratio,
-                'shape_v_u_ratio': shape_v_u_ratio, 'in_transit_scatter_ppm': in_transit_scatter_ppm,
-                'depth_scatter_ppm': depth_scatter_ppm, 'flux_std_ppm': flux_std_ppm,
-                'flux_mad_ppm': flux_mad_ppm, 'flux_skew': flux_skew, 'flux_kurtosis': flux_kurtosis,
-                'cdpp_ppm': cdpp_ppm, 'pointwise_scatter_ppm': pointwise_scatter_ppm,
-                'autocorr_max': autocorr_max, 'ls_peak_power': ls_peak_power, 'gap_fraction': gap_fraction,
-                'baseline_d': baseline_d, 'star_teff': star_teff, 'star_radius': star_radius,
-                'star_logg': star_logg,
-                'centroid_shift_col_sigma': c_shift_col_sig,
-                'centroid_shift_row_sigma': c_shift_row_sig,
-                'centroid_shift_total_sigma': c_shift_tot_sig,
-                'centroid_shift_total_arcsec': c_shift_tot_arcsec
-            }
-            if mission == 'Kepler':
-                feat.update(match_flags)
-            features_list.append(feat)
-            t_feat_end = time.time()
-            timing_feats.append(t_feat_end - t_feat_start)
-
-            transit_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=bls_epoch, duration=bls_duration_d * 1.5)
-            lc_search = lc_search[~transit_mask]
-
-        for f in features_list:
-            f['n_signals_star'] = len(features_list)
+        star_feats = {
+            'flux_std_ppm': flux_std_ppm, 'flux_mad_ppm': flux_mad_ppm, 'flux_skew': flux_skew,
+            'flux_kurtosis': flux_kurtosis, 'cdpp_ppm': cdpp_ppm, 'pointwise_scatter_ppm': pointwise_scatter_ppm,
+            'autocorr_max': autocorr_max, 'ls_peak_power': ls_peak_power, 'gap_fraction': gap_fraction,
+            'baseline_d': baseline_d, 'star_teff': star_teff, 'star_radius': star_radius, 'star_logg': star_logg,
+        }
+        main_res = search_signals(lc_flat, tid, mission, row_dicts, baseline_d, med_diff, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver)
+        features_list = main_res['features']
+        curves_dict = main_res['curves']
+        timing_bls = main_res['timing_bls']
+        timing_bls_details = main_res['bls_details']
+        timing_feats = main_res['timing_feats']
+        alias_corrections = main_res['alias_corrections']
+        alias_factors_list = main_res['alias_factors']
         timing_total = time.time() - start_t
         timings = {
             'dl': timing_dl,
@@ -876,7 +1129,9 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'n_quarters': n_quarters if 'n_quarters' in locals() else (len(lc_col) if 'lc_col' in locals() and lc_col is not None else 0),
             'baseline_d': baseline_d if 'baseline_d' in locals() else 0.0,
             'alias_corrections': alias_corrections,
-            'alias_factors': ';'.join(alias_factors_list)
+            'alias_factors': ';'.join(alias_factors_list),
+            'n_refined': main_res['n_refined'],
+            'n_few_transits': main_res['n_few_transits']
         }
         return features_list, curves_dict, tid, None, dl_size, timings
     except Exception as e:
