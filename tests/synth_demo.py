@@ -19,7 +19,7 @@ FEATURE_COLUMNS = [
 ]
 
 
-def build_workspace(root, n_per_group=16, seed=3, with_version=True, version='2|quick=1|flatten_days=3|max_signals=4', suffix='_quick'):
+def build_workspace(root, n_per_group=24, seed=3, with_version=True, version='2|quick=1|flatten_days=3|max_signals=4', suffix='_quick'):
     rng = np.random.RandomState(seed)
     root = str(root)
     labels_dir = os.path.join(root, 'data', 'labels')
@@ -30,7 +30,7 @@ def build_workspace(root, n_per_group=16, seed=3, with_version=True, version='2|
     eb_ids = [str(1000000 + i * 17) for i in range(12)]
     pd.DataFrame({'kepid': eb_ids}).to_csv(os.path.join(labels_dir, 'kepler_eb_catalog.csv'), index=False)
 
-    dispositions = ['CONFIRMED', 'CANDIDATE', 'FALSE POSITIVE']
+    dispositions = ['CONFIRMED', 'FALSE POSITIVE', 'CANDIDATE', 'FALSE POSITIVE']
     groups = {}
     next_id = [2000000]
 
@@ -51,7 +51,7 @@ def build_workspace(root, n_per_group=16, seed=3, with_version=True, version='2|
     koi_periods = {}
     marked_all = groups['tr_m'] + groups['ctrl_m']
     for i, sid in enumerate(marked_all):
-        disp = 'CONFIRMED' if sid == SHOWCASE else dispositions[i % 3]
+        disp = 'CONFIRMED' if sid == SHOWCASE else dispositions[i % 4]
         n_koi = 2 if i % 3 == 0 else 1
         periods = [round(2.0 + 1.7 * i % 40 + 3.1 * k, 4) for k in range(n_koi)]
         koi_periods[sid] = periods
@@ -74,7 +74,7 @@ def build_workspace(root, n_per_group=16, seed=3, with_version=True, version='2|
 
     star_class = {}
     for i, sid in enumerate(marked_all):
-        disp = 'CONFIRMED' if sid == SHOWCASE else dispositions[i % 3]
+        disp = 'CONFIRMED' if sid == SHOWCASE else dispositions[i % 4]
         cls = 1 if disp in ('CONFIRMED', 'CANDIDATE') else 0
         star_class[sid] = (disp, cls)
         star_snr = float(rng.uniform(8, 40))

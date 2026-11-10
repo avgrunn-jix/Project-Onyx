@@ -19,6 +19,7 @@ EXCLUDE_COLS = [
     'p_candidate',
     'n_signals_star',
     'pipeline_version',
+    'bls_epoch',
 ]
 
 COVERAGE_COLS = [
