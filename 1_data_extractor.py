@@ -353,6 +353,145 @@ def match_period_ratio(ratio, tol=ALIAS_TOL):
         return 'HARMONIC'
     return None
 
+R_SUN_CM = 6.957e10
+R_SUN_OVER_R_JUP = 9.731
+SECONDARY_PHASE_MIN = 0.2
+SECONDARY_PHASE_MAX = 0.8
+SECONDARY_PHASE_STEP_DUR = 0.25
+EB_MATCH_TOL = 0.01
+EB_MATCH_RATIOS = (0.5, 1.0, 2.0)
+EB_CATALOG_PATH = os.path.join('data', 'labels', 'kepler_eb_catalog.csv')
+
+def robust_sigma(x):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if len(x) < 3:
+        return np.nan
+    return float(1.4826 * np.median(np.abs(x - np.median(x))))
+
+def _wrapped_phase(t, period, epoch, center=0.0):
+    ph = (np.asarray(t, dtype=float) - epoch) / period - center
+    return ph - np.round(ph)
+
+def odd_even_z(t, f, period, epoch, duration):
+    t = np.asarray(t, dtype=float)
+    f = np.asarray(f, dtype=float)
+    if len(t) == 0 or not (period > 0 and duration > 0):
+        return np.nan
+    k = np.round((t - epoch) / period).astype(np.int64)
+    in_win = np.abs(t - (epoch + k * period)) < duration / 2.0
+    vals = {}
+    for parity in (1, 0):
+        m = in_win & ((k % 2) == parity) & np.isfinite(f)
+        n = int(np.sum(m))
+        if n < 3:
+            return np.nan
+        vals[parity] = (float(np.mean(f[m])), float(np.std(f[m], ddof=1) / np.sqrt(n)))
+    out_m = (~(np.abs(_wrapped_phase(t, period, epoch)) * period < duration)) & np.isfinite(f)
+    base = float(np.median(f[out_m])) if np.any(out_m) else 1.0
+    d_odd = base - vals[1][0]
+    d_even = base - vals[0][0]
+    se = np.sqrt(vals[1][1] ** 2 + vals[0][1] ** 2)
+    if not se > 0:
+        return np.nan
+    return float((d_odd - d_even) / se)
+
+def secondary_search(t, f, period, epoch, duration, phase_min=SECONDARY_PHASE_MIN, phase_max=SECONDARY_PHASE_MAX):
+    t = np.asarray(t, dtype=float)
+    f = np.asarray(f, dtype=float)
+    if len(t) == 0 or not (period > 0 and duration > 0):
+        return np.nan, np.nan
+    ok = np.isfinite(f)
+    t, f = t[ok], f[ok]
+    half_w = duration / (2.0 * period)
+    phase = (t - epoch) / period
+    phase = phase - np.floor(phase)
+    primary = np.abs(_wrapped_phase(t, period, epoch)) < 2.0 * half_w
+    out_m = ~primary
+    if np.sum(out_m) < 10:
+        return np.nan, np.nan
+    base = float(np.median(f[out_m]))
+    step = max(SECONDARY_PHASE_STEP_DUR * duration / period, 1e-4)
+    best_z, best_phase = -np.inf, np.nan
+    for ph0 in np.arange(phase_min, phase_max + 1e-12, step):
+        win = np.abs(phase - ph0) < half_w
+        n = int(np.sum(win))
+        if n < 3:
+            continue
+        rest = out_m & ~(np.abs(phase - ph0) < 2.0 * half_w)
+        sig = robust_sigma(f[rest])
+        if not sig > 0:
+            continue
+        z = (base - float(np.mean(f[win]))) / (sig / np.sqrt(n))
+        if z > best_z:
+            best_z, best_phase = float(z), float(ph0)
+    if not np.isfinite(best_z):
+        return np.nan, np.nan
+    return best_z, best_phase
+
+def implied_radius_rjup(star_radius_rsun, depth_ppm):
+    if star_radius_rsun is None or depth_ppm is None:
+        return np.nan
+    r = float(star_radius_rsun)
+    d = float(depth_ppm) * 1e-6
+    if not (np.isfinite(r) and r > 0 and np.isfinite(d) and d > 0):
+        return np.nan
+    return float(r * np.sqrt(d) * R_SUN_OVER_R_JUP)
+
+def expected_duration_days(period_d, star_radius_rsun, star_logg):
+    vals = [period_d, star_radius_rsun, star_logg]
+    if any(v is None for v in vals):
+        return np.nan
+    p, r, lg = (float(v) for v in vals)
+    if not (np.isfinite(p) and p > 0 and np.isfinite(r) and r > 0 and np.isfinite(lg)):
+        return np.nan
+    g = 10.0 ** lg
+    r_cm = r * R_SUN_CM
+    p_s = p * 86400.0
+    a_cm = (g * r_cm ** 2 * p_s ** 2 / (4.0 * np.pi ** 2)) ** (1.0 / 3.0)
+    return float(p / np.pi * np.arcsin(min(1.0, r_cm / a_cm)))
+
+def duration_ratio(duration_d, period_d, star_radius_rsun, star_logg):
+    exp_d = expected_duration_days(period_d, star_radius_rsun, star_logg)
+    if not (np.isfinite(exp_d) and exp_d > 0 and duration_d is not None and np.isfinite(float(duration_d))):
+        return np.nan
+    return float(float(duration_d) / exp_d)
+
+def load_eb_periods(path=None):
+    path = EB_CATALOG_PATH if path is None else path
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    df = pd.read_csv(path)
+    if 'kepid' not in df.columns or 'period_d' not in df.columns:
+        return None
+    out = {}
+    for kid, per in zip(df['kepid'], df['period_d']):
+        try:
+            key = str(int(kid))
+            per = float(per)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(per) and per > 0:
+            out.setdefault(key, []).append(per)
+    return out
+
+def eb_periods_for(tid, eb_catalog):
+    if eb_catalog is None:
+        return None
+    digits = re.findall(r'\d+', str(tid))
+    if not digits:
+        return []
+    return list(eb_catalog.get(str(int(digits[-1])), []))
+
+def eb_period_match(period, eb_periods, tol=EB_MATCH_TOL):
+    if eb_periods is None:
+        return np.nan
+    for p_eb in eb_periods:
+        ratio = float(period) / float(p_eb)
+        if any(abs(ratio / m - 1.0) < tol for m in EB_MATCH_RATIOS):
+            return 1
+    return 0
+
 def invert_light_curve(lc):
     inv = lc.copy()
     unit = getattr(lc.flux, 'unit', None)
@@ -367,7 +506,7 @@ def inverted_output_path(output):
 def diag_inverted_fields(inverted_flag, n_inverted):
     return {'inverted_control': int(bool(inverted_flag)), 'inverted_count': int(n_inverted) if inverted_flag else 0}
 
-def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=False):
+def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=False, eb_periods=None):
     lc_search = lc_flat.copy()
     features_list = []
     curves_dict = {}
@@ -528,6 +667,12 @@ def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star
                 transit_depths.append(1.0 - np.nanmean(flux_search[mask]))
         depth_scatter_ppm = float(np.nanstd(transit_depths) * 1e6) if len(transit_depths) > 0 else 0.0
 
+        oe_z = odd_even_z(times_search, flux_search, bls_period_d, bls_epoch, bls_duration_d)
+        sec_z, sec_phase = secondary_search(times_search, flux_search, bls_period_d, bls_epoch, bls_duration_d)
+        imp_rad = implied_radius_rjup(star_feats.get('star_radius', np.nan), bls_depth_ppm)
+        dur_ratio = duration_ratio(bls_duration_d, bls_period_d, star_feats.get('star_radius', np.nan), star_feats.get('star_logg', np.nan))
+        eb_match = eb_period_match(bls_period_d, eb_periods)
+
         col_det = np.asarray(lc_search['centroid_col_detrended'].value, dtype=float) if 'centroid_col_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
         row_det = np.asarray(lc_search['centroid_row_detrended'].value, dtype=float) if 'centroid_row_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
         c_shift_col_sig, c_shift_row_sig, c_shift_tot_sig, c_shift_tot_arcsec = compute_centroid_shift(times_search, col_det, row_det, bls_period_d, bls_epoch, bls_duration_d, mission)
@@ -541,8 +686,10 @@ def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star
             'transit_count': transit_count, 'n_transits_observed': n_transits_observed,
             'single_event_fraction': sef, 'dur_at_grid_edge': dur_edge,
             'duty_cycle': duty_cycle, 'odd_even_depth_diff_ppm': odd_even_depth_diff_ppm,
-            'odd_even_sigma': odd_even_sigma, 'secondary_depth_ppm': secondary_depth_ppm,
-            'secondary_snr': secondary_snr, 'harmonic_power_ratio': harmonic_power_ratio,
+            'odd_even_sigma': odd_even_sigma, 'odd_even_z': oe_z, 'secondary_depth_ppm': secondary_depth_ppm,
+            'secondary_snr': secondary_snr, 'secondary_z': sec_z, 'secondary_phase': sec_phase,
+            'implied_radius_rjup': imp_rad, 'duration_ratio': dur_ratio, 'eb_period_match': eb_match,
+            'harmonic_power_ratio': harmonic_power_ratio,
             'shape_v_u_ratio': shape_v_u_ratio, 'in_transit_scatter_ppm': in_transit_scatter_ppm,
             'depth_scatter_ppm': depth_scatter_ppm,
         }
@@ -989,7 +1136,7 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0, clip_upward=None, resolve_aliases=None, inverted_control=False):
+def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0, clip_upward=None, resolve_aliases=None, inverted_control=False, eb_periods=None):
     use_clip_upward = CLIP_UPWARD_ONLY if clip_upward is None else bool(clip_upward)
     use_resolve_aliases = RESOLVE_ALIASES if resolve_aliases is None else bool(resolve_aliases)
     pipeline_ver = build_pipeline_version(quick_mode, flatten_days, max_signals)
@@ -1126,12 +1273,12 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'autocorr_max': autocorr_max, 'ls_peak_power': ls_peak_power, 'gap_fraction': gap_fraction,
             'baseline_d': baseline_d, 'star_teff': star_teff, 'star_radius': star_radius, 'star_logg': star_logg,
         }
-        main_res = search_signals(lc_flat, tid, mission, row_dicts, baseline_d, med_diff, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver)
+        main_res = search_signals(lc_flat, tid, mission, row_dicts, baseline_d, med_diff, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, eb_periods=eb_periods)
         inv_res = None
         if inverted_control:
             t_inv_start = time.time()
             inv_source = main_res['lc_residual'] if INVERTED_MASK_MAIN_SIGNALS else lc_flat
-            inv_res = search_signals(invert_light_curve(inv_source), tid, mission, [], baseline_d, med_diff, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=True)
+            inv_res = search_signals(invert_light_curve(inv_source), tid, mission, [], baseline_d, med_diff, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=True, eb_periods=eb_periods)
             inv_res['time'] = time.time() - t_inv_start
         features_list = main_res['features']
         curves_dict = main_res['curves']
@@ -1552,6 +1699,9 @@ def main():
         except Exception:
             pass
 
+    eb_catalog = load_eb_periods()
+    if eb_catalog is None:
+        logger.warning(f"EB catalog with periods not found at {EB_CATALOG_PATH}; eb_period_match will be NaN")
     tasks = []
     for tid in target_ids:
         tid_str = str(tid)
@@ -1560,7 +1710,7 @@ def main():
         if tid_str in failed_attempts and failed_attempts[tid_str] >= MAX_FAILED_ATTEMPTS:
             continue
         rows = labels_df[labels_df['target_id'] == tid_str].to_dict('records')
-        tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout, args.max_sectors, CLIP_UPWARD_ONLY, RESOLVE_ALIASES, args.inverted_control))
+        tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout, args.max_sectors, CLIP_UPWARD_ONLY, RESOLVE_ALIASES, args.inverted_control, eb_periods_for(tid_str, eb_catalog)))
 
     total_tasks = len(tasks)
     completed_stars = 0
