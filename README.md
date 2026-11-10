@@ -96,13 +96,13 @@ Demo mode (`--mode demo`) checks the pipeline reproducibly on a balanced sample 
 
 ### Methodology
 
-- **Star-level 50/50 split.** The sample is split into a training half and a control half. Each half contains the same number of marked stars (stars that appear in the KOI label table with a `CONFIRMED`, `CANDIDATE`, or `FALSE POSITIVE` disposition) and unmarked control stars (no known KOI). No star appears in both halves.
+- **Star-level 50/50 split.** The sample is split into a training half and a control half. The planned groups are marked stars (stars that appear in the KOI label table with a `CONFIRMED`, `CANDIDATE`, or `FALSE POSITIVE` disposition) and unmarked control stars (no known KOI), each split into a training and a control part. No stars are shared between the halves. Stars whose extraction failed are not replaced, and the remaining groups are not trimmed to the size of the smallest one; add `--balance-halves` to restore the old behaviour of trimming all four groups to equal size. The processing order of the planned stars is shuffled with the seed, which does not change which stars are selected or which group they belong to.
 - **Matched control stars.** Unmarked stars are drawn from the Kepler stellar catalog (`Q1_Q17_DR25_KS`, `kepmag` 11.0-15.5, data span above 1000 d, at least 10 quarters), excluding all KOI hosts. Each marked star gets a one-to-one match within its KIC-number decile, chosen as the nearest star in normalized `kepmag` and number of quarters (`st_quarters`). This prevents trivially separating the groups by instrumental noise or observation length.
-- **Isolated showcase system.** Kepler-80 (KIC 4852528) is forced into the control half and is excluded from all training, which rules out data leakage. Use `--showcase-star` to choose another star. The KOI label table lists five planets for this star (b, c, d, e, f), and the Kepler-80 recovery table in `summary.md` counts exactly these five, using their periods hard-coded in `3_demo_pipeline.py`. A sixth planet, Kepler-80 g (period about 14.65 d), was found by Shallue & Vanderburg (2018; reference 1) but is absent from the label table. It is therefore not counted as a known planet in the recovery table, and a signal near its period would not be matched to a catalog planet.
+- **Isolated showcase system.** Kepler-80 (KIC 4852528) is forced into the control half and is excluded from all training; no stars are shared between the halves. Use `--showcase-star` to choose another star. The KOI label table lists five planets for this star (b, c, d, e, f), and the Kepler-80 recovery table in `summary.md` counts exactly these five, using their periods hard-coded in `3_demo_pipeline.py`. A sixth planet, Kepler-80 g (period about 14.65 d), was found by Shallue & Vanderburg (2018; reference 1) but is absent from the label table. It is therefore not counted as a known planet in the recovery table, and a signal near its period would not be matched to a catalog planet.
 - **Two-way evaluation.**
   - **Direction A:** train on the training half, evaluate on the control half.
   - **Direction B:** train on the control half (Kepler-80 removed), evaluate on the training half.
-- **Abstention thresholds.** Verdict thresholds are tuned with star-grouped (`GroupKFold`) out-of-fold predictions on the training data, choosing the thresholds with the largest coverage for which the accuracy on accepted signals (the share of correct verdicts among all `CANDIDATE` and `FALSE_POSITIVE` verdicts) reaches `--target-precision` (default 0.90). If no setting reaches it, the setting with the highest accuracy is used. Despite its name, `--target-precision` therefore targets accuracy on accepted signals, not class precision. Confidence intervals come from a bootstrap over stars (500 resamples, 5th-95th percentile).
+- **Abstention thresholds.** Verdict thresholds are tuned with star-grouped (`GroupKFold`) out-of-fold predictions on the training data, choosing the thresholds with the largest coverage for which the accuracy on accepted signals (the share of correct verdicts among all `CANDIDATE` and `FALSE_POSITIVE` verdicts) reaches `--target-precision` (default 0.90). If no setting reaches it, the setting with the highest accuracy is used. Despite its name, `--target-precision` therefore targets accuracy on accepted signals, not class precision. The out-of-fold models used to tune the thresholds have the same hyperparameters and the same number of models as the final ensemble. All confidence intervals are 95% intervals (2.5th-97.5th percentile) from a bootstrap over stars (500 resamples); proportions of recovered KOIs use 95% Wilson intervals.
 - **Immutability check.** Before and after the run, the pipeline computes SHA-256 hashes of all files in `outputs/` (excluding `outputs/demo*` and `outputs/_smoke_test`) and compares them, so the run cannot silently modify existing artifacts.
 
 ### Running
@@ -119,7 +119,15 @@ Quick smoke test (coarse grid, isolated output folder):
 python main.py --mode demo --marked-stars 4 --unmarked-stars 4 --quick --smoke-test
 ```
 
-Other demo options: `--seed`, `--showcase-star`, `--unmarked-file`, `--output-dir`, `--max-download-workers`, `--target-precision`, `--min-depth-ppm`. Runtime estimates are given in [Performance](#performance).
+Other demo options: `--seed`, `--showcase-star`, `--unmarked-file`, `--output-dir`, `--max-download-workers`, `--target-precision`, `--min-depth-ppm`.
+
+Three more flags change how a run is resumed or evaluated:
+
+- `--report-only`: rebuilds the report and tables from the existing features and split files in `--output-dir`. It does no extraction, no retries and no downloads, and it does not change the existing files; the new outputs get a `_report` suffix (for example `summary_quick_report.md`). The Kepler-80 showcase figure is not rebuilt, because that needs a download; the summary says so. Files without a `pipeline_version` column work, with a warning.
+- `--allow-legacy`: lets extraction resume into a features file whose `pipeline_version` differs or is missing. Without it, the run stops with an error (see [Pipeline version](#pipeline-version)).
+- `--balance-halves`: trims the four star groups to the size of the smallest one. Without it, a failed star does not shrink the other groups.
+
+The metrics in `summary.md` are conditional on detection and on matching a KOI: they are computed only on signals that the search found and that matched a catalog KOI period (`MATCHED`). KOIs that the search missed, or found only at a harmonic, are not in them; the KOI recovery table in the summary reports those separately. Runtime estimates are given in [Performance](#performance).
 
 ### Showcase figure
 
@@ -136,10 +144,11 @@ With `--quick`, file names get a `_quick` suffix. With `--smoke-test`, the folde
 - `summary.md`: the full analytical report. **This file is generated in Russian.** It contains:
   - balance statistics of the stellar parameters per group;
   - photometry and BLS diagnostics for every star;
-  - the classification results with a confusion matrix, precision, recall, ROC-AUC, the share of `REVIEW` verdicts, bootstrap confidence intervals, and comparison with baselines (majority class and an SNR threshold);
-  - the distribution of predicted probabilities on unmarked stars, the false-alarm rate assuming they host no detectable planets, anomaly scores (Isolation Forest, LOF), and the top 5 validation candidates with SHAP factors;
+  - the KOI recovery table on the control marked stars (exact, harmonic, not found, by disposition and period bin, with 95% Wilson intervals, the number of KOIs outside the search range, and the end-to-end completeness: found exactly and verdict `CANDIDATE`);
+  - the classification results with a confusion matrix, precision, recall, ROC-AUC, accuracy on accepted verdicts, the share of `REVIEW` verdicts, 95% bootstrap confidence intervals over stars, the Brier score with a five-bin reliability table, comparison with baselines (majority class, an SNR threshold with the direction found on the training half, and a logistic regression), and ablations (without the stellar features, without `transit_count` and `gap_fraction`, with the coverage features) with ROC-AUC intervals;
+  - the distribution of the model score (`p_mean`) on unmarked stars, the share of `CANDIDATE` verdicts among their signals (the model is not trained on noise signals, so this is not a false-alarm rate), and the top 5 signals with SHAP factors;
   - the Kepler-80 recovery table, counting exact period matches and harmonic matches separately (format "N exact + M by harmonic out of K");
-  - classification examples with SHAP explanations;
+  - two correct and two wrong classification examples with SHAP explanations;
   - threats to validity and the SHA-256 immutability report.
 - `diagnostics_stars.csv`: per-star photometric diagnostics (number of quarters, baseline, number of signals, `MATCHED`/`HARMONIC`/`UNMATCHED` counts, status, maximum SDE/SNR, and per-stage timings).
 - `control_signals.csv` and `control_signals.md`: all periodic signals of the control half with their features, `p_mean`, `p_std`, verdicts (`CANDIDATE`, `FALSE_POSITIVE`, `REVIEW`), and SHAP factors.
@@ -164,8 +173,9 @@ Long extraction runs can be interrupted and resumed. This applies to any environ
 
 - **Autosave.** The rows of each star are flushed to disk (`flush` + `fsync`) as soon as that star is finished.
 - **Auto-resume.** Re-running the same command reads the finished stars from `--output` (or from the diagnostics file) and processes only the remaining ones. If the existing file lacks columns of the current feature schema (the centroid-shift columns), the extractor stops with an error: use `--no-resume` or a new `--output`.
+- <a id="pipeline-version"></a>**Pipeline version.** Every feature row and diagnostics row has a `pipeline_version` column: the `PIPELINE_VERSION` constant of `onyx_features.py` plus the `quick`, `flatten_days` and `max_signals` settings. When resuming, the extractor stops with an error if the existing file has a different version or no such column. `--allow-legacy` turns that stop into a warning. `pipeline_version` is never used as a model feature.
 - `--no-resume`: start from scratch. This deletes the existing output, `_failed`, diagnostics, and `folded_curves.npz` files. Resuming is on by default.
-- `--star-timeout <SECONDS>`: time limit per star (default 1800 s). A star whose download or computation fails or hangs is recorded in `<output>_failed.csv` (for example `extracted_features_failed.csv`), and the pipeline moves on. On the next run, failed stars are retried once.
+- `--star-timeout <SECONDS>`: time limit per star (default 1800 s). A star whose download or computation fails or hangs is recorded in `<output>_failed.csv` (for example `extracted_features_failed.csv`), and the pipeline moves on. Each row of the failed table keeps the original error text, the stage, and the number of attempts; the demo also fills `star_type` and `split`. After the run, the failed stars get one more attempt in a retry pass; on the next run a star is retried until it has failed 3 times. If the disk is below `--min-free-gb`, a star waits up to 10 minutes (checked every 30 s) before it is recorded as failed. A star that ignores its own deadline is abandoned after three times `--star-timeout`, counted from the moment its worker started, and recorded as failed.
 - `--cache-dir <PATH>`: where FITS files are downloaded (default: the system temporary folder, `tempfile.gettempdir()`). Files are deleted after feature extraction unless `--keep-raw` is set.
 - **Training without MAST access.** If a feature CSV already exists, train directly on it without any extraction:
 

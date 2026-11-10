@@ -45,6 +45,9 @@ def main():
     parser.add_argument('--injections-per-star', type=int, default=12)
     parser.add_argument('--max-sectors', type=int, default=0, help='[DEBUG ONLY] Limit the number of sectors/quarters downloaded. Warning: alters baseline, features, and detection results; not for production training.')
     parser.add_argument('--no-resume', action='store_true')
+    parser.add_argument('--allow-legacy', action='store_true', help='Resume extraction into a features file with a different or missing pipeline_version, with a warning.')
+    parser.add_argument('--report-only', action='store_true', help='[demo] Rebuild the report from existing feature and split files; no extraction, retries or downloads.')
+    parser.add_argument('--balance-halves', action='store_true', help='[demo] Trim the four star groups to the size of the smallest one.')
     parser.add_argument('--star-timeout', type=float, default=1800.0)
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
     parser.add_argument('--features-file', default='', help='[Optional] Precomputed features CSV to train/retrain ML model directly without feature extraction.')
@@ -124,6 +127,7 @@ def main():
         if args.purge_lk_cache: cmd1.append('--purge-lk-cache')
         if args.quick: cmd1.append('--quick')
         if args.no_resume: cmd1.append('--no-resume')
+        if args.allow_legacy: cmd1.append('--allow-legacy')
         if args.smoke_test: cmd1.append('--smoke-test')
         logging.info('Running extractor')
         ret1 = subprocess.run(cmd1)
@@ -149,6 +153,7 @@ def main():
         if args.purge_lk_cache: cmd1.append('--purge-lk-cache')
         if args.quick: cmd1.append('--quick')
         if args.no_resume: cmd1.append('--no-resume')
+        if args.allow_legacy: cmd1.append('--allow-legacy')
         if args.smoke_test: cmd1.append('--smoke-test')
         logging.info('Running extractor in extract-only mode')
         ret1 = subprocess.run(cmd1)
@@ -167,6 +172,7 @@ def main():
         if args.keep_raw: cmd1.append('--keep-raw')
         if args.quick: cmd1.append('--quick')
         if args.no_resume: cmd1.append('--no-resume')
+        if args.allow_legacy: cmd1.append('--allow-legacy')
         if args.smoke_test: cmd1.append('--smoke-test')
         logging.info('Running extractor for prediction targets')
         ret1 = subprocess.run(cmd1)
@@ -199,6 +205,7 @@ def main():
             cmd1.extend(['--injection-output', inj_tgt])
         if args.quick: cmd1.append('--quick')
         if args.no_resume: cmd1.append('--no-resume')
+        if args.allow_legacy: cmd1.append('--allow-legacy')
         if args.smoke_test: cmd1.append('--smoke-test')
         logging.info('Running injection tests')
         subprocess.run(cmd1)
@@ -218,6 +225,12 @@ def main():
         cmd = [sys.executable, demo_script, '--marked-stars', str(args.marked_stars), '--unmarked-stars', str(args.unmarked_stars), '--seed', str(args.seed), '--showcase-star', str(args.showcase_star), '--workers', str(args.workers), '--max-download-workers', str(args.max_download_workers), '--target-precision', str(args.target_precision), '--min-depth-ppm', str(args.min_depth_ppm), '--star-timeout', str(args.star_timeout), '--cache-dir', args.cache_dir, '--flatten-days', str(args.flatten_days), '--max-signals', str(args.max_signals), '--min-free-gb', str(eff_min_free)]
         if args.output_dir:
             cmd.extend(['--output-dir', args.output_dir])
+        if args.report_only:
+            cmd.append('--report-only')
+        if args.allow_legacy:
+            cmd.append('--allow-legacy')
+        if args.balance_halves:
+            cmd.append('--balance-halves')
         if args.unmarked_file:
             cmd.extend(['--unmarked-file', args.unmarked_file])
         if args.quick:

@@ -18,7 +18,7 @@ REAL_HEADER = (
 EXTRACTOR_COLUMNS = REAL_HEADER + ['target_bin']
 
 LEGACY_ML_FEATURES = [
-    'bls_period_d', 'bls_epoch', 'bls_duration_d', 'bls_depth_ppm', 'bls_depth_snr',
+    'bls_period_d', 'bls_duration_d', 'bls_depth_ppm', 'bls_depth_snr',
     'bls_power_peak', 'bls_sde', 'transit_count', 'duty_cycle',
     'odd_even_depth_diff_ppm', 'odd_even_sigma', 'secondary_depth_ppm',
     'secondary_snr', 'harmonic_power_ratio', 'shape_v_u_ratio',
@@ -31,7 +31,7 @@ LEGACY_ML_FEATURES = [
 ]
 
 LEGACY_DEMO_FEATURES = [
-    'bls_period_d', 'bls_epoch', 'bls_duration_d', 'bls_depth_ppm', 'bls_depth_snr',
+    'bls_period_d', 'bls_duration_d', 'bls_depth_ppm', 'bls_depth_snr',
     'bls_power_peak', 'bls_sde', 'transit_count', 'duty_cycle',
     'odd_even_depth_diff_ppm', 'odd_even_sigma', 'secondary_depth_ppm',
     'secondary_snr', 'harmonic_power_ratio', 'shape_v_u_ratio',
@@ -59,7 +59,7 @@ def test_equivalence_ml_pipeline_schema():
     df = pd.DataFrame(columns=EXTRACTOR_COLUMNS)
     actual = onyx_features.compute_feature_columns(df, exclude_coverage=False)
     assert len(REAL_HEADER) == 45
-    assert len(actual) == 34
+    assert len(actual) == 33
     assert actual == LEGACY_ML_FEATURES
     assert 'baseline_d' in actual
 
@@ -68,10 +68,18 @@ def test_equivalence_demo_pipeline_schema():
     cols = EXTRACTOR_COLUMNS + ['n_files', 'n_quarters']
     df = pd.DataFrame(columns=cols)
     actual = onyx_features.compute_feature_columns(df, exclude_coverage=True)
-    assert len(actual) == 33
+    assert len(actual) == 32
     assert actual == LEGACY_DEMO_FEATURES
     for cov in LEGACY_COVERAGE_COLS:
         assert cov not in actual
+
+
+def test_bls_epoch_and_pipeline_version_are_not_features():
+    df = pd.DataFrame(columns=EXTRACTOR_COLUMNS + ['pipeline_version'])
+    for cov_flag in (False, True):
+        feats = onyx_features.compute_feature_columns(df, exclude_coverage=cov_flag)
+        assert 'bls_epoch' not in feats
+        assert 'pipeline_version' not in feats
 
 
 def test_equivalence_transfer_intersection():

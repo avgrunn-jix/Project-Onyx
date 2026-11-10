@@ -22,13 +22,12 @@ from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, r
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import FunctionTransformer, RobustScaler
-from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import LocalOutlierFactor
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupKFold
 from xgboost import XGBClassifier
 import shap
-from onyx_features import COVERAGE_COLS, compute_feature_columns
+from onyx_report import STAR_FEATURE_COLS, SEARCH_MAX_PERIOD_D, SEARCH_MIN_PERIOD_D, ablation_feature_sets, brier_score, build_koi_recovery, ci_text, oriented_auc, reliability_table, summarize_koi_recovery
+from onyx_features import COVERAGE_COLS, PipelineVersionError, build_pipeline_version, check_pipeline_version, compute_feature_columns
 from onyx_showcase import render_showcase
 
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Segoe UI']
@@ -82,8 +81,8 @@ def verify_eb_catalog(catalog_path):
         norm = str(tid).upper().replace('KIC', '').strip().lstrip('0')
         if norm not in eb_set:
             raise RuntimeError(f"EB catalog self-test failed on positive ID: {tid}")
-    if '6541920' in eb_set:
-        raise RuntimeError("EB catalog self-test failed on negative control (Kepler-80)")
+    if '4852528' in eb_set:
+        raise RuntimeError("EB catalog self-test failed on negative control (Kepler-80, KIC 4852528)")
     return eb_set, len(df_eb)
 
 def is_eclipsing_binary(target_id, eb_set):
@@ -298,27 +297,145 @@ def compute_group_stats(info_dict):
         'q_max': int(np.max(qs)) if qs else 0
     }
 
-def split_stars(marked_stars, unmarked_stars, star_prim, showcase_star, seed):
+def split_stars(marked_stars, unmarked_stars, star_prim, showcase_star, seed, balance=False):
     showcase_id = str(showcase_star)
     tr_marked = [marked_stars[i] for i in range(len(marked_stars)) if i % 2 == 0]
     ctrl_marked = [marked_stars[i] for i in range(len(marked_stars)) if i % 2 == 1]
     tr_unmarked = [unmarked_stars[i] for i in range(len(unmarked_stars)) if i % 2 == 0]
     ctrl_unmarked = [unmarked_stars[i] for i in range(len(unmarked_stars)) if i % 2 == 1]
 
-    n_bal_m = min(len(tr_marked), len(ctrl_marked))
-    n_bal_u = min(len(tr_unmarked), len(ctrl_unmarked))
-    n_bal = min(n_bal_m, n_bal_u)
-
-    tr_marked = tr_marked[:n_bal]
-    ctrl_marked = ctrl_marked[:n_bal]
-    tr_unmarked = tr_unmarked[:n_bal]
-    ctrl_unmarked = ctrl_unmarked[:n_bal]
+    if balance:
+        n_bal_m = min(len(tr_marked), len(ctrl_marked))
+        n_bal_u = min(len(tr_unmarked), len(ctrl_unmarked))
+        n_bal = min(n_bal_m, n_bal_u)
+        tr_marked = tr_marked[:n_bal]
+        ctrl_marked = ctrl_marked[:n_bal]
+        tr_unmarked = tr_unmarked[:n_bal]
+        ctrl_unmarked = ctrl_unmarked[:n_bal]
 
     assert len(set(tr_marked).intersection(set(ctrl_marked))) == 0
     assert len(set(tr_unmarked).intersection(set(ctrl_unmarked))) == 0
     assert showcase_id in ctrl_marked
     assert showcase_id not in tr_marked
     return tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked
+
+MAX_FAILED_ATTEMPTS = 3
+SPLIT_LABELS_RU = {'TRAIN': 'Обучающая', 'CONTROL': 'Контрольная'}
+TYPE_LABELS_RU = {'MARKED': 'Отмеченная (KOI)', 'UNMARKED': 'Неотмеченная (Control)'}
+
+def shuffled_order(stars, seed):
+    order = list(stars)
+    np.random.RandomState(seed).shuffle(order)
+    return order
+
+def plan_group_map(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked):
+    group_map = {}
+    for lst, st_type, split in ((tr_marked, 'MARKED', 'TRAIN'), (ctrl_marked, 'MARKED', 'CONTROL'), (tr_unmarked, 'UNMARKED', 'TRAIN'), (ctrl_unmarked, 'UNMARKED', 'CONTROL')):
+        for sid in lst:
+            group_map[str(sid)] = (st_type, split)
+    return group_map
+
+def annotate_failed_table(failed_csv, group_map):
+    if not os.path.exists(failed_csv) or os.path.getsize(failed_csv) == 0:
+        return 0
+    df = pd.read_csv(failed_csv, dtype={'target_id': str, 'star_type': str, 'split': str})
+    for col in ('star_type', 'split'):
+        if col not in df.columns:
+            df[col] = 'UNKNOWN'
+        df[col] = df[col].fillna('UNKNOWN')
+    n_set = 0
+    for i, tid in enumerate(df['target_id'].astype(str)):
+        if tid in group_map:
+            st_type, split = group_map[tid]
+            if df.at[i, 'star_type'] != st_type or df.at[i, 'split'] != split:
+                df.at[i, 'star_type'] = st_type
+                df.at[i, 'split'] = split
+                n_set += 1
+    if n_set > 0:
+        df.to_csv(failed_csv, index=False, encoding='utf-8')
+    return n_set
+
+def stars_done_for_run(features_csv, diag_csv, failed_csv, max_attempts=MAX_FAILED_ATTEMPTS):
+    done = set()
+    if os.path.exists(features_csv) and os.path.getsize(features_csv) > 0:
+        try:
+            done.update(pd.read_csv(features_csv, usecols=['target_id'], dtype=str)['target_id'].dropna().astype(str).unique())
+        except Exception:
+            pass
+    if os.path.exists(diag_csv) and os.path.getsize(diag_csv) > 0:
+        try:
+            df_d = pd.read_csv(diag_csv, dtype={'target_id': str})
+            done.update(df_d[df_d['status'] == 'OK']['target_id'].dropna().astype(str).unique())
+        except Exception:
+            pass
+    if os.path.exists(failed_csv) and os.path.getsize(failed_csv) > 0:
+        try:
+            df_f = pd.read_csv(failed_csv, dtype={'target_id': str})
+            if 'attempts' not in df_f.columns:
+                df_f['attempts'] = 1
+            df_f['attempts'] = pd.to_numeric(df_f['attempts'], errors='coerce').fillna(1)
+            best = df_f.groupby('target_id')['attempts'].max()
+            done.update(str(t) for t, a in best.items() if a >= max_attempts)
+        except Exception:
+            pass
+    return done
+
+def finalize_groups(tr_m, ctrl_m, tr_u, ctrl_u, processed_ids, showcase_id, balance=False):
+    s_tr_m = [s for s in tr_m if s in processed_ids]
+    s_ctrl_m = [s for s in ctrl_m if s in processed_ids]
+    s_tr_u = [s for s in tr_u if s in processed_ids]
+    s_ctrl_u = [s for s in ctrl_u if s in processed_ids]
+    if balance:
+        n_bal = min(len(s_tr_m), len(s_ctrl_m), len(s_tr_u), len(s_ctrl_u))
+        rest_m = [s for s in s_ctrl_m if s != showcase_id]
+        if showcase_id in s_ctrl_m:
+            f_ctrl_m = [showcase_id] + rest_m[:max(0, n_bal - 1)]
+        else:
+            f_ctrl_m = rest_m[:n_bal]
+        f_tr_m = s_tr_m[:n_bal]
+        f_tr_u = s_tr_u[:n_bal]
+        f_ctrl_u = s_ctrl_u[:n_bal]
+    else:
+        f_tr_m, f_ctrl_m, f_tr_u, f_ctrl_u = s_tr_m, s_ctrl_m, s_tr_u, s_ctrl_u
+    kept = set(f_tr_m) | set(f_ctrl_m) | set(f_tr_u) | set(f_ctrl_u)
+    dropped = [s for s in s_tr_m + s_ctrl_m + s_tr_u + s_ctrl_u if s not in kept]
+    return {'tr_m': f_tr_m, 'ctrl_m': f_ctrl_m, 'tr_u': f_tr_u, 'ctrl_u': f_ctrl_u, 'dropped': dropped,
+            'succ': {'tr_m': s_tr_m, 'ctrl_m': s_ctrl_m, 'tr_u': s_tr_u, 'ctrl_u': s_ctrl_u}}
+
+def load_report_plan(out_dir, file_suffix, star_prim):
+    split_path = os.path.join(out_dir, f"demo_stars_split{file_suffix}.csv")
+    failed_path = os.path.join(out_dir, f"features_demo{file_suffix}_failed.csv")
+    targets_path = os.path.join(out_dir, f"targets_demo{file_suffix}.txt")
+    groups = {'tr_m': [], 'ctrl_m': [], 'tr_u': [], 'ctrl_u': []}
+    seen = set()
+    def add(sid, st_type, split):
+        if sid in seen:
+            return
+        key = ('tr' if split == 'TRAIN' else 'ctrl') + ('_m' if st_type == 'MARKED' else '_u')
+        groups[key].append(sid)
+        seen.add(sid)
+    if os.path.exists(split_path) and os.path.getsize(split_path) > 0:
+        df_sp = pd.read_csv(split_path, dtype={'target_id': str})
+        for r in df_sp.to_dict('records'):
+            add(str(r['target_id']), str(r['star_type']), str(r['split']))
+    failed_ids = []
+    if os.path.exists(failed_path) and os.path.getsize(failed_path) > 0:
+        df_fl = pd.read_csv(failed_path, dtype={'target_id': str, 'star_type': str, 'split': str})
+        for r in df_fl.to_dict('records'):
+            sid = str(r['target_id'])
+            failed_ids.append(sid)
+            if str(r.get('star_type')) in ('MARKED', 'UNMARKED') and str(r.get('split')) in ('TRAIN', 'CONTROL'):
+                add(sid, str(r['star_type']), str(r['split']))
+    planned = []
+    if os.path.exists(targets_path):
+        with open(targets_path, 'r', encoding='utf-8') as fh:
+            planned = [ln.strip() for ln in fh if ln.strip()]
+    for sid in groups['tr_m'] + groups['ctrl_m'] + groups['tr_u'] + groups['ctrl_u'] + failed_ids:
+        if sid not in planned:
+            planned.append(sid)
+    marked_ids = [s for s in planned if s in set(groups['tr_m'] + groups['ctrl_m']) or (s not in seen and s in star_prim)]
+    unmarked_ids = [s for s in planned if s not in set(marked_ids)]
+    return groups, planned, marked_ids, unmarked_ids
 
 def apply_log1p(X):
     return np.log1p(np.maximum(X, 0))
@@ -385,6 +502,7 @@ def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, see
     oof_mean = np.zeros(len(y_tr))
     oof_std = np.zeros(len(y_tr))
 
+    n_models = min(20, max(5, len(y_tr) * 2))
     if n_splits >= 2:
         gkf = GroupKFold(n_splits=n_splits)
         for tr_g_idx, val_g_idx in gkf.split(X_tr_scaled, y_tr, groups=groups_tr):
@@ -396,7 +514,7 @@ def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, see
             fold_models = []
             rng_fold = np.random.RandomState(seed)
             u_fold_groups = np.unique(groups_tr[tr_g_idx])
-            n_fold_m = min(10, max(4, len(tr_g_idx)))
+            n_fold_m = n_models
             for _ in range(n_fold_m):
                 b_g = rng_fold.choice(u_fold_groups, size=len(u_fold_groups), replace=True)
                 b_idx = []
@@ -405,7 +523,7 @@ def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, see
                 b_idx = [i for i in b_idx if i in tr_g_idx]
                 if len(np.unique(y_tr[b_idx])) < 2:
                     b_idx = tr_g_idx
-                mf = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.08, scale_pos_weight=r_fold, random_state=int(rng_fold.randint(10000)), eval_metric='logloss')
+                mf = XGBClassifier(n_estimators=60, max_depth=4, learning_rate=0.08, scale_pos_weight=r_fold, random_state=int(rng_fold.randint(10000)), eval_metric='logloss')
                 mf.fit(X_tr_scaled[b_idx], y_tr[b_idx])
                 fold_models.append(mf)
             val_preds = np.array([mf.predict_proba(X_tr_scaled[val_g_idx])[:, 1] for mf in fold_models])
@@ -458,7 +576,6 @@ def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, see
 
     xgb_base = XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.08, scale_pos_weight=ratio, random_state=seed, eval_metric='logloss')
     xgb_base.fit(X_tr_scaled, y_tr)
-    n_models = min(20, max(5, len(y_tr) * 2))
     ensemble_models = []
     rng = np.random.RandomState(seed)
     for _ in range(n_models):
@@ -503,31 +620,65 @@ def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, see
     df_res['shap_top3'] = top_factors
     return df_res, xgb_base, explainer, scale_pipe, (t_high, t_low, s_max)
 
+BOOT_KEYS = ['acc_ci', 'auc_ci', 'cov_ci', 'prec_ci', 'rec_ci', 'acc_accepted_ci']
+
 def bootstrap_star_metrics(df_eval, n_boot=1000, seed=42):
     unique_stars = df_eval['target_id'].unique()
     if len(unique_stars) == 0:
-        return {'acc_ci': (0.0, 0.0), 'auc_ci': (0.0, 0.0), 'cov_ci': (0.0, 0.0)}
+        return {k: (0.0, 0.0) for k in BOOT_KEYS}
     rng = np.random.RandomState(seed)
-    acc_list, auc_list, cov_list = [], [], []
+    star_values = df_eval['target_id'].values
+    pos_by_star = {sid: np.where(star_values == sid)[0] for sid in unique_stars}
+    y_all = df_eval['target_bin'].values
+    p_all = df_eval['p_mean'].values
+    dec_all = df_eval['decision'].values if 'decision' in df_eval else None
+    lists = {k: [] for k in BOOT_KEYS}
     for _ in range(n_boot):
         b_stars = rng.choice(unique_stars, size=len(unique_stars), replace=True)
-        dfs = []
-        for s in b_stars:
-            dfs.append(df_eval[df_eval['target_id'] == s])
-        b_df = pd.concat(dfs, ignore_index=True)
-        if 'decision' in b_df:
-            acc_mask = b_df['decision'].isin(['CANDIDATE', 'FALSE_POSITIVE'])
-            cov_list.append(float(np.mean(acc_mask)))
-        if len(b_df['target_bin'].unique()) >= 2:
-            acc_list.append(accuracy_score(b_df['target_bin'], (b_df['p_mean'] >= 0.5).astype(int)))
+        b_idx = np.concatenate([pos_by_star[sid] for sid in b_stars])
+        y = y_all[b_idx]
+        p = p_all[b_idx]
+        if dec_all is not None:
+            d = dec_all[b_idx]
+            acc_mask = np.isin(d, ['CANDIDATE', 'FALSE_POSITIVE'])
+            lists['cov_ci'].append(float(np.mean(acc_mask)))
+            if acc_mask.any():
+                lists['acc_accepted_ci'].append(float(np.mean((d[acc_mask] == 'CANDIDATE').astype(int) == y[acc_mask])))
+        if len(np.unique(y)) >= 2:
+            pred = (p >= 0.5).astype(int)
+            lists['acc_ci'].append(accuracy_score(y, pred))
+            lists['prec_ci'].append(precision_score(y, pred, zero_division=0))
+            lists['rec_ci'].append(recall_score(y, pred, zero_division=0))
             try:
-                auc_list.append(roc_auc_score(b_df['target_bin'], b_df['p_mean']))
+                lists['auc_ci'].append(roc_auc_score(y, p))
             except Exception:
                 pass
-    acc_ci = (float(np.percentile(acc_list, 5)), float(np.percentile(acc_list, 95))) if acc_list else (0.0, 0.0)
-    auc_ci = (float(np.percentile(auc_list, 5)), float(np.percentile(auc_list, 95))) if auc_list else (0.0, 0.0)
-    cov_ci = (float(np.percentile(cov_list, 5)), float(np.percentile(cov_list, 95))) if cov_list else (0.0, 0.0)
-    return {'acc_ci': acc_ci, 'auc_ci': auc_ci, 'cov_ci': cov_ci}
+    out = {}
+    for k in BOOT_KEYS:
+        vals = lists[k]
+        out[k] = (float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))) if vals else (0.0, 0.0)
+    return out
+
+def evaluate_ablation(feats, df_train, df_ctrl_all, ctrl_stars, showcase_id, seed, full_pool, target_precision, n_boot=500):
+    pred, model, _, _, _ = train_and_eval_pipeline(df_train, df_ctrl_all, feats, seed, full_features_pool=full_pool, target_precision=target_precision)
+    if model is None:
+        return None
+    sub = pred[(pred['target_id'].isin(ctrl_stars)) & (pred['target_id'] != showcase_id) & (pred['match_status'] == 'MATCHED')].copy()
+    if len(sub) == 0 or np.isnan(sub['p_mean'].values).all():
+        return None
+    y = sub['target_bin'].values
+    p = sub['p_mean'].values
+    auc = float(roc_auc_score(y, p)) if len(np.unique(y)) >= 2 else float('nan')
+    boot = bootstrap_star_metrics(sub, n_boot=n_boot, seed=seed)
+    top_shap = sub['shap_top3'].iloc[0].split('|')[0].strip() if 'shap_top3' in sub else '-'
+    return {
+        'acc': float(accuracy_score(y, (p >= 0.5).astype(int))),
+        'auc': auc,
+        'auc_ci': boot['auc_ci'],
+        'coverage': float(np.mean(sub['decision'].isin(['CANDIDATE', 'FALSE_POSITIVE']))),
+        'top_shap': top_shap,
+        'n_features': len(feats),
+    }
 
 def generate_showcase_figure(showcase_id, showcase_signals, out_path, quick_mode, cache_dir=None, layout='tall', lang='ru'):
     import lightkurve as lk
@@ -610,6 +761,9 @@ def main():
     parser.add_argument('--max-signals', type=int, default=4)
     parser.add_argument('--star-timeout', type=float, default=1800.0)
     parser.add_argument('--min-free-gb', type=float, default=5.0)
+    parser.add_argument('--report-only', action='store_true', help='Rebuild the report and tables from existing feature and split files; no extraction, retries or downloads.')
+    parser.add_argument('--allow-legacy', action='store_true', help='Resume extraction into a features file whose pipeline_version differs or is missing, with a warning.')
+    parser.add_argument('--balance-halves', action='store_true', help='Trim the four star groups to the size of the smallest one (previous behaviour).')
     parser.add_argument('--verbose', action='store_true', help='Print detailed output to the console instead of the progress bar.')
     args = parser.parse_args()
     global _console, _logger, _verbose
@@ -634,6 +788,7 @@ def main():
     os.makedirs(os.path.join(out_dir, 'figures'), exist_ok=True)
 
     file_suffix = '_quick' if args.quick else ''
+    out_suffix = file_suffix + ('_report' if args.report_only else '')
     emit(f"=== Project Onyx: Demonstration Pipeline (Mode Demo) ===")
     emit(f"Config: marked_stars={args.marked_stars}, unmarked_stars={args.unmarked_stars}, quick={args.quick}, seed={args.seed}, showcase={args.showcase_star}")
     emit(f"Output directory: {out_dir}")
@@ -648,102 +803,115 @@ def main():
     phase('selecting marked and unmarked stars')
 
     labels_path = os.path.join('data', 'labels', 'kepler_labels.csv')
+    if not os.path.exists(labels_path) and args.report_only:
+        emit(f"Ошибка: в режиме --report-only нужен локальный файл меток {labels_path}.")
+        sys.exit(1)
     if not os.path.exists(labels_path):
         extractor_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), '1_data_extractor.py')
         run_child([sys.executable, extractor_script, '--mission', 'Kepler', '--limit', '1', '--cache-dir', args.cache_dir], check=False)
     labels_df = pd.read_csv(labels_path, dtype={'target_id': str})
 
-    marked_ids, star_prim = get_marked_stars(labels_df, args.marked_stars, args.seed, args.showcase_star)
-    stellar_cache = os.path.join('data', 'labels', 'kepler_stellar_cache.csv')
-    marked_info = fetch_stellar_params(marked_ids, stellar_cache)
+    if args.report_only:
+        _, star_prim = get_marked_stars(labels_df, 1, args.seed, args.showcase_star)
+        report_groups, all_selected_stars, marked_ids, unmarked_ids = load_report_plan(out_dir, file_suffix, star_prim)
+        tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked = report_groups['tr_m'], report_groups['ctrl_m'], report_groups['tr_u'], report_groups['ctrl_u']
+        planned_order = list(all_selected_stars)
+        comp_table = None
+        ks_table = None
+        emit("Режим --report-only: выбор звёзд и таблицы баланса выборки пропущены, план взят из файлов разбиения и сбоев.")
+    else:
+        marked_ids, star_prim = get_marked_stars(labels_df, args.marked_stars, args.seed, args.showcase_star)
+        stellar_cache = os.path.join('data', 'labels', 'kepler_stellar_cache.csv')
+        marked_info = fetch_stellar_params(marked_ids, stellar_cache)
 
-    unmarked_pool_file = os.path.join('data', 'labels', 'kepler_stellar_unmarked_pool.csv')
-    pool_df = get_unmarked_pool(labels_df, unmarked_pool_file, args.unmarked_file)
-    unmarked_ids, unmarked_info = match_unmarked_stars(marked_ids, marked_info, pool_df, args.unmarked_stars, args.seed, labels_df=labels_df)
+        unmarked_pool_file = os.path.join('data', 'labels', 'kepler_stellar_unmarked_pool.csv')
+        pool_df = get_unmarked_pool(labels_df, unmarked_pool_file, args.unmarked_file)
+        unmarked_ids, unmarked_info = match_unmarked_stars(marked_ids, marked_info, pool_df, args.unmarked_stars, args.seed, labels_df=labels_df)
 
-    phase('checking sample balance')
-    stats_m = compute_group_stats(marked_info)
-    stats_u = compute_group_stats(unmarked_info)
-    comp_table = pd.DataFrame([
-        {'Группа': 'Отмеченные (KOI)', 'Звёзд': stats_m['count'], 'Kepmag (среднее)': f"{stats_m['mag_mean']:.2f} ± {stats_m['mag_std']:.2f}", 'Kepmag (медиана)': f"{stats_m['mag_median']:.2f}", 'Кварталов (среднее)': f"{stats_m['q_mean']:.1f}", 'Кварталов (медиана)': f"{stats_m['q_median']:.0f}"},
-        {'Группа': 'Неотмеченные (Control)', 'Звёзд': stats_u['count'], 'Kepmag (среднее)': f"{stats_u['mag_mean']:.2f} ± {stats_u['mag_std']:.2f}", 'Kepmag (медиана)': f"{stats_u['mag_median']:.2f}", 'Кварталов (среднее)': f"{stats_u['q_mean']:.1f}", 'Кварталов (медиана)': f"{stats_u['q_median']:.0f}"}
-    ])
-    emit("\nТаблица сравнения распределений звёздных параметров:", show=False)
-    emit(comp_table.to_string(index=False), show=False)
+        phase('checking sample balance')
+        stats_m = compute_group_stats(marked_info)
+        stats_u = compute_group_stats(unmarked_info)
+        comp_table = pd.DataFrame([
+            {'Группа': 'Отмеченные (KOI)', 'Звёзд': stats_m['count'], 'Kepmag (среднее)': f"{stats_m['mag_mean']:.2f} ± {stats_m['mag_std']:.2f}", 'Kepmag (медиана)': f"{stats_m['mag_median']:.2f}", 'Кварталов (среднее)': f"{stats_m['q_mean']:.1f}", 'Кварталов (медиана)': f"{stats_m['q_median']:.0f}"},
+            {'Группа': 'Неотмеченные (Control)', 'Звёзд': stats_u['count'], 'Kepmag (среднее)': f"{stats_u['mag_mean']:.2f} ± {stats_u['mag_std']:.2f}", 'Kepmag (медиана)': f"{stats_u['mag_median']:.2f}", 'Кварталов (среднее)': f"{stats_u['q_mean']:.1f}", 'Кварталов (медиана)': f"{stats_u['q_median']:.0f}"}
+        ])
+        emit("\nТаблица сравнения распределений звёздных параметров:", show=False)
+        emit(comp_table.to_string(index=False), show=False)
 
-    marked_kic = [int(s) for s in marked_ids if str(s).isdigit()]
-    unmarked_kic = [int(s) for s in unmarked_ids if str(s).isdigit()]
-    ks_kic = ks_2samp(marked_kic, unmarked_kic)
+        marked_kic = [int(s) for s in marked_ids if str(s).isdigit()]
+        unmarked_kic = [int(s) for s in unmarked_ids if str(s).isdigit()]
+        ks_kic = ks_2samp(marked_kic, unmarked_kic)
 
-    m_mags = [marked_info[s][0] for s in marked_ids if s in marked_info]
-    u_mags = [unmarked_info[s][0] for s in unmarked_ids if s in unmarked_info]
-    ks_mag = ks_2samp(m_mags, u_mags)
+        m_mags = [marked_info[s][0] for s in marked_ids if s in marked_info]
+        u_mags = [unmarked_info[s][0] for s in unmarked_ids if s in unmarked_info]
+        ks_mag = ks_2samp(m_mags, u_mags)
 
-    m_qs = [marked_info[s][1] for s in marked_ids if s in marked_info]
-    u_qs = [unmarked_info[s][1] for s in unmarked_ids if s in unmarked_info]
-    ks_q = ks_2samp(m_qs, u_qs)
+        m_qs = [marked_info[s][1] for s in marked_ids if s in marked_info]
+        u_qs = [unmarked_info[s][1] for s in unmarked_ids if s in unmarked_info]
+        ks_q = ks_2samp(m_qs, u_qs)
 
-    ks_table = pd.DataFrame([
-        {
-            'Параметр': 'KIC-номер',
-            'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(marked_kic)} / {int(np.percentile(marked_kic, 25))} / {int(np.median(marked_kic))} / {int(np.percentile(marked_kic, 75))} / {np.max(marked_kic)}",
-            'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(unmarked_kic)} / {int(np.percentile(unmarked_kic, 25))} / {int(np.median(unmarked_kic))} / {int(np.percentile(unmarked_kic, 75))} / {np.max(unmarked_kic)}",
-            'Статистика KS (D)': f"{ks_kic.statistic:.3f}",
-            'p-значение': f"{ks_kic.pvalue:.4f}"
-        },
-        {
-            'Параметр': 'Яркость (kepmag)',
-            'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(m_mags):.2f} / {np.percentile(m_mags, 25):.2f} / {np.median(m_mags):.2f} / {np.percentile(m_mags, 75):.2f} / {np.max(m_mags):.2f}",
-            'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(u_mags):.2f} / {np.percentile(u_mags, 25):.2f} / {np.median(u_mags):.2f} / {np.percentile(u_mags, 75):.2f} / {np.max(u_mags):.2f}",
-            'Статистика KS (D)': f"{ks_mag.statistic:.3f}",
-            'p-значение': f"{ks_mag.pvalue:.4f}"
-        },
-        {
-            'Параметр': 'Кварталов (quarters)',
-            'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(m_qs)} / {int(np.percentile(m_qs, 25))} / {int(np.median(m_qs))} / {int(np.percentile(m_qs, 75))} / {np.max(m_qs)}",
-            'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(u_qs)} / {int(np.percentile(u_qs, 25))} / {int(np.median(u_qs))} / {int(np.percentile(u_qs, 75))} / {np.max(u_qs)}",
-            'Статистика KS (D)': f"{ks_q.statistic:.3f}",
-            'p-значение': f"{ks_q.pvalue:.4f}"
-        }
-    ])
-    emit("\nРезультаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):", show=False)
-    emit(ks_table.to_string(index=False), show=False)
+        ks_table = pd.DataFrame([
+            {
+                'Параметр': 'KIC-номер',
+                'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(marked_kic)} / {int(np.percentile(marked_kic, 25))} / {int(np.median(marked_kic))} / {int(np.percentile(marked_kic, 75))} / {np.max(marked_kic)}",
+                'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(unmarked_kic)} / {int(np.percentile(unmarked_kic, 25))} / {int(np.median(unmarked_kic))} / {int(np.percentile(unmarked_kic, 75))} / {np.max(unmarked_kic)}",
+                'Статистика KS (D)': f"{ks_kic.statistic:.3f}",
+                'p-значение': f"{ks_kic.pvalue:.4f}"
+            },
+            {
+                'Параметр': 'Яркость (kepmag)',
+                'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(m_mags):.2f} / {np.percentile(m_mags, 25):.2f} / {np.median(m_mags):.2f} / {np.percentile(m_mags, 75):.2f} / {np.max(m_mags):.2f}",
+                'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(u_mags):.2f} / {np.percentile(u_mags, 25):.2f} / {np.median(u_mags):.2f} / {np.percentile(u_mags, 75):.2f} / {np.max(u_mags):.2f}",
+                'Статистика KS (D)': f"{ks_mag.statistic:.3f}",
+                'p-значение': f"{ks_mag.pvalue:.4f}"
+            },
+            {
+                'Параметр': 'Кварталов (quarters)',
+                'Отмеченные (min / Q1 / med / Q3 / max)': f"{np.min(m_qs)} / {int(np.percentile(m_qs, 25))} / {int(np.median(m_qs))} / {int(np.percentile(m_qs, 75))} / {np.max(m_qs)}",
+                'Неотмеченные (min / Q1 / med / Q3 / max)': f"{np.min(u_qs)} / {int(np.percentile(u_qs, 25))} / {int(np.median(u_qs))} / {int(np.percentile(u_qs, 75))} / {np.max(u_qs)}",
+                'Статистика KS (D)': f"{ks_q.statistic:.3f}",
+                'p-значение': f"{ks_q.pvalue:.4f}"
+            }
+        ])
+        emit("\nРезультаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):", show=False)
+        emit(ks_table.to_string(index=False), show=False)
 
-    tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked = split_stars(marked_ids, unmarked_ids, star_prim, args.showcase_star, args.seed)
-    all_selected_stars = tr_marked + ctrl_marked + tr_unmarked + ctrl_unmarked
-    targets_demo_file = os.path.join(out_dir, f"targets_demo{file_suffix}.txt")
-    with open(targets_demo_file, 'w', encoding='utf-8') as f:
-        for sid in all_selected_stars:
-            f.write(f"{sid}\n")
+        tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked = split_stars(marked_ids, unmarked_ids, star_prim, args.showcase_star, args.seed, balance=args.balance_halves)
+        planned_order = tr_marked + ctrl_marked + tr_unmarked + ctrl_unmarked
+        all_selected_stars = shuffled_order(planned_order, args.seed)
+        targets_demo_file = os.path.join(out_dir, f"targets_demo{file_suffix}.txt")
+        with open(targets_demo_file, 'w', encoding='utf-8') as f:
+            for sid in all_selected_stars:
+                f.write(f"{sid}\n")
 
     features_demo_csv = os.path.join(out_dir, f"features_demo{file_suffix}.csv")
     failed_csv = os.path.join(out_dir, f"features_demo{file_suffix}_failed.csv")
     diag_source_csv = os.path.join(out_dir, f"features_demo{file_suffix}_diagnostics.csv")
 
-    already_done_stars = set()
-    if os.path.exists(features_demo_csv) and os.path.getsize(features_demo_csv) > 0:
-        try:
-            df_existing = pd.read_csv(features_demo_csv, dtype={'target_id': str})
-            already_done_stars.update(df_existing['target_id'].dropna().astype(str).unique())
-        except Exception:
-            pass
-    if os.path.exists(diag_source_csv) and os.path.getsize(diag_source_csv) > 0:
-        try:
-            df_diag_ex = pd.read_csv(diag_source_csv, dtype={'target_id': str})
-            already_done_stars.update(df_diag_ex[df_diag_ex['status'] == 'OK']['target_id'].dropna().astype(str).unique())
-        except Exception:
-            pass
-    if os.path.exists(failed_csv) and os.path.getsize(failed_csv) > 0:
-        try:
-            df_failed_existing = pd.read_csv(failed_csv, dtype={'target_id': str})
-            already_done_stars.update(df_failed_existing['target_id'].dropna().astype(str).unique())
-        except Exception:
-            pass
-
-    targets_to_run = [sid for sid in all_selected_stars if sid not in already_done_stars]
-    emit(f"\nСостояние выборки перед извлечением: всего по плану {len(all_selected_stars)} звёзд, уже обработано ранее: {len(all_selected_stars) - len(targets_to_run)}, осталось обработать: {len(targets_to_run)}")
+    pipeline_ver = build_pipeline_version(args.quick, args.flatten_days, args.max_signals)
+    report_version_note = ''
+    if args.report_only:
+        if os.path.exists(features_demo_csv):
+            ver_note = check_pipeline_version(features_demo_csv, pipeline_ver, report_only=True)
+            report_version_note = ver_note or ''
+            if ver_note:
+                emit(f"ВНИМАНИЕ: {ver_note}")
+        emit("Режим --report-only: извлечение признаков, повторы и скачивание не выполняются.")
+        targets_to_run = []
+    else:
+        annotate_failed_table(failed_csv, plan_group_map(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked))
+        already_done_stars = stars_done_for_run(features_demo_csv, diag_source_csv, failed_csv)
+        targets_to_run = [sid for sid in all_selected_stars if sid not in already_done_stars]
+        emit(f"\nСостояние выборки перед извлечением: всего по плану {len(all_selected_stars)} звёзд, уже обработано ранее: {len(all_selected_stars) - len(targets_to_run)}, осталось обработать: {len(targets_to_run)}")
 
     if len(targets_to_run) > 0:
+        try:
+            ver_note = check_pipeline_version(features_demo_csv, pipeline_ver, allow_legacy=args.allow_legacy)
+        except PipelineVersionError as ver_err:
+            emit(f"Ошибка: {ver_err}")
+            sys.exit(1)
+        if ver_note:
+            emit(f"ВНИМАНИЕ: {ver_note}")
         targets_run_file = os.path.join(out_dir, f"targets_to_run{file_suffix}.txt")
         with open(targets_run_file, 'w', encoding='utf-8') as f:
             for sid in targets_to_run:
@@ -767,9 +935,12 @@ def main():
             cmd_ext.append('--quick')
         if args.smoke_test:
             cmd_ext.append('--smoke-test')
+        if args.allow_legacy:
+            cmd_ext.append('--allow-legacy')
         emit(f"Запуск извлечения признаков для {len(targets_to_run)} звёзд...")
         phase('extracting features')
         run_child(cmd_ext, check=True)
+        annotate_failed_table(failed_csv, plan_group_map(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked))
 
     if not os.path.exists(features_demo_csv) or os.path.getsize(features_demo_csv) == 0:
         emit(f"Ошибка: файл признаков {features_demo_csv} пуст или не найден!")
@@ -817,26 +988,14 @@ def main():
     else:
         emit(f"\nЖёсткая проверка выборки УСПЕШНО пройдена: запланировано {len(all_selected_stars)}, успешно обработано {len(planned_ids.intersection(processed_ids))}, сбоев {len(planned_ids.intersection(failed_ids))}, расхождений 0.\n")
 
-    succ_tr_m = [s for s in tr_marked if s in processed_ids]
-    succ_ctrl_m = [s for s in ctrl_marked if s in processed_ids]
-    succ_tr_u = [s for s in tr_unmarked if s in processed_ids]
-    succ_ctrl_u = [s for s in ctrl_unmarked if s in processed_ids]
-
-    n_bal = min(len(succ_tr_m), len(succ_ctrl_m), len(succ_tr_u), len(succ_ctrl_u))
     showcase_id = str(args.showcase_star)
-
-    if showcase_id in succ_ctrl_m:
-        succ_ctrl_m.remove(showcase_id)
-        final_ctrl_m = [showcase_id] + succ_ctrl_m[:max(0, n_bal - 1)]
-    else:
-        final_ctrl_m = succ_ctrl_m[:n_bal]
-    final_tr_m = succ_tr_m[:n_bal]
-    final_tr_u = succ_tr_u[:n_bal]
-    final_ctrl_u = succ_ctrl_u[:n_bal]
-
-    total_dropped = (len(succ_tr_m) - len(final_tr_m)) + (len(succ_ctrl_m) - (len(final_ctrl_m) - (1 if showcase_id in final_ctrl_m else 0))) + (len(succ_tr_u) - len(final_tr_u)) + (len(succ_ctrl_u) - len(final_ctrl_u))
+    fin = finalize_groups(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked, processed_ids, showcase_id, balance=args.balance_halves)
+    final_tr_m, final_ctrl_m, final_tr_u, final_ctrl_u = fin['tr_m'], fin['ctrl_m'], fin['tr_u'], fin['ctrl_u']
+    succ_tr_m, succ_ctrl_m, succ_tr_u, succ_ctrl_u = fin['succ']['tr_m'], fin['succ']['ctrl_m'], fin['succ']['tr_u'], fin['succ']['ctrl_u']
+    dropped_balance = set(fin['dropped'])
+    total_dropped = len(dropped_balance)
     phase('splitting stars into halves')
-    emit(f"\nСбалансированное разбиение по звёздам (равные половины):")
+    emit(f"\n{'Сбалансированное разбиение по звёздам (равные половины, --balance-halves)' if args.balance_halves else 'Разбиение по звёздам (группы не усекаются)'}:")
     emit(f"  Обучающая часть: {len(final_tr_m)} отмеченных, {len(final_tr_u)} неотмеченных (Всего звёзд: {len(final_tr_m)+len(final_tr_u)})")
     emit(f"  Контрольная часть: {len(final_ctrl_m)} отмеченных (включая Kepler-80), {len(final_ctrl_u)} неотмеченных (Всего звёзд: {len(final_ctrl_m)+len(final_ctrl_u)})")
     if total_dropped > 0:
@@ -847,7 +1006,8 @@ def main():
     for s in final_tr_u: split_records.append({'target_id': s, 'star_type': 'UNMARKED', 'split': 'TRAIN', 'primary_label': 'NONE'})
     for s in final_ctrl_m: split_records.append({'target_id': s, 'star_type': 'MARKED', 'split': 'CONTROL', 'primary_label': star_prim.get(s, 'NONE')})
     for s in final_ctrl_u: split_records.append({'target_id': s, 'star_type': 'UNMARKED', 'split': 'CONTROL', 'primary_label': 'NONE'})
-    pd.DataFrame(split_records).to_csv(os.path.join(out_dir, f"demo_stars_split{file_suffix}.csv"), index=False, encoding='utf-8')
+    if not args.report_only:
+        pd.DataFrame(split_records).to_csv(os.path.join(out_dir, f"demo_stars_split{file_suffix}.csv"), index=False, encoding='utf-8')
 
     diag_source_csv = os.path.join(out_dir, f"features_demo{file_suffix}_diagnostics.csv")
     diag_map = {}
@@ -861,7 +1021,8 @@ def main():
 
     diag_rows_csv = []
     diag_rows_md = []
-    for sid in all_selected_stars:
+    group_map = plan_group_map(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked)
+    for sid in planned_order:
         is_m = (sid in marked_ids)
         st_type_str = 'Отмеченная (KOI)' if is_m else 'Неотмеченная (Control)'
         if sid in (final_tr_m + final_tr_u):
@@ -869,9 +1030,11 @@ def main():
         elif sid in (final_ctrl_m + final_ctrl_u):
             split_str = 'Контрольная'
         else:
-            split_str = 'Отброшена для баланса'
+            split_str = 'Отброшена для баланса' if sid in dropped_balance else 'Вне половин (сбой или не обработана)'
 
         is_eb = 'ДА' if is_eclipsing_binary(sid, eb_stars_set) else 'НЕТ'
+        plan_type, plan_split = group_map.get(sid, ('MARKED' if is_m else 'UNMARKED', None))
+        plan_group_str = f"{TYPE_LABELS_RU[plan_type]} / {SPLIT_LABELS_RU.get(plan_split, 'не определена')}"
 
         d_info = diag_map.get(sid)
         if d_info is not None:
@@ -911,7 +1074,9 @@ def main():
         diag_rows_csv.append({
             'target_id': sid,
             'тип': st_type_str,
+            'плановая группа': plan_group_str,
             'половина': split_str,
+            'pipeline_version': str(d_info.get('pipeline_version', '')) if d_info is not None else '',
             'число файлов': nf,
             'число уникальных кварталов': nq,
             'базлайн в сутках': round(bd, 2),
@@ -945,7 +1110,7 @@ def main():
 
     df_diag_csv = pd.DataFrame(diag_rows_csv)
     df_diag_md = pd.DataFrame(diag_rows_md)
-    diag_csv_out = os.path.join(out_dir, f"diagnostics_stars{file_suffix}.csv")
+    diag_csv_out = os.path.join(out_dir, f"diagnostics_stars{out_suffix}.csv")
     df_diag_csv.to_csv(diag_csv_out, index=False, encoding='utf-8')
 
     df_features['target_bin'] = df_features['label'].apply(lambda x: 1 if str(x).upper() in ['CONFIRMED', 'CANDIDATE'] else 0)
@@ -1006,6 +1171,9 @@ def main():
             acc_accepted, prec_accepted, rec_accepted = 0.0, 0.0, 0.0
 
         boot_res = bootstrap_star_metrics(ctrl_m_eval, n_boot=500, seed=args.seed)
+        brier_a = brier_score(y_ctrl_true, y_ctrl_prob)
+        brier_ref = float(np.mean(y_ctrl_true) * (1.0 - np.mean(y_ctrl_true)))
+        reliab_table = reliability_table(y_ctrl_true, y_ctrl_prob, 5)
 
         b0_pred = np.zeros(len(y_ctrl_true), dtype=int)
         b0_acc = float(accuracy_score(y_ctrl_true, b0_pred))
@@ -1035,7 +1203,7 @@ def main():
         b1_acc = float(accuracy_score(y_ctrl_true, snr_pred))
         b1_rec = float(recall_score(y_ctrl_true, snr_pred, zero_division=0))
         b1_prec = float(precision_score(y_ctrl_true, snr_pred, zero_division=0))
-        b1_auc = float(roc_auc_score(y_ctrl_true, ctrl_snr)) if len(np.unique(y_ctrl_true)) >= 2 else 0.500
+        b1_auc = oriented_auc(y_ctrl_true, ctrl_snr, best_snr_dir)
         b1_cov = 1.000
 
         lr_features = [c for c in ['bls_depth_snr', 'bls_depth_ppm', 'bls_period_d', 'centroid_shift_total_sigma'] if c in df_tr_m_matched.columns]
@@ -1062,24 +1230,20 @@ def main():
             {'Модель / Эталон': 'Основная модель (только принятые решения)', 'Точность': f"{acc_accepted:.3f}", 'Полнота': f"{rec_accepted:.3f}", 'Precision': f"{prec_accepted:.3f}", 'ROC-AUC': '-', 'Охват (Coverage)': f"{coverage_ctrl:.1%}"}
         ])
 
+        top_shap_clean = ctrl_m_eval['shap_top3'].iloc[0].split('|')[0].strip() if len(ctrl_m_eval) > 0 and 'shap_top3' in ctrl_m_eval else '-'
+        abl_rows = [{'Конфигурация': f"Основная модель (признаков: {len(feature_cols)})", 'Точность': f"{acc_a:.3f}", 'ROC-AUC': f"{auc_a:.3f}", '95% ДИ ROC-AUC': ci_text(boot_res['auc_ci']), 'Охват решений': f"{coverage_ctrl:.1%}", 'Топ-1 признак SHAP': top_shap_clean}]
         cov_present = [c for c in coverage_cols if c in df_features.columns]
+        abl_configs = []
         if cov_present:
-            feat_with_cov = feature_cols + cov_present
-            ctrl_pred_cov, model_cov, expl_cov, _, _ = train_and_eval_pipeline(df_tr_m_matched, df_ctrl_all, feat_with_cov, args.seed, full_features_pool=df_features, target_precision=args.target_precision)
-            ctrl_m_cov = ctrl_pred_cov[(ctrl_pred_cov['target_id'].isin(set(final_ctrl_m))) & (ctrl_pred_cov['target_id'] != showcase_id) & (ctrl_pred_cov['match_status'] == 'MATCHED')].copy()
-            y_cov_prob = ctrl_m_cov['p_mean'].values
-            y_cov_pred = (y_cov_prob >= 0.5).astype(int)
-            acc_cov = float(accuracy_score(y_ctrl_true, y_cov_pred))
-            auc_cov = float(roc_auc_score(y_ctrl_true, y_cov_prob)) if len(np.unique(y_ctrl_true)) >= 2 else 0.0
-            cov_cov_val = float(np.mean(ctrl_m_cov['decision'].isin(['CANDIDATE', 'FALSE_POSITIVE'])))
-            top_shap_cov = ctrl_m_cov['shap_top3'].iloc[0].split('|')[0].strip() if len(ctrl_m_cov) > 0 and 'shap_top3' in ctrl_m_cov else '-'
-            top_shap_clean = ctrl_m_eval['shap_top3'].iloc[0].split('|')[0].strip() if len(ctrl_m_eval) > 0 and 'shap_top3' in ctrl_m_eval else '-'
-            ablation_table = pd.DataFrame([
-                {'Конфигурация': 'Без признаков покрытия (основная модель)', 'Точность': f"{acc_a:.3f}", 'ROC-AUC': f"{auc_a:.3f}", 'Охват решений': f"{coverage_ctrl:.1%}", 'Топ-1 признак SHAP': top_shap_clean},
-                {'Конфигурация': 'С признаками покрытия (+baseline_d)', 'Точность': f"{acc_cov:.3f}", 'ROC-AUC': f"{auc_cov:.3f}", 'Охват решений': f"{cov_cov_val:.1%}", 'Топ-1 признак SHAP': top_shap_cov}
-            ])
-        else:
-            ablation_table = pd.DataFrame()
+            abl_configs.append(('С признаками покрытия (+' + ', '.join(cov_present) + ')', feature_cols + cov_present))
+        abl_configs.extend(ablation_feature_sets(feature_cols))
+        ctrl_star_set = set(final_ctrl_m)
+        for abl_name, abl_feats in abl_configs:
+            abl_res = evaluate_ablation(abl_feats, df_tr_m_matched, df_ctrl_all, ctrl_star_set, showcase_id, args.seed, df_features, args.target_precision)
+            if abl_res is None:
+                continue
+            abl_rows.append({'Конфигурация': f"{abl_name} [признаков: {abl_res['n_features']}]", 'Точность': f"{abl_res['acc']:.3f}", 'ROC-AUC': f"{abl_res['auc']:.3f}", '95% ДИ ROC-AUC': ci_text(abl_res['auc_ci']), 'Охват решений': f"{abl_res['coverage']:.1%}", 'Топ-1 признак SHAP': abl_res['top_shap']})
+        ablation_table = pd.DataFrame(abl_rows)
     else:
         acc_a = None
         rec_a = None
@@ -1093,7 +1257,10 @@ def main():
         acc_accepted = None
         prec_accepted = None
         rec_accepted = None
-        boot_res = {'acc_ci': (0.0, 0.0), 'auc_ci': (0.0, 0.0), 'cov_ci': (0.0, 0.0)}
+        boot_res = {k: (0.0, 0.0) for k in BOOT_KEYS}
+        brier_a = None
+        brier_ref = None
+        reliab_table = pd.DataFrame()
         baselines_table = pd.DataFrame()
         ablation_table = pd.DataFrame()
 
@@ -1117,6 +1284,13 @@ def main():
         mean_auc_two_way = None
 
     unmatched_marked_signals = ctrl_pred[(ctrl_pred['target_id'].isin(set(final_ctrl_m))) & (ctrl_pred['match_status'] == 'UNMATCHED')]
+    ctrl_koi_stars = set(final_ctrl_m) - {showcase_id}
+    koi_ctrl = labels_df[labels_df['target_id'].astype(str).isin(ctrl_koi_stars)][['target_id', 'label', 'catalog_period']].copy()
+    koi_ctrl = koi_ctrl[koi_ctrl['label'].astype(str).str.upper().str.replace(' ', '_').isin(['CONFIRMED', 'CANDIDATE', 'FALSE_POSITIVE'])]
+    koi_recovery = build_koi_recovery(koi_ctrl, ctrl_pred[ctrl_pred['target_id'].isin(ctrl_koi_stars)])
+    koi_summary = summarize_koi_recovery(koi_recovery)
+    koi_recovery_csv_out = os.path.join(out_dir, f"koi_recovery{out_suffix}.csv")
+    koi_recovery.to_csv(koi_recovery_csv_out, index=False, encoding='utf-8')
 
     ctrl_unmarked_signals = ctrl_pred[ctrl_pred['target_id'].isin(set(final_ctrl_u))].copy()
     n_unm_stars = len(final_ctrl_u)
@@ -1164,16 +1338,16 @@ def main():
 
     if can_eval_a and len(clean_unmarked_signals) > 0 and not np.isnan(clean_unmarked_signals['p_mean']).all():
         unm_probs = ctrl_unmarked_signals['p_mean'].values
-        n_false_alarms = int(np.sum(ctrl_unmarked_signals['decision'] == 'CANDIDATE'))
-        far_rate = float(n_false_alarms / len(ctrl_unmarked_signals))
+        n_cand_unm = int(np.sum(ctrl_unmarked_signals['decision'] == 'CANDIDATE'))
+        cand_share_unm = float(n_cand_unm / len(ctrl_unmarked_signals))
         review_rate_unm = float(np.sum(ctrl_unmarked_signals['decision'] == 'REVIEW') / len(ctrl_unmarked_signals))
 
         top_candidates_per_star = clean_unmarked_signals.sort_values(by='p_mean', ascending=False).groupby('target_id', as_index=False).first()
         top5_candidates = top_candidates_per_star.sort_values(by='p_mean', ascending=False).head(5)
     else:
         unm_probs = np.array([0.0])
-        n_false_alarms = 0
-        far_rate = 0.0
+        n_cand_unm = 0
+        cand_share_unm = 0.0
         review_rate_unm = 0.0
         top5_candidates = pd.DataFrame()
 
@@ -1186,8 +1360,8 @@ def main():
     control_table = ctrl_pred[[c for c in out_table_cols if c in ctrl_pred]].copy()
     control_table.rename(columns={'bls_period_d': 'period_d', 'bls_depth_ppm': 'depth_ppm', 'label': 'catalog_label'}, inplace=True)
     control_table['catalog_label'] = control_table['catalog_label'].fillna('NONE')
-    ctrl_csv_out = os.path.join(out_dir, f"control_signals{file_suffix}.csv")
-    ctrl_md_out = os.path.join(out_dir, f"control_signals{file_suffix}.md")
+    ctrl_csv_out = os.path.join(out_dir, f"control_signals{out_suffix}.csv")
+    ctrl_md_out = os.path.join(out_dir, f"control_signals{out_suffix}.md")
     control_table.to_csv(ctrl_csv_out, index=False, encoding='utf-8')
     with open(ctrl_md_out, 'w', encoding='utf-8') as f:
         f.write(df_to_markdown(control_table) + "\n")
@@ -1230,7 +1404,7 @@ def main():
                 'причина подозрения': '; '.join(suspect_reason)
             })
     df_suspects = pd.DataFrame(suspect_rows)
-    suspects_csv_out = os.path.join(out_dir, f"suspects{file_suffix}.csv")
+    suspects_csv_out = os.path.join(out_dir, f"suspects{out_suffix}.csv")
     df_suspects.to_csv(suspects_csv_out, index=False, encoding='utf-8')
 
     df_features['is_artifact'] = (df_features['match_status'] == 'UNMATCHED') & ((df_features['bls_period_d'] >= 90.0) | (df_features['bls_depth_snr'] > 100.0))
@@ -1280,7 +1454,16 @@ def main():
 
     showcase_signals = ctrl_pred[ctrl_pred['target_id'] == showcase_id].copy()
     showcase_plot_path = os.path.join(out_dir, f"showcase_kepler80{file_suffix}.png")
-    showcase_n_files, showcase_quarters, showcase_baseline, showcase_bjd_min, showcase_bjd_max = generate_showcase_figure(showcase_id, showcase_signals, showcase_plot_path, args.quick, cache_dir=args.cache_dir)
+    showcase_skipped_note = ''
+    if args.report_only:
+        showcase_n_files, showcase_quarters, showcase_baseline, showcase_bjd_min, showcase_bjd_max = 0, 0, 0.0, 0.0, 0.0
+        if os.path.exists(showcase_plot_path):
+            showcase_skipped_note = f"Режим --report-only: витрина Kepler-80 не перестраивалась (для неё нужна загрузка кривой блеска); использован ранее созданный файл `{showcase_plot_path}`."
+        else:
+            showcase_skipped_note = "Режим --report-only: витрина Kepler-80 пропущена, так как локального кэша кривой блеска и готового рисунка нет, а для построения нужна загрузка."
+        emit(showcase_skipped_note)
+    else:
+        showcase_n_files, showcase_quarters, showcase_baseline, showcase_bjd_min, showcase_bjd_max = generate_showcase_figure(showcase_id, showcase_signals, showcase_plot_path, args.quick, cache_dir=args.cache_dir)
 
     known_planets = [
         {'planet': 'Kepler-80 b', 'koi': 'KOI-500.01', 'period_d': 7.053527},
@@ -1313,7 +1496,7 @@ def main():
             'Каталожный период (дни)': f"{kp_p:.4f}",
             'Результат обнаружения': match_type,
             'Период найденного (дни)': f"{float(matched_sig['bls_period_d']):.4f}" if matched_sig is not None else '-',
-            'Вероятность': f"{float(matched_sig['p_mean']):.1%}" if (matched_sig is not None and pd.notnull(matched_sig.get('p_mean')) and not np.isnan(float(matched_sig['p_mean']))) else '-',
+            'Оценка модели (p_mean)': f"{float(matched_sig['p_mean']):.3f}" if (matched_sig is not None and pd.notnull(matched_sig.get('p_mean')) and not np.isnan(float(matched_sig['p_mean']))) else '-',
             'Вердикт': str(matched_sig['decision']) if matched_sig is not None else '-'
         })
     df_k80_rec = pd.DataFrame(recovered_planets)
@@ -1323,6 +1506,7 @@ def main():
     k80_summary_str = f"{n_exact} точно + {n_harmonic} по гармонике из {len(known_planets)}"
 
     correct_samples = ctrl_m_eval[((ctrl_m_eval['target_bin'] == 1) & (ctrl_m_eval['decision'] == 'CANDIDATE')) | ((ctrl_m_eval['target_bin'] == 0) & (ctrl_m_eval['decision'] == 'FALSE_POSITIVE'))].head(2) if can_eval_a else pd.DataFrame()
+    wrong_samples = ctrl_m_eval[((ctrl_m_eval['target_bin'] == 0) & (ctrl_m_eval['decision'] == 'CANDIDATE')) | ((ctrl_m_eval['target_bin'] == 1) & (ctrl_m_eval['decision'] == 'FALSE_POSITIVE'))].head(2) if can_eval_a else pd.DataFrame()
 
     total_wall_s = time.time() - start_wall_time
     total_cpu_s = time.process_time() - start_cpu_time
@@ -1339,7 +1523,7 @@ def main():
     hashes_after = compute_immutability_hashes('outputs')
     hash_match = (hashes_before == hashes_after)
 
-    summary_md_path = os.path.join(out_dir, f"summary{file_suffix}.md")
+    summary_md_path = os.path.join(out_dir, f"summary{out_suffix}.md")
     h1 = chr(35) + " "
     h2 = chr(35) * 2 + " "
     h3 = chr(35) * 3 + " "
@@ -1354,7 +1538,13 @@ def main():
         f.write(f"* **Параметры классификации и фильтрации:** `--target-precision = {args.target_precision:.2f}`, `--min-depth-ppm = {args.min_depth_ppm:.1f}`\n")
         f.write(f"* **Случайный seed:** `{args.seed}`\n")
         f.write(f"* **Показательная система:** Kepler-80 (KIC {args.showcase_star}, статус CONFIRMED, 5 планет)\n")
-        f.write(f"* **Выходная директория:** `{out_dir}`\n\n")
+        f.write(f"* **Выходная директория:** `{out_dir}`\n")
+        f.write(f"* **Версия конвейера (pipeline_version):** `{pipeline_ver}`\n")
+        if args.report_only:
+            f.write("* **Режим `--report-only`:** отчёт пересобран по готовым файлам признаков и разбиения; извлечение, повторные попытки и скачивание не выполнялись.\n")
+            if report_version_note:
+                f.write(f"  * Предупреждение о pipeline_version: {report_version_note}\n")
+        f.write("\n")
 
         f.write(f"{h2}2. Состав выборки и балансировка звёздных параметров\n")
         f.write(f"Выборка неотмеченных звёзд сформирована со стратификацией по 10 децилям KIC-номеров отмеченных звёзд для обеспечения пространственной равномерности по всему полю Kepler, с жадным подбором распределений яркости (`kepmag`) и числа кварталов (`quarters`).\n\n")
@@ -1363,7 +1553,10 @@ def main():
         f.write(f"  * Неотмеченные звёзды (Control): план **{args.unmarked_stars}**, успешно обработано **{len(succ_tr_u) + len(succ_ctrl_u)}**, с ошибками в `_failed.csv`: **{len(failed_u_in_plan)}**\n")
         f.write(f"  * Обучающая половина: **{len(final_tr_m)}** отмеченных + **{len(final_tr_u)}** неотмеченных звёзд\n")
         f.write(f"  * Контрольная половина: **{len(final_ctrl_m)}** отмеченных (включая Kepler-80) + **{len(final_ctrl_u)}** неотмеченных звёзд\n")
-        f.write(f"  * Отброшено звёзд для поддержания строгого равенства половин: **{total_dropped}**\n")
+        if args.balance_halves:
+            f.write(f"  * Отброшено звёзд для поддержания строгого равенства половин (`--balance-halves`): **{total_dropped}**\n")
+        else:
+            f.write("  * Группы не усекаются до размера наименьшей (флаг `--balance-halves` не задан); звёзды со сбоем не уменьшают остальные группы\n")
         f.write(f"* **Временные затраты прогона:**\n")
         f.write(f"  * Астрономическое время запуска (Wall-clock time): **{total_wall_s:.1f} с** ({total_wall_s / 60.0:.2f} мин)\n")
         f.write(f"  * Суммарное процессорное время обработки звёзд: **{sum_star_total_s:.1f} с** ({sum_star_total_s / 60.0:.2f} мин)\n")
@@ -1383,12 +1576,15 @@ def main():
                 })
             f.write(df_to_markdown(pd.DataFrame(failed_table_rows)) + "\n\n")
 
-        f.write(f"{h3}Сравнение распределений яркости и наблюдаемости:\n\n")
-        f.write(df_to_markdown(comp_table) + "\n\n")
+        if comp_table is not None and ks_table is not None:
+            f.write(f"{h3}Сравнение распределений яркости и наблюдаемости:\n\n")
+            f.write(df_to_markdown(comp_table) + "\n\n")
 
-        f.write(f"{h3}Результаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):\n\n")
-        f.write(df_to_markdown(ks_table) + "\n\n")
+            f.write(f"{h3}Результаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):\n\n")
+            f.write(df_to_markdown(ks_table) + "\n\n")
 
+        else:
+            f.write("Таблицы сравнения распределений и критерия Колмогорова-Смирнова пропущены: режим `--report-only` не повторяет выбор звёзд и не обращается к сети.\n\n")
         f.write(f"{h2}2.1. Диагностика обнаружения периодических сигналов по каждой звезде\n")
         f.write(f"В таблице ниже приведены детальные результаты фотометрической обработки и поиска сигналов алгоритмом Box Least Squares (BLS) для каждой звезды выборки.\n\n")
         f.write(df_to_markdown(df_diag_md) + "\n\n")
@@ -1448,21 +1644,37 @@ def main():
 
         f.write(f"{h2}3. Раздел А: Оценка на отмеченных звёздах контрольной части (есть истинные метки)\n")
         f.write(f"*(Примечание: витринная система Kepler-80 исключена из количественных метрик Раздела А и оценивается качественно и независимо в Разделе 5)*\n\n")
+        f.write(f"{h3}Восстановление KOI на контрольных отмеченных звёздах (без Kepler-80):\n\n")
+        f.write(f"Для каждого KOI с каталожным периодом в диапазоне поиска [{SEARCH_MIN_PERIOD_D:g}; {SEARCH_MAX_PERIOD_D:g}] д статус: «точно» (период найденного сигнала отличается не более чем на 1%), «гармоника» (период в 0.5 или 2 раза от каталожного) или «не найден». Доли даны с 95% интервалом Уилсона.\n\n")
+        f.write(f"**По диспозиции:**\n\n")
+        f.write(df_to_markdown(koi_summary['by_disposition']) + "\n\n")
+        f.write(f"**По корзинам периода:**\n\n")
+        f.write(df_to_markdown(koi_summary['by_period_bin']) + "\n\n")
+        f.write(f"* **KOI вне диапазона поиска (не учтены в таблицах выше):** {koi_summary['n_out_of_range']} из {koi_summary['n_total']}\n")
+        f.write(f"* **Сквозная полнота (найден точно и вердикт CANDIDATE), KOI CONFIRMED и CANDIDATE в диапазоне:** {koi_summary['n_end_to_end']}/{koi_summary['n_positive_in_range']} = {koi_summary['end_to_end_rate']:.1%} (95% интервал Уилсона: {koi_summary['end_to_end_ci'][0]:.1%}; {koi_summary['end_to_end_ci'][1]:.1%}); найден точно, независимо от вердикта: {koi_summary['n_positive_found_exact']}\n")
+        f.write(f"* Таблица по каждому KOI: `{koi_recovery_csv_out}`\n\n")
         if can_eval_a and len(ctrl_m_eval) > 0 and acc_a is not None:
             f.write(f"* **Всего размеченных сигналов (MATCHED) для оценки (без Kepler-80):** {len(ctrl_m_eval)}\n")
             f.write(f"* **Матрица ошибок (Confusion Matrix, основная модель):**\n```\n{cm_a}\n```\n")
+            f.write(f"* **Метрики с 95% ДИ (бутстрап по звёздам, 500 повторов, перцентили 2.5 и 97.5):**\n")
+            f.write(f"  * Точность: {acc_a:.3f} (95% ДИ {ci_text(boot_res['acc_ci'])}); ROC-AUC: {auc_a:.3f} (95% ДИ {ci_text(boot_res['auc_ci'])})\n")
+            f.write(f"  * Precision: {prec_a:.3f} (95% ДИ {ci_text(boot_res['prec_ci'])}); Recall: {rec_a:.3f} (95% ДИ {ci_text(boot_res['rec_ci'])})\n")
+            f.write(f"* **Условность метрик:** все метрики Раздела А вычислены только по сигналам, которые поиск обнаружил и которые совпали с каталожным периодом KOI (статус MATCHED). KOI, не найденные поиском или найденные по гармонике, в них не входят; их доля показана в таблице восстановления выше.\n\n")
             f.write(f"{h3}Сравнение с эталонами классификации (Baselines):\n\n")
             f.write(df_to_markdown(baselines_table) + "\n\n")
+            f.write(f"{h3}Калибровка оценки модели (p_mean) на контрольных MATCHED-сигналах:\n\n")
+            f.write(f"* **Оценка Брайера:** {brier_a:.4f} (для константного прогноза с долей класса 1 = {float(np.mean(y_ctrl_true)):.3f}: {brier_ref:.4f}; меньше значит лучше)\n\n")
+            f.write(df_to_markdown(reliab_table) + "\n\n")
             f.write(f"* **Пороги отказа от решения (Abstention Thresholds):**\n")
             f.write(f"  * Пороги подобраны кросс-валидацией `GroupKFold` (с группировкой по звёздам `target_id`) на обучающей выборке под целевую точность $\\ge {args.target_precision:.2f}$:\n")
             f.write(f"    * $t_{{high}} = {thres_a[0]:.2f}$, $t_{{low}} = {thres_a[1]:.2f}$, $s_{{max}} = {thres_a[2]:.2f}$\n")
-            f.write(f"  * **Охват решений (Coverage):** **{coverage_ctrl:.1%}** ({n_accepted_ctrl} из {len(ctrl_m_eval)} сигналов, 90% ДИ бутстрапом: [{boot_res['cov_ci'][0]:.3f}, {boot_res['cov_ci'][1]:.3f}])\n")
-            f.write(f"  * **Точность на принятых решениях:** **{prec_accepted:.3f}** (принято сигналов: {n_accepted_ctrl}{', пометка: малая выборка' if n_accepted_ctrl < 20 else ''})\n")
+            f.write(f"  * **Охват решений (Coverage):** **{coverage_ctrl:.1%}** ({n_accepted_ctrl} из {len(ctrl_m_eval)} сигналов, 95% ДИ: {ci_text(boot_res['cov_ci'])})\n")
+            f.write(f"  * **Точность на принятых решениях:** **{acc_accepted:.3f}** (95% ДИ {ci_text(boot_res['acc_accepted_ci'])}; принято сигналов: {n_accepted_ctrl}{', пометка: малая выборка' if n_accepted_ctrl < 20 else ''}); precision на принятых: {prec_accepted:.3f}, recall на принятых: {rec_accepted:.3f}\n")
             f.write(f"  * **Доля вердиктов REVIEW:** **{review_rate_ctrl:.1%}** ({n_review_ctrl} из {len(ctrl_m_eval)})\n\n")
 
             if len(ablation_table) > 0:
-                f.write(f"{h3}Абляция: Влияние признаков покрытия данных (baseline_d):\n\n")
-                f.write("Признаки покрытия данных (`baseline_d`, `n_quarters`, `n_files`) отражают длительность фотометрических наблюдений конкретной звезды телескопом, а не физические свойства транзитного сигнала. Во избежание ложной корреляции они исключены из пространства признаков основной модели.\n\n")
+                f.write(f"{h3}Абляции признаков (обучение в направлении А, оценка на тех же контрольных MATCHED-сигналах):\n\n")
+                f.write("Признаки покрытия данных (`baseline_d`, `n_quarters`, `n_files`) отражают длительность наблюдений звезды, а не физические свойства транзитного сигнала, поэтому исключены из основной модели. Звёздные признаки (" + ", ".join(STAR_FEATURE_COLS) + ") описывают звезду и её шум, а не сам сигнал; `transit_count` и `gap_fraction` зависят от длительности и заполненности ряда. Строки таблицы показывают, насколько ROC-AUC зависит от каждой группы.\n\n")
                 f.write(df_to_markdown(ablation_table) + "\n\n")
 
             f.write(f"* **Двунаправленная перекрёстная проверка (Two-way train/test):**\n")
@@ -1494,7 +1706,7 @@ def main():
         if can_eval_a and len(ctrl_unmarked_signals) > 0:
             f.write(f"* **Распределение предсказанной вероятности (p_mean):**\n")
             f.write(f"  * Минимум: {float(np.min(unm_probs)):.3f} | 25%: {float(np.percentile(unm_probs, 25)):.3f} | Медиана: {float(np.median(unm_probs)):.3f} | 75%: {float(np.percentile(unm_probs, 75)):.3f} | Максимум: {float(np.max(unm_probs)):.3f}\n")
-            f.write(f"* **Доля сигналов с вердиктом CANDIDATE:** **{far_rate:.1%}** ({n_false_alarms} сигналов; примечание: данная величина не является строгой метрикой качества False Alarm Rate, так как отсутствие планет на неотмеченных звёздах является рабочей гипотезой, а не доказанным фактом).\n")
+            f.write(f"* **Доля вердиктов CANDIDATE среди сигналов неразмеченных звёзд:** **{cand_share_unm:.1%}** ({n_cand_unm} сигналов); модель не обучалась на шумовых сигналах.\n")
             f.write(f"* **Доля неопределённых сигналов (REVIEW):** **{review_rate_unm:.1%}**\n\n")
 
             f.write(f"{h3}Фильтрация потенциальных инструментальных артефактов перед ранжированием:\n\n")
@@ -1503,7 +1715,7 @@ def main():
             f.write(f"{h3}Топ-5 наиболее «планетоподобных» сигналов среди неотмеченных звёзд (после фильтрации артефактов, максимум 1 на звезду):\n\n")
             if len(top5_candidates) > 0:
                 top5_view = top5_candidates[['target_id', 'bls_period_d', 'bls_depth_ppm', 'p_mean', 'decision', 'shap_top3']].copy()
-                top5_view.rename(columns={'bls_period_d': 'Период (д)', 'bls_depth_ppm': 'Глубина (ppm)', 'p_mean': 'Вероятность', 'decision': 'Решение', 'shap_top3': 'Вклады SHAP'}, inplace=True)
+                top5_view.rename(columns={'bls_period_d': 'Период (д)', 'bls_depth_ppm': 'Глубина (ppm)', 'p_mean': 'Оценка модели (p_mean)', 'decision': 'Решение', 'shap_top3': 'Вклады SHAP'}, inplace=True)
                 f.write(df_to_markdown(top5_view) + "\n\n")
             else:
                 f.write("Все обнаруженные сигналы на неотмеченных звёздах отфильтрованы по критериям артефактов.\n\n")
@@ -1511,17 +1723,27 @@ def main():
             f.write("* Модельная оценка вероятностей пропущена, так как классификатор машинного обучения не обучался из-за малого числа размеченных сигналов (< 5 на класс).\n\n")
 
         f.write(f"{h2}5. Результаты по витринной системе Kepler-80 (KIC {showcase_id})\n")
-        f.write(f"Для витринной системы Kepler-80 загружено {showcase_n_files} файлов ({showcase_quarters} уникальных кварталов Kepler, базлайн: {showcase_baseline:.1f} суток, диапазон BJD {showcase_bjd_min:.1f} – {showcase_bjd_max:.1f}). Система содержит 5 известных подтверждённых планет в резонансной цепочке периодов. Графическая панель сохранена в файл `{showcase_plot_path}`.\n\n")
+        if showcase_skipped_note:
+            f.write(showcase_skipped_note + "\n\n")
+        else:
+            f.write(f"Для витринной системы Kepler-80 загружено {showcase_n_files} файлов ({showcase_quarters} уникальных кварталов Kepler, базлайн: {showcase_baseline:.1f} суток, диапазон BJD {showcase_bjd_min:.1f} – {showcase_bjd_max:.1f}). Система содержит 5 известных подтверждённых планет в резонансной цепочке периодов. Графическая панель сохранена в файл `{showcase_plot_path}`.\n\n")
         f.write(df_to_markdown(df_k80_rec) + "\n\n")
         f.write(f"* **Итог валидации Kepler-80:** **{k80_summary_str}** (найдено точно: {n_exact}, по гармонике: {n_harmonic}, не найдено: {n_not_found}).\n")
         if n_exact + n_harmonic < 5:
             f.write(f"  * *Для ненайденных планет:* причина не установлена (требуется дополнительный специализированный анализ периодограммы BLS и фазовой кривой без умозрительных предположений).\n\n")
 
         f.write(f"{h2}6. Примеры классификации и интерпретация признаков (SHAP)\n")
-        if can_eval_a and len(correct_samples) > 0:
+        if can_eval_a and (len(correct_samples) > 0 or len(wrong_samples) > 0):
             f.write(f"{h3}Примеры верных решений модели:\n")
+            if len(correct_samples) == 0:
+                f.write("* Верных принятых решений (CANDIDATE / FALSE_POSITIVE) в контрольной части нет.\n")
             for _, r in correct_samples.iterrows():
-                f.write(f"* **Звезда {r['target_id']} (Сигнал {r['signal_id']}):** Истинный класс = `{r['label']}`, Вердикт = `{r['decision']}` ($p = {r['p_mean']:.1%}$).\n  * Вклады SHAP: `{r['shap_top3']}`\n")
+                f.write(f"* **Звезда {r['target_id']} (Сигнал {r['signal_id']}):** Истинный класс = `{r['label']}`, Вердикт = `{r['decision']}`, оценка модели p_mean = {r['p_mean']:.3f}.\n  * Вклады SHAP: `{r['shap_top3']}`\n")
+            f.write(f"{h3}Примеры ошибочных решений модели:\n")
+            if len(wrong_samples) == 0:
+                f.write("* Ошибочных принятых решений (CANDIDATE / FALSE_POSITIVE) в контрольной части нет.\n")
+            for _, r in wrong_samples.iterrows():
+                f.write(f"* **Звезда {r['target_id']} (Сигнал {r['signal_id']}):** Истинный класс = `{r['label']}`, Вердикт = `{r['decision']}`, оценка модели p_mean = {r['p_mean']:.3f}.\n  * Вклады SHAP: `{r['shap_top3']}`\n")
         else:
             f.write("* На текущей тестовой выборке примеры решений модели отсутствуют (оценка пропущена из-за размера выборки).\n")
 
