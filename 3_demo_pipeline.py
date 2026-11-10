@@ -1231,7 +1231,7 @@ def main():
         ])
 
         top_shap_clean = ctrl_m_eval['shap_top3'].iloc[0].split('|')[0].strip() if len(ctrl_m_eval) > 0 and 'shap_top3' in ctrl_m_eval else '-'
-        abl_rows = [{'Конфигурация': f"Основная модель ({len(feature_cols)} признаков)", 'Точность': f"{acc_a:.3f}", 'ROC-AUC': f"{auc_a:.3f}", '95% ДИ ROC-AUC': ci_text(boot_res['auc_ci']), 'Охват решений': f"{coverage_ctrl:.1%}", 'Топ-1 признак SHAP': top_shap_clean}]
+        abl_rows = [{'Конфигурация': f"Основная модель (признаков: {len(feature_cols)})", 'Точность': f"{acc_a:.3f}", 'ROC-AUC': f"{auc_a:.3f}", '95% ДИ ROC-AUC': ci_text(boot_res['auc_ci']), 'Охват решений': f"{coverage_ctrl:.1%}", 'Топ-1 признак SHAP': top_shap_clean}]
         cov_present = [c for c in coverage_cols if c in df_features.columns]
         abl_configs = []
         if cov_present:
@@ -1242,7 +1242,7 @@ def main():
             abl_res = evaluate_ablation(abl_feats, df_tr_m_matched, df_ctrl_all, ctrl_star_set, showcase_id, args.seed, df_features, args.target_precision)
             if abl_res is None:
                 continue
-            abl_rows.append({'Конфигурация': f"{abl_name} [{abl_res['n_features']} признаков]", 'Точность': f"{abl_res['acc']:.3f}", 'ROC-AUC': f"{abl_res['auc']:.3f}", '95% ДИ ROC-AUC': ci_text(abl_res['auc_ci']), 'Охват решений': f"{abl_res['coverage']:.1%}", 'Топ-1 признак SHAP': abl_res['top_shap']})
+            abl_rows.append({'Конфигурация': f"{abl_name} [признаков: {abl_res['n_features']}]", 'Точность': f"{abl_res['acc']:.3f}", 'ROC-AUC': f"{abl_res['auc']:.3f}", '95% ДИ ROC-AUC': ci_text(abl_res['auc_ci']), 'Охват решений': f"{abl_res['coverage']:.1%}", 'Топ-1 признак SHAP': abl_res['top_shap']})
         ablation_table = pd.DataFrame(abl_rows)
     else:
         acc_a = None
@@ -1659,7 +1659,7 @@ def main():
             f.write(f"* **Метрики с 95% ДИ (бутстрап по звёздам, 500 повторов, перцентили 2.5 и 97.5):**\n")
             f.write(f"  * Точность: {acc_a:.3f} (95% ДИ {ci_text(boot_res['acc_ci'])}); ROC-AUC: {auc_a:.3f} (95% ДИ {ci_text(boot_res['auc_ci'])})\n")
             f.write(f"  * Precision: {prec_a:.3f} (95% ДИ {ci_text(boot_res['prec_ci'])}); Recall: {rec_a:.3f} (95% ДИ {ci_text(boot_res['rec_ci'])})\n")
-            f.write(f"* **Условность метрик:** все метрики Раздела А вычислены только по сигналам, которые поиск обнаружил и которые совпали с каталожным периодом KOI (статус MATCHED). KOI, не найденные поиском или найденные по гармонике, в них не входят; их доля показана в таблице восстановления выше.\n")
+            f.write(f"* **Условность метрик:** все метрики Раздела А вычислены только по сигналам, которые поиск обнаружил и которые совпали с каталожным периодом KOI (статус MATCHED). KOI, не найденные поиском или найденные по гармонике, в них не входят; их доля показана в таблице восстановления выше.\n\n")
             f.write(f"{h3}Сравнение с эталонами классификации (Baselines):\n\n")
             f.write(df_to_markdown(baselines_table) + "\n\n")
             f.write(f"{h3}Калибровка оценки модели (p_mean) на контрольных MATCHED-сигналах:\n\n")
