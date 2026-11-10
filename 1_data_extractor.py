@@ -882,7 +882,7 @@ def fetch_labels(mission):
             pass
     if mission == 'Kepler':
         try:
-            labels_table = NasaExoplanetArchive.query_criteria(table='cumulative', select='kepid,koi_disposition,koi_period,koi_fpflag_nt,koi_fpflag_ss,koi_fpflag_co,koi_fpflag_ec')
+            labels_table = NasaExoplanetArchive.query_criteria(table='cumulative', select='kepid,koi_disposition,koi_period,koi_depth,koi_fpflag_nt,koi_fpflag_ss,koi_fpflag_co,koi_fpflag_ec')
             df = labels_table.to_pandas()
             df.rename(columns={'kepid': 'target_id', 'koi_disposition': 'label', 'koi_period': 'catalog_period'}, inplace=True)
             df['target_id'] = df['target_id'].astype(str)

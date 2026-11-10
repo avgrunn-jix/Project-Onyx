@@ -68,6 +68,10 @@ def build_report(new_dir, old_dir):
         lines.append(f'  периоды new: {fmt_periods(p_new)}')
         lines.append(f'  периоды old: {fmt_periods(p_old)}')
         lines.append(f'  alias_factors (new): {af if af else "-"}')
+        inv_new = diag_value(d_new, tid, 'inverted_count', '')
+        inv_old = diag_value(d_old, tid, 'inverted_count', '')
+        if str(inv_new) != '' or str(inv_old) != '':
+            lines.append(f'  INVERTED-сигналов: new={inv_new} | old={inv_old}')
         lines.append('')
         if len(p_new) < len(p_old):
             fewer.append((tid, len(p_new), len(p_old)))

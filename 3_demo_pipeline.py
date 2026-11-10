@@ -1454,7 +1454,8 @@ def main():
 
     unmatched_marked_signals = ctrl_pred[(ctrl_pred['target_id'].isin(set(final_ctrl_m))) & (ctrl_pred['match_status'] == 'UNMATCHED')]
     ctrl_koi_stars = set(final_ctrl_m) - {showcase_id}
-    koi_ctrl = labels_df[labels_df['target_id'].astype(str).isin(ctrl_koi_stars)][['target_id', 'label', 'catalog_period']].copy()
+    koi_cols = ['target_id', 'label', 'catalog_period'] + (['koi_depth'] if 'koi_depth' in labels_df.columns else [])
+    koi_ctrl = labels_df[labels_df['target_id'].astype(str).isin(ctrl_koi_stars)][koi_cols].copy()
     koi_ctrl = koi_ctrl[koi_ctrl['label'].astype(str).str.upper().str.replace(' ', '_').isin(['CONFIRMED', 'CANDIDATE', 'FALSE_POSITIVE'])]
     koi_recovery = build_koi_recovery(koi_ctrl, ctrl_pred[ctrl_pred['target_id'].isin(ctrl_koi_stars)])
     koi_summary = summarize_koi_recovery(koi_recovery)
@@ -1826,6 +1827,14 @@ def main():
         f.write(df_to_markdown(koi_summary['by_disposition']) + "\n\n")
         f.write(f"**По корзинам периода:**\n\n")
         f.write(df_to_markdown(koi_summary['by_period_bin']) + "\n\n")
+        f.write(f"**По глубине транзита (koi_depth, 4 корзины по квартилям KOI в диапазоне):**\n\n")
+        if len(koi_summary['by_depth']) > 0:
+            f.write(df_to_markdown(koi_summary['by_depth']) + "\n\n")
+            f.write(f"* KOI с известной koi_depth: {koi_summary['n_depth_known']} из {koi_summary['n_in_range']}\n\n")
+        else:
+            f.write("Разбивка не построена: в `data/labels/kepler_labels.csv` нет колонки `koi_depth` (файл скачан до её добавления в запрос) или известных глубин меньше 4. Колонка появится после повторной загрузки меток из архива NASA.\n\n")
+        f.write(f"**По числу KOI у звезды (все диспозиции, включая KOI вне диапазона поиска):**\n\n")
+        f.write(df_to_markdown(koi_summary['by_multiplicity']) + "\n\n")
         f.write(f"* **KOI вне диапазона поиска (не учтены в таблицах выше):** {koi_summary['n_out_of_range']} из {koi_summary['n_total']}\n")
         f.write(f"* **Сквозная полнота (найден точно и вердикт CANDIDATE), KOI CONFIRMED и CANDIDATE в диапазоне:** {koi_summary['n_end_to_end']}/{koi_summary['n_positive_in_range']} = {koi_summary['end_to_end_rate']:.1%} (95% интервал Уилсона: {koi_summary['end_to_end_ci'][0]:.1%}; {koi_summary['end_to_end_ci'][1]:.1%}); найден точно, независимо от вердикта: {koi_summary['n_positive_found_exact']}\n")
         f.write(f"* Таблица по каждому KOI: `{koi_recovery_csv_out}`\n\n")
