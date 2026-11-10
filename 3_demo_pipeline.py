@@ -26,7 +26,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupKFold
 from xgboost import XGBClassifier
 import shap
-from onyx_report import STAR_FEATURE_COLS, SEARCH_MAX_PERIOD_D, SEARCH_MIN_PERIOD_D, ablation_feature_sets, brier_score, build_koi_recovery, ci_text, oriented_auc, reliability_table, summarize_koi_recovery
+from onyx_report import format_share, inverted_star_rates, STAR_FEATURE_COLS, SEARCH_MAX_PERIOD_D, SEARCH_MIN_PERIOD_D, ablation_feature_sets, brier_score, build_koi_recovery, ci_text, oriented_auc, reliability_table, summarize_koi_recovery
 from onyx_features import COVERAGE_COLS, PipelineVersionError, build_pipeline_version, check_pipeline_version, compute_feature_columns
 from onyx_showcase import render_showcase
 
@@ -437,6 +437,31 @@ def load_report_plan(out_dir, file_suffix, star_prim):
     unmarked_ids = [s for s in planned if s not in set(marked_ids)]
     return groups, planned, marked_ids, unmarked_ids
 
+def load_inverted_signals(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    df = pd.read_csv(path, dtype={'target_id': str})
+    if 'match_status' in df.columns:
+        df = df[df['match_status'] == 'INVERTED'].copy()
+    return df
+
+def inverted_control_stats(df_inverted, diag_map, processed_ids):
+    counts = {}
+    if df_inverted is not None and len(df_inverted) > 0:
+        counts = {str(k): int(v) for k, v in df_inverted['target_id'].astype(str).value_counts().items()}
+    controlled = set()
+    has_flag = False
+    for sid, row in diag_map.items():
+        val = row.get('inverted_control', None) if hasattr(row, 'get') else None
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            continue
+        has_flag = True
+        if str(row.get('status', 'OK')) == 'OK' and int(float(val)) == 1:
+            controlled.add(str(sid))
+    if not has_flag and df_inverted is not None:
+        controlled = set(str(s) for s in processed_ids)
+    return counts, controlled
+
 def apply_log1p(X):
     return np.log1p(np.maximum(X, 0))
 
@@ -622,6 +647,103 @@ def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, see
 
 BOOT_KEYS = ['acc_ci', 'auc_ci', 'cov_ci', 'prec_ci', 'rec_ci', 'acc_accepted_ci']
 
+REAL_RECALL_TARGET = 0.95
+NOISE_MIN_PER_CLASS = 5
+
+def noise_feature_cols(feature_cols):
+    return [c for c in feature_cols if c not in STAR_FEATURE_COLS]
+
+def fit_bootstrap_ensemble(X, y, groups, seed, n_models):
+    rng = np.random.RandomState(seed)
+    uniq = np.unique(groups)
+    ratio = float(np.sum(y == 0)) / max(1, np.sum(y == 1))
+    models = []
+    for _ in range(n_models):
+        if len(uniq) > 1:
+            b_g = rng.choice(uniq, size=len(uniq), replace=True)
+            idx = np.concatenate([np.where(groups == g)[0] for g in b_g])
+        else:
+            idx = rng.choice(len(y), size=len(y), replace=True)
+        if len(np.unique(y[idx])) < 2:
+            idx = np.arange(len(y))
+        m = XGBClassifier(n_estimators=60, max_depth=4, learning_rate=0.08, scale_pos_weight=ratio, random_state=int(rng.randint(10000)), eval_metric='logloss')
+        m.fit(X[idx], y[idx])
+        models.append(m)
+    return models
+
+def ensemble_mean(models, X):
+    if len(X) == 0:
+        return np.zeros(0)
+    return np.mean([m.predict_proba(X)[:, 1] for m in models], axis=0)
+
+def choose_real_threshold(oof_scores, y, recall_target=REAL_RECALL_TARGET):
+    s = np.asarray(oof_scores, dtype=float)
+    yy = np.asarray(y)
+    real = np.sort(s[yy == 1])
+    if len(real) == 0:
+        return 0.0
+    k = int(np.floor((1.0 - recall_target) * len(real)))
+    k = min(max(k, 0), len(real) - 1)
+    return float(real[k])
+
+def train_signal_noise(df_real, df_noise, feature_cols, seed):
+    cols = noise_feature_cols(feature_cols)
+    df = pd.concat([df_real.assign(_y=1), df_noise.assign(_y=0)], ignore_index=True)
+    y = df['_y'].values.astype(int)
+    groups = df['target_id'].astype(str).values
+    counts = {1: int(np.sum(y == 1)), 0: int(np.sum(y == 0))}
+    if min(counts.values()) < NOISE_MIN_PER_CLASS:
+        return None, counts
+    scaler = get_ml_pipeline()
+    X = scaler.fit_transform(df.reindex(columns=cols).values.astype(float))
+    n_models = min(20, max(5, len(y) * 2))
+    oof = np.zeros(len(y))
+    n_splits = min(5, len(np.unique(groups)))
+    for tr_idx, va_idx in GroupKFold(n_splits=n_splits).split(X, y, groups=groups):
+        if len(np.unique(y[tr_idx])) < 2:
+            oof[va_idx] = float(np.mean(y[tr_idx]))
+            continue
+        fold_models = fit_bootstrap_ensemble(X[tr_idx], y[tr_idx], groups[tr_idx], seed, n_models)
+        oof[va_idx] = ensemble_mean(fold_models, X[va_idx])
+    threshold = choose_real_threshold(oof, y)
+    models = fit_bootstrap_ensemble(X, y, groups, seed, n_models)
+    oof_noise = oof[y == 0]
+    oof_real = oof[y == 1]
+    return {
+        'cols': cols, 'scaler': scaler, 'models': models, 'threshold': threshold,
+        'n_real': counts[1], 'n_noise': counts[0], 'n_models': n_models,
+        'oof_real_kept': float(np.mean(oof_real >= threshold)) if len(oof_real) else 0.0,
+        'oof_noise_rejected': float(np.mean(oof_noise < threshold)) if len(oof_noise) else 0.0,
+    }, counts
+
+def predict_p_real(model, df):
+    if model is None or len(df) == 0:
+        return np.full(len(df), np.nan)
+    return ensemble_mean(model['models'], model['scaler'].transform(df.reindex(columns=model['cols']).values.astype(float)))
+
+def apply_noise_gate(decisions, p_real, threshold):
+    dec = np.asarray(decisions, dtype=object).copy()
+    pr = np.asarray(p_real, dtype=float)
+    gate = (dec == 'CANDIDATE') & ~(pr >= threshold)
+    dec[gate] = 'REVIEW'
+    return dec, int(np.sum(gate))
+
+def p_real_distribution(groups, threshold):
+    rows = []
+    for name, vals in groups:
+        v = np.asarray(vals, dtype=float)
+        v = v[np.isfinite(v)]
+        if len(v) == 0:
+            rows.append({'Сигналы': name, 'Число': 0, 'Мин': '-', '25%': '-', 'Медиана': '-', '75%': '-', 'Макс': '-', 'Доля p_real >= порога': '-'})
+            continue
+        rows.append({
+            'Сигналы': name, 'Число': int(len(v)),
+            'Мин': f"{np.min(v):.3f}", '25%': f"{np.percentile(v, 25):.3f}", 'Медиана': f"{np.median(v):.3f}",
+            '75%': f"{np.percentile(v, 75):.3f}", 'Макс': f"{np.max(v):.3f}",
+            'Доля p_real >= порога': format_share(int(np.sum(v >= threshold)), int(len(v))),
+        })
+    return pd.DataFrame(rows)
+
 def bootstrap_star_metrics(df_eval, n_boot=1000, seed=42):
     unique_stars = df_eval['target_id'].unique()
     if len(unique_stars) == 0:
@@ -763,6 +885,7 @@ def main():
     parser.add_argument('--min-free-gb', type=float, default=5.0)
     parser.add_argument('--report-only', action='store_true', help='Rebuild the report and tables from existing feature and split files; no extraction, retries or downloads.')
     parser.add_argument('--allow-legacy', action='store_true', help='Resume extraction into a features file whose pipeline_version differs or is missing, with a warning.')
+    parser.add_argument('--inverted-control', action='store_true', help='Pass --inverted-control to the extractor: also search 2 - flux of each processed light curve and write features_demo*_inverted.csv.')
     parser.add_argument('--balance-halves', action='store_true', help='Trim the four star groups to the size of the smallest one (previous behaviour).')
     parser.add_argument('--verbose', action='store_true', help='Print detailed output to the console instead of the progress bar.')
     args = parser.parse_args()
@@ -937,6 +1060,8 @@ def main():
             cmd_ext.append('--smoke-test')
         if args.allow_legacy:
             cmd_ext.append('--allow-legacy')
+        if args.inverted_control:
+            cmd_ext.append('--inverted-control')
         emit(f"Запуск извлечения признаков для {len(targets_to_run)} звёзд...")
         phase('extracting features')
         run_child(cmd_ext, check=True)
@@ -1021,6 +1146,9 @@ def main():
 
     diag_rows_csv = []
     diag_rows_md = []
+    inverted_csv = os.path.join(out_dir, f"features_demo{file_suffix}_inverted.csv")
+    df_inverted = load_inverted_signals(inverted_csv)
+    inv_counts, inv_controlled = inverted_control_stats(df_inverted, diag_map, processed_ids)
     group_map = plan_group_map(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked)
     for sid in planned_order:
         is_m = (sid in marked_ids)
@@ -1082,6 +1210,7 @@ def main():
             'базлайн в сутках': round(bd, 2),
             'найдено сигналов': nsig,
             'MATCHED/HARMONIC/UNMATCHED': match_summary,
+            'INVERTED-сигналов': int(inv_counts.get(sid, 0)) if sid in inv_controlled else '-',
             'статус': stat_display,
             'максимальный SDE': round(msde, 2),
             'максимальный SNR': round(msnr, 2),
@@ -1102,6 +1231,7 @@ def main():
             'Базлайн (д)': f"{bd:.1f}",
             'Сигналов': nsig,
             'MATCHED/HARM/UNM': match_summary,
+            'INVERTED': int(inv_counts.get(sid, 0)) if sid in inv_controlled else '-',
             'Макс. SDE / SNR': max_sde_snr_str,
             'Статус': stat_display,
             'EB (каталог)': is_eb,
@@ -1139,6 +1269,45 @@ def main():
     emit("\n[Направление Б] Обучение на контрольной половине (без Kepler-80) -> проверка на обучающей...")
     df_ctrl_m_for_b = df_ctrl_m_matched[df_ctrl_m_matched['target_id'] != showcase_id].copy()
     train_pred, model_b, expl_b, scaler_b, thres_b = train_and_eval_pipeline(df_ctrl_m_for_b, df_train_all, feature_cols, args.seed, full_features_pool=df_features, target_precision=args.target_precision)
+
+    noise_gate = {'ran': False, 'reason': ''}
+    if df_inverted is None or len(df_inverted) == 0:
+        noise_gate['reason'] = 'нет файла INVERTED-сигналов (извлечение без --inverted-control)'
+        emit(f"ВНИМАНИЕ: этап «сигнал или шум» пропущен: {noise_gate['reason']}; вердикты CANDIDATE выдаются по-прежнему.")
+    elif model_a is None:
+        noise_gate['reason'] = 'основная модель направления А не обучена'
+        emit(f"ВНИМАНИЕ: этап «сигнал или шум» пропущен: {noise_gate['reason']}.")
+    else:
+        train_star_ids = set(final_tr_m) | set(final_tr_u)
+        df_noise_tr = df_inverted[df_inverted['target_id'].astype(str).isin(train_star_ids)].copy()
+        nz_model, nz_counts = train_signal_noise(df_tr_m_matched, df_noise_tr, feature_cols, args.seed)
+        if nz_model is None:
+            noise_gate['reason'] = f"мало сигналов для обучения: MATCHED {nz_counts[1]}, INVERTED {nz_counts[0]} (нужно не меньше {NOISE_MIN_PER_CLASS} каждого класса)"
+            emit(f"ВНИМАНИЕ: этап «сигнал или шум» пропущен: {noise_gate['reason']}.")
+        else:
+            ctrl_pred['p_real'] = predict_p_real(nz_model, ctrl_pred)
+            ctrl_pred['decision_before_noise_gate'] = ctrl_pred['decision'].values
+            gated, n_gated = apply_noise_gate(ctrl_pred['decision'].values, ctrl_pred['p_real'].values, nz_model['threshold'])
+            ctrl_pred['decision'] = gated
+            ctrl_star_ids = set(final_ctrl_m) | set(final_ctrl_u)
+            df_noise_ctrl = df_inverted[df_inverted['target_id'].astype(str).isin(ctrl_star_ids)].copy()
+            p_real_inv_ctrl = predict_p_real(nz_model, df_noise_ctrl)
+            unm_mask = ctrl_pred['target_id'].isin(set(final_ctrl_u))
+            m_mask = ctrl_pred['target_id'].isin(set(final_ctrl_m)) & (ctrl_pred['target_id'] != showcase_id) & (ctrl_pred['match_status'] == 'MATCHED')
+            noise_gate.update({
+                'ran': True, 'model': nz_model, 'n_gated': n_gated,
+                'dist': p_real_distribution([
+                    ('MATCHED (контроль, отмеченные, без Kepler-80)', ctrl_pred.loc[m_mask, 'p_real'].values),
+                    ('UNMATCHED (контроль)', ctrl_pred.loc[ctrl_pred['match_status'] == 'UNMATCHED', 'p_real'].values),
+                    ('INVERTED (контроль)', p_real_inv_ctrl),
+                ], nz_model['threshold']),
+                'unm_cand_before': int(np.sum(unm_mask & (ctrl_pred['decision_before_noise_gate'] == 'CANDIDATE'))),
+                'unm_cand_after': int(np.sum(unm_mask & (ctrl_pred['decision'] == 'CANDIDATE'))),
+                'm_cand_before': int(np.sum(m_mask & (ctrl_pred['decision_before_noise_gate'] == 'CANDIDATE'))),
+                'm_cand_after': int(np.sum(m_mask & (ctrl_pred['decision'] == 'CANDIDATE'))),
+                'n_unm_signals': int(np.sum(unm_mask)),
+            })
+            emit(f"Этап «сигнал или шум»: порог p_real = {nz_model['threshold']:.3f}, CANDIDATE снято: {n_gated}")
 
     can_eval_a = (model_a is not None)
     can_eval_b = (model_b is not None)
@@ -1285,7 +1454,8 @@ def main():
 
     unmatched_marked_signals = ctrl_pred[(ctrl_pred['target_id'].isin(set(final_ctrl_m))) & (ctrl_pred['match_status'] == 'UNMATCHED')]
     ctrl_koi_stars = set(final_ctrl_m) - {showcase_id}
-    koi_ctrl = labels_df[labels_df['target_id'].astype(str).isin(ctrl_koi_stars)][['target_id', 'label', 'catalog_period']].copy()
+    koi_cols = ['target_id', 'label', 'catalog_period'] + (['koi_depth'] if 'koi_depth' in labels_df.columns else [])
+    koi_ctrl = labels_df[labels_df['target_id'].astype(str).isin(ctrl_koi_stars)][koi_cols].copy()
     koi_ctrl = koi_ctrl[koi_ctrl['label'].astype(str).str.upper().str.replace(' ', '_').isin(['CONFIRMED', 'CANDIDATE', 'FALSE_POSITIVE'])]
     koi_recovery = build_koi_recovery(koi_ctrl, ctrl_pred[ctrl_pred['target_id'].isin(ctrl_koi_stars)])
     koi_summary = summarize_koi_recovery(koi_recovery)
@@ -1356,7 +1526,7 @@ def main():
     ctrl_pred['possible_artifact'] = ctrl_pred['is_artifact'].apply(lambda x: 'ДА' if x else 'НЕТ')
     ctrl_pred['is_kepler_eb'] = ctrl_pred['target_id'].apply(lambda x: 'ДА' if is_eclipsing_binary(x, eb_stars_set) else 'НЕТ')
 
-    out_table_cols = ['target_id', 'star_type', 'signal_id', 'bls_period_d', 'bls_depth_ppm', 'label', 'p_mean', 'p_std', 'decision', 'possible_artifact', 'is_kepler_eb', 'shap_top3']
+    out_table_cols = ['target_id', 'star_type', 'signal_id', 'bls_period_d', 'bls_depth_ppm', 'label', 'p_mean', 'p_std', 'p_real', 'decision_before_noise_gate', 'decision', 'possible_artifact', 'is_kepler_eb', 'shap_top3']
     control_table = ctrl_pred[[c for c in out_table_cols if c in ctrl_pred]].copy()
     control_table.rename(columns={'bls_period_d': 'period_d', 'bls_depth_ppm': 'depth_ppm', 'label': 'catalog_label'}, inplace=True)
     control_table['catalog_label'] = control_table['catalog_label'].fillna('NONE')
@@ -1642,6 +1812,13 @@ def main():
         ]
         f.write(df_to_markdown(pd.DataFrame(unm_summary_rows)) + "\n\n")
 
+        f.write(f"{h2}2.4. Контроль на перевёрнутой кривой (оценка частоты ложных срабатываний поиска)\n")
+        if inv_controlled:
+            f.write("Тот же поиск (те же параметры и функции) запущен на ряде 2 - flux той же обработанной кривой блеска, из которой предварительно вырезаны сигналы, найденные основным поиском. Настоящие транзиты на перевёрнутом ряде становятся горбами и не ищутся, поэтому найденные там провалы порождены шумом и систематикой. Такие сигналы (INVERTED) хранятся в отдельном файле и не входят в обычные таблицы и метрики.\n\n")
+            f.write(df_to_markdown(inverted_star_rates([('Звёзды KOI (отмеченные)', final_tr_m + final_ctrl_m), ('Звёзды без отметки', final_tr_u + final_ctrl_u)], inv_controlled, inv_counts)) + "\n\n")
+            f.write(f"* Файл INVERTED-сигналов: `{inverted_csv}`; доли даны с 95% интервалом Уилсона.\n\n")
+        else:
+            f.write("Контроль не запускался: нет файла INVERTED-сигналов и отметок контроля в диагностике (флаг `--inverted-control` при извлечении не задан).\n\n")
         f.write(f"{h2}3. Раздел А: Оценка на отмеченных звёздах контрольной части (есть истинные метки)\n")
         f.write(f"*(Примечание: витринная система Kepler-80 исключена из количественных метрик Раздела А и оценивается качественно и независимо в Разделе 5)*\n\n")
         f.write(f"{h3}Восстановление KOI на контрольных отмеченных звёздах (без Kepler-80):\n\n")
@@ -1650,6 +1827,14 @@ def main():
         f.write(df_to_markdown(koi_summary['by_disposition']) + "\n\n")
         f.write(f"**По корзинам периода:**\n\n")
         f.write(df_to_markdown(koi_summary['by_period_bin']) + "\n\n")
+        f.write(f"**По глубине транзита (koi_depth, 4 корзины по квартилям KOI в диапазоне):**\n\n")
+        if len(koi_summary['by_depth']) > 0:
+            f.write(df_to_markdown(koi_summary['by_depth']) + "\n\n")
+            f.write(f"* KOI с известной koi_depth: {koi_summary['n_depth_known']} из {koi_summary['n_in_range']}\n\n")
+        else:
+            f.write("Разбивка не построена: в `data/labels/kepler_labels.csv` нет колонки `koi_depth` (файл скачан до её добавления в запрос) или известных глубин меньше 4. Колонка появится после повторной загрузки меток из архива NASA.\n\n")
+        f.write(f"**По числу KOI у звезды (все диспозиции, включая KOI вне диапазона поиска):**\n\n")
+        f.write(df_to_markdown(koi_summary['by_multiplicity']) + "\n\n")
         f.write(f"* **KOI вне диапазона поиска (не учтены в таблицах выше):** {koi_summary['n_out_of_range']} из {koi_summary['n_total']}\n")
         f.write(f"* **Сквозная полнота (найден точно и вердикт CANDIDATE), KOI CONFIRMED и CANDIDATE в диапазоне:** {koi_summary['n_end_to_end']}/{koi_summary['n_positive_in_range']} = {koi_summary['end_to_end_rate']:.1%} (95% интервал Уилсона: {koi_summary['end_to_end_ci'][0]:.1%}; {koi_summary['end_to_end_ci'][1]:.1%}); найден точно, независимо от вердикта: {koi_summary['n_positive_found_exact']}\n")
         f.write(f"* Таблица по каждому KOI: `{koi_recovery_csv_out}`\n\n")
@@ -1722,6 +1907,18 @@ def main():
         else:
             f.write("* Модельная оценка вероятностей пропущена, так как классификатор машинного обучения не обучался из-за малого числа размеченных сигналов (< 5 на класс).\n\n")
 
+        f.write(f"{h2}4.1. Этап «сигнал или шум» (p_real)\n")
+        if noise_gate['ran']:
+            nzm = noise_gate['model']
+            f.write(f"Отдельный ансамбль ({nzm['n_models']} моделей XGBoost на бутстрепе по звёздам) обучен отличать MATCHED-сигналы обучающей половины (класс 1, {nzm['n_real']} сигналов) от INVERTED-сигналов звёзд обучающей половины (класс 0, {nzm['n_noise']} сигналов). Звёздные признаки ({', '.join(STAR_FEATURE_COLS)}) в этот ансамбль не входят: они описывают звезду, а не сигнал. Порог выбран по внекорзинным предсказаниям `GroupKFold` с группировкой по звёздам так, чтобы выше порога оставалось не меньше {REAL_RECALL_TARGET:.0%} MATCHED-сигналов обучающей половины.\n\n")
+            f.write(f"* **Порог p_real:** {nzm['threshold']:.3f} (на OOF обучающей половины: сохранено MATCHED {nzm['oof_real_kept']:.1%}, отсечено INVERTED {nzm['oof_noise_rejected']:.1%})\n")
+            f.write(f"* **Правило:** вердикт CANDIDATE остаётся только при p_real не ниже порога, иначе сигнал получает REVIEW; прежний вердикт сохранён в колонке `decision_before_noise_gate` таблицы сигналов. Метрики Раздела А и сквозная полнота посчитаны после этого правила.\n")
+            f.write(f"* **CANDIDATE среди сигналов звёзд без отметки (контроль, {noise_gate['n_unm_signals']} сигналов):** до условия {noise_gate['unm_cand_before']}, после {noise_gate['unm_cand_after']}\n")
+            f.write(f"* **CANDIDATE среди MATCHED-сигналов контрольных отмеченных звёзд (без Kepler-80):** до условия {noise_gate['m_cand_before']}, после {noise_gate['m_cand_after']}\n\n")
+            f.write(f"**Распределение p_real на контрольной половине:**\n\n")
+            f.write(df_to_markdown(noise_gate['dist']) + "\n\n")
+        else:
+            f.write(f"Этап пропущен: {noise_gate['reason']}. Вердикты выдаются без этого условия, как раньше.\n\n")
         f.write(f"{h2}5. Результаты по витринной системе Kepler-80 (KIC {showcase_id})\n")
         if showcase_skipped_note:
             f.write(showcase_skipped_note + "\n\n")

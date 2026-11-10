@@ -6,6 +6,7 @@ SEARCH_MIN_PERIOD_D = 0.5
 SEARCH_MAX_PERIOD_D = 100.0
 PERIOD_TOL = 0.01
 PERIOD_BINS = [(0.5, 3.0), (3.0, 10.0), (10.0, 30.0), (30.0, 100.0)]
+MULTIPLICITY_BINS = [('1 KOI у звезды', 1, 1), ('2–3 KOI у звезды', 2, 3), ('4 и больше KOI у звезды', 4, 10 ** 6)]
 POSITIVE_LABELS = ('CONFIRMED', 'CANDIDATE')
 STAR_FEATURE_COLS = [
     'star_teff', 'star_radius', 'star_logg', 'flux_std_ppm', 'flux_mad_ppm', 'flux_skew',
@@ -44,7 +45,7 @@ def period_status(cat_period, signal_periods, tol=PERIOD_TOL):
         ratio = sp / cat_period
         if abs(ratio - 1.0) < tol:
             return 'точно', idx
-        if status == 'не найден' and (abs(ratio - 0.5) < tol or abs(ratio - 2.0) < tol):
+        if status == 'не найден' and (abs(ratio - 0.5) < tol or abs(ratio - 2.0) < tol or abs(ratio * 3.0 - 1.0) < tol or abs(ratio / 3.0 - 1.0) < tol):
             status = 'гармоника'
             best = idx
     return status, best
@@ -56,6 +57,8 @@ def build_koi_recovery(koi_df, signals_df, min_period=SEARCH_MIN_PERIOD_D, max_p
     if signals_df is not None and len(signals_df) > 0:
         for tid, grp in signals_df.groupby(signals_df['target_id'].astype(str)):
             sig_by_star[tid] = grp.reset_index(drop=True)
+    has_depth = 'koi_depth' in koi_df.columns
+    n_koi = koi_df['target_id'].astype(str).value_counts().to_dict() if len(koi_df) > 0 else {}
     for r in koi_df.to_dict('records'):
         tid = str(r['target_id'])
         cat_p = float(r['catalog_period']) if pd.notna(r.get('catalog_period')) else np.nan
@@ -73,9 +76,10 @@ def build_koi_recovery(koi_df, signals_df, min_period=SEARCH_MIN_PERIOD_D, max_p
                     found_p = float(grp.loc[idx, 'bls_period_d'])
                     if 'decision' in grp.columns:
                         decision = str(grp.loc[idx, 'decision'])
-        rows.append({'target_id': tid, 'disposition': disp, 'catalog_period': cat_p, 'in_range': in_range,
-                     'status': status, 'found_period': found_p, 'decision': decision})
-    return pd.DataFrame(rows, columns=['target_id', 'disposition', 'catalog_period', 'in_range', 'status', 'found_period', 'decision'])
+        depth = pd.to_numeric(pd.Series([r.get('koi_depth', np.nan)]), errors='coerce').iloc[0] if has_depth else np.nan
+        rows.append({'target_id': tid, 'disposition': disp, 'catalog_period': cat_p, 'koi_depth': float(depth), 'n_koi_star': int(n_koi.get(tid, 0)),
+                     'in_range': in_range, 'status': status, 'found_period': found_p, 'decision': decision})
+    return pd.DataFrame(rows, columns=['target_id', 'disposition', 'catalog_period', 'koi_depth', 'n_koi_star', 'in_range', 'status', 'found_period', 'decision'])
 
 
 def _status_row(name, sub):
@@ -108,6 +112,23 @@ def summarize_koi_recovery(rec):
         sub = in_rng[mask]
         if len(sub) > 0:
             by_bin.append(_status_row(f"P {lo:g}–{hi:g} д", sub))
+    by_depth = []
+    depth_vals = in_rng['koi_depth'] if 'koi_depth' in in_rng.columns else pd.Series(dtype=float)
+    depth_ok = in_rng[np.isfinite(pd.to_numeric(depth_vals, errors='coerce').astype(float))] if len(in_rng) > 0 else in_rng
+    if len(depth_ok) >= 4:
+        edges = np.unique(np.quantile(depth_ok['koi_depth'].astype(float), [0.0, 0.25, 0.5, 0.75, 1.0]))
+        for i in range(len(edges) - 1):
+            lo, hi = edges[i], edges[i + 1]
+            last = i == len(edges) - 2
+            m = (depth_ok['koi_depth'] >= lo) & ((depth_ok['koi_depth'] <= hi) if last else (depth_ok['koi_depth'] < hi))
+            sub = depth_ok[m]
+            if len(sub) > 0:
+                by_depth.append(_status_row(f"Q{i + 1}: {lo:.0f}–{hi:.0f} ppm", sub))
+    by_mult = []
+    for name, lo, hi in MULTIPLICITY_BINS:
+        sub = in_rng[(in_rng['n_koi_star'] >= lo) & (in_rng['n_koi_star'] <= hi)] if 'n_koi_star' in in_rng.columns else in_rng.iloc[0:0]
+        if len(sub) > 0:
+            by_mult.append(_status_row(name, sub))
     pos = in_rng[in_rng['disposition'].isin(POSITIVE_LABELS)]
     n_pos = len(pos)
     k_e2e = int(((pos['status'] == 'точно') & (pos['decision'] == 'CANDIDATE')).sum())
@@ -116,6 +137,9 @@ def summarize_koi_recovery(rec):
     return {
         'by_disposition': pd.DataFrame(by_disp),
         'by_period_bin': pd.DataFrame(by_bin),
+        'by_depth': pd.DataFrame(by_depth),
+        'by_multiplicity': pd.DataFrame(by_mult),
+        'n_depth_known': int(len(depth_ok)),
         'n_total': int(len(rec)),
         'n_in_range': int(len(in_rng)),
         'n_out_of_range': out_of_range,
@@ -174,3 +198,21 @@ def ablation_feature_sets(feature_cols):
 
 def ci_text(ci, digits=3):
     return f"[{ci[0]:.{digits}f}; {ci[1]:.{digits}f}]"
+
+
+def inverted_star_rates(groups, controlled_ids, inverted_counts):
+    rows = []
+    controlled = set(str(s) for s in controlled_ids)
+    for name, stars in groups:
+        pool = [str(s) for s in stars if str(s) in controlled]
+        n = len(pool)
+        k = sum(1 for s in pool if int(inverted_counts.get(s, 0)) > 0)
+        n_sig = int(sum(int(inverted_counts.get(s, 0)) for s in pool))
+        rows.append({
+            'Группа звёзд': name,
+            'Звёзд с контролем': n,
+            'Звёзд с INVERTED-сигналом': format_share(k, n),
+            'INVERTED-сигналов всего': n_sig,
+            'На звезду': f"{n_sig / n:.3f}" if n > 0 else '-',
+        })
+    return pd.DataFrame(rows)

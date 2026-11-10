@@ -45,6 +45,7 @@ def main():
     parser.add_argument('--injections-per-star', type=int, default=12)
     parser.add_argument('--max-sectors', type=int, default=0, help='[DEBUG ONLY] Limit the number of sectors/quarters downloaded. Warning: alters baseline, features, and detection results; not for production training.')
     parser.add_argument('--no-resume', action='store_true')
+    parser.add_argument('--inverted-control', action='store_true', help='Also run the search on the inverted light curve (2 - flux) and write <output>_inverted.csv; used by the demo signal-or-noise stage.')
     parser.add_argument('--allow-legacy', action='store_true', help='Resume extraction into a features file with a different or missing pipeline_version, with a warning.')
     parser.add_argument('--report-only', action='store_true', help='[demo] Rebuild the report from existing feature and split files; no extraction, retries or downloads.')
     parser.add_argument('--balance-halves', action='store_true', help='[demo] Trim the four star groups to the size of the smallest one.')
@@ -128,6 +129,7 @@ def main():
         if args.quick: cmd1.append('--quick')
         if args.no_resume: cmd1.append('--no-resume')
         if args.allow_legacy: cmd1.append('--allow-legacy')
+        if args.inverted_control: cmd1.append('--inverted-control')
         if args.smoke_test: cmd1.append('--smoke-test')
         logging.info('Running extractor')
         ret1 = subprocess.run(cmd1)
@@ -154,6 +156,7 @@ def main():
         if args.quick: cmd1.append('--quick')
         if args.no_resume: cmd1.append('--no-resume')
         if args.allow_legacy: cmd1.append('--allow-legacy')
+        if args.inverted_control: cmd1.append('--inverted-control')
         if args.smoke_test: cmd1.append('--smoke-test')
         logging.info('Running extractor in extract-only mode')
         ret1 = subprocess.run(cmd1)
@@ -229,6 +232,8 @@ def main():
             cmd.append('--report-only')
         if args.allow_legacy:
             cmd.append('--allow-legacy')
+        if args.inverted_control:
+            cmd.append('--inverted-control')
         if args.balance_halves:
             cmd.append('--balance-halves')
         if args.unmarked_file:

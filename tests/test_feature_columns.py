@@ -3,10 +3,12 @@ import onyx_features
 
 
 REAL_HEADER = (
-    "signal_id,target_id,signal_index,mission,label,match_status,bls_period_d,"
-    "bls_epoch,bls_duration_d,bls_depth_ppm,bls_depth_snr,bls_power_peak,bls_sde,"
-    "transit_count,duty_cycle,odd_even_depth_diff_ppm,odd_even_sigma,"
-    "secondary_depth_ppm,secondary_snr,harmonic_power_ratio,shape_v_u_ratio,"
+    "signal_id,target_id,signal_index,pipeline_version,mission,label,match_status,"
+    "bls_period_d,bls_epoch,bls_duration_d,bls_depth_ppm,bls_depth_snr,bls_power_peak,"
+    "bls_sde,bls_sde_raw,transit_count,n_transits_observed,single_event_fraction,"
+    "dur_at_grid_edge,duty_cycle,odd_even_depth_diff_ppm,odd_even_sigma,odd_even_z,"
+    "secondary_depth_ppm,secondary_snr,secondary_z,secondary_phase,implied_radius_rjup,"
+    "duration_ratio,eb_period_match,harmonic_power_ratio,shape_v_u_ratio,"
     "in_transit_scatter_ppm,depth_scatter_ppm,flux_std_ppm,flux_mad_ppm,flux_skew,"
     "flux_kurtosis,cdpp_ppm,pointwise_scatter_ppm,autocorr_max,ls_peak_power,"
     "gap_fraction,baseline_d,star_teff,star_radius,star_logg,"
@@ -19,9 +21,11 @@ EXTRACTOR_COLUMNS = REAL_HEADER + ['target_bin']
 
 LEGACY_ML_FEATURES = [
     'bls_period_d', 'bls_duration_d', 'bls_depth_ppm', 'bls_depth_snr',
-    'bls_power_peak', 'bls_sde', 'transit_count', 'duty_cycle',
-    'odd_even_depth_diff_ppm', 'odd_even_sigma', 'secondary_depth_ppm',
-    'secondary_snr', 'harmonic_power_ratio', 'shape_v_u_ratio',
+    'bls_power_peak', 'bls_sde', 'transit_count', 'n_transits_observed',
+    'single_event_fraction', 'dur_at_grid_edge', 'duty_cycle',
+    'odd_even_depth_diff_ppm', 'odd_even_z', 'secondary_depth_ppm',
+    'secondary_z', 'secondary_phase', 'implied_radius_rjup', 'duration_ratio',
+    'harmonic_power_ratio', 'shape_v_u_ratio',
     'in_transit_scatter_ppm', 'depth_scatter_ppm', 'flux_std_ppm',
     'flux_mad_ppm', 'flux_skew', 'flux_kurtosis', 'cdpp_ppm',
     'pointwise_scatter_ppm', 'autocorr_max', 'ls_peak_power', 'gap_fraction',
@@ -30,18 +34,9 @@ LEGACY_ML_FEATURES = [
     'centroid_shift_total_sigma', 'centroid_shift_total_arcsec',
 ]
 
-LEGACY_DEMO_FEATURES = [
-    'bls_period_d', 'bls_duration_d', 'bls_depth_ppm', 'bls_depth_snr',
-    'bls_power_peak', 'bls_sde', 'transit_count', 'duty_cycle',
-    'odd_even_depth_diff_ppm', 'odd_even_sigma', 'secondary_depth_ppm',
-    'secondary_snr', 'harmonic_power_ratio', 'shape_v_u_ratio',
-    'in_transit_scatter_ppm', 'depth_scatter_ppm', 'flux_std_ppm',
-    'flux_mad_ppm', 'flux_skew', 'flux_kurtosis', 'cdpp_ppm',
-    'pointwise_scatter_ppm', 'autocorr_max', 'ls_peak_power', 'gap_fraction',
-    'star_teff', 'star_radius', 'star_logg',
-    'centroid_shift_col_sigma', 'centroid_shift_row_sigma',
-    'centroid_shift_total_sigma', 'centroid_shift_total_arcsec',
-]
+LEGACY_DEMO_FEATURES = [c for c in LEGACY_ML_FEATURES if c != 'baseline_d']
+
+REPORT_ONLY_COLS = ['bls_epoch', 'bls_sde_raw', 'odd_even_sigma', 'secondary_snr', 'eb_period_match', 'pipeline_version']
 
 LEGACY_EXCLUDE_COLS = [
     'signal_id', 'target_id', 'signal_index', 'mission', 'label',
@@ -58,8 +53,8 @@ LEGACY_COVERAGE_COLS = [
 def test_equivalence_ml_pipeline_schema():
     df = pd.DataFrame(columns=EXTRACTOR_COLUMNS)
     actual = onyx_features.compute_feature_columns(df, exclude_coverage=False)
-    assert len(REAL_HEADER) == 45
-    assert len(actual) == 33
+    assert len(REAL_HEADER) == 56
+    assert len(actual) == 39
     assert actual == LEGACY_ML_FEATURES
     assert 'baseline_d' in actual
 
@@ -68,7 +63,7 @@ def test_equivalence_demo_pipeline_schema():
     cols = EXTRACTOR_COLUMNS + ['n_files', 'n_quarters']
     df = pd.DataFrame(columns=cols)
     actual = onyx_features.compute_feature_columns(df, exclude_coverage=True)
-    assert len(actual) == 32
+    assert len(actual) == 38
     assert actual == LEGACY_DEMO_FEATURES
     for cov in LEGACY_COVERAGE_COLS:
         assert cov not in actual
@@ -80,6 +75,16 @@ def test_bls_epoch_and_pipeline_version_are_not_features():
         feats = onyx_features.compute_feature_columns(df, exclude_coverage=cov_flag)
         assert 'bls_epoch' not in feats
         assert 'pipeline_version' not in feats
+
+
+def test_report_only_columns_never_features():
+    df = pd.DataFrame(columns=EXTRACTOR_COLUMNS)
+    for cov_flag in (False, True):
+        feats = onyx_features.compute_feature_columns(df, exclude_coverage=cov_flag)
+        for col in REPORT_ONLY_COLS:
+            assert col not in feats
+        for col in ('odd_even_z', 'secondary_z', 'secondary_phase', 'implied_radius_rjup', 'duration_ratio'):
+            assert col in feats
 
 
 def test_equivalence_transfer_intersection():
