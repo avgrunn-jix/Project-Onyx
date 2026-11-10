@@ -174,3 +174,21 @@ def ablation_feature_sets(feature_cols):
 
 def ci_text(ci, digits=3):
     return f"[{ci[0]:.{digits}f}; {ci[1]:.{digits}f}]"
+
+
+def inverted_star_rates(groups, controlled_ids, inverted_counts):
+    rows = []
+    controlled = set(str(s) for s in controlled_ids)
+    for name, stars in groups:
+        pool = [str(s) for s in stars if str(s) in controlled]
+        n = len(pool)
+        k = sum(1 for s in pool if int(inverted_counts.get(s, 0)) > 0)
+        n_sig = int(sum(int(inverted_counts.get(s, 0)) for s in pool))
+        rows.append({
+            'Группа звёзд': name,
+            'Звёзд с контролем': n,
+            'Звёзд с INVERTED-сигналом': format_share(k, n),
+            'INVERTED-сигналов всего': n_sig,
+            'На звезду': f"{n_sig / n:.3f}" if n > 0 else '-',
+        })
+    return pd.DataFrame(rows)

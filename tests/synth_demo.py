@@ -126,3 +126,34 @@ def build_workspace(root, n_per_group=24, seed=3, with_version=True, version='2|
                                'primary_label': star_class[sid][0].replace(' ', '_') if sid in star_class else 'NONE'})
     pd.DataFrame(split_rows).to_csv(os.path.join(out_dir, f'demo_stars_split{suffix}.csv'), index=False)
     return {'root': root, 'out_dir': out_dir, 'groups': groups, 'features': df, 'koi_periods': koi_periods}
+
+
+def add_inverted_control(ws, seed=9, suffix='_quick', marked_rate=0.5, unmarked_rate=0.25):
+    rng = np.random.RandomState(seed)
+    groups = ws['groups']
+    marked = groups['tr_m'] + groups['ctrl_m']
+    unmarked = groups['tr_u'] + groups['ctrl_u']
+    base = ws['features']
+    template = base.iloc[0].to_dict()
+    rows = []
+    diag_rows = []
+    counts = {}
+    for stars, rate in ((marked, marked_rate), (unmarked, unmarked_rate)):
+        for i, sid in enumerate(stars):
+            n = 1 if (i % int(round(1.0 / rate))) == 0 else 0
+            counts[sid] = n
+            for k in range(n):
+                r = dict(template)
+                r.update({'signal_id': f'{sid}_inv{k}', 'target_id': sid, 'signal_index': k, 'label': 'INVERTED',
+                          'match_status': 'INVERTED', 'bls_period_d': float(rng.uniform(0.6, 30.0)),
+                          'bls_depth_snr': float(rng.uniform(7.1, 9.0)), 'bls_sde': float(rng.uniform(7.0, 8.0)),
+                          'odd_even_sigma': float(abs(rng.normal(1.5, 0.4))), 'shape_v_u_ratio': float(abs(rng.normal(1.0, 0.2)))})
+                rows.append(r)
+            diag_rows.append({'target_id': sid, 'status': 'OK', 'n_files': 17, 'n_quarters': 17, 'baseline_d': 1400.0,
+                              'signals_found': int((base['target_id'] == sid).sum()), 'inverted_control': 1, 'inverted_count': n})
+    df_inv = pd.DataFrame(rows, columns=list(base.columns))
+    df_inv.to_csv(os.path.join(ws['out_dir'], f'features_demo{suffix}_inverted.csv'), index=False)
+    pd.DataFrame(diag_rows).to_csv(os.path.join(ws['out_dir'], f'features_demo{suffix}_diagnostics.csv'), index=False)
+    ws['inverted'] = df_inv
+    ws['inverted_counts'] = counts
+    return ws

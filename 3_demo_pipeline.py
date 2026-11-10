@@ -26,7 +26,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupKFold
 from xgboost import XGBClassifier
 import shap
-from onyx_report import STAR_FEATURE_COLS, SEARCH_MAX_PERIOD_D, SEARCH_MIN_PERIOD_D, ablation_feature_sets, brier_score, build_koi_recovery, ci_text, oriented_auc, reliability_table, summarize_koi_recovery
+from onyx_report import inverted_star_rates, STAR_FEATURE_COLS, SEARCH_MAX_PERIOD_D, SEARCH_MIN_PERIOD_D, ablation_feature_sets, brier_score, build_koi_recovery, ci_text, oriented_auc, reliability_table, summarize_koi_recovery
 from onyx_features import COVERAGE_COLS, PipelineVersionError, build_pipeline_version, check_pipeline_version, compute_feature_columns
 from onyx_showcase import render_showcase
 
@@ -437,6 +437,31 @@ def load_report_plan(out_dir, file_suffix, star_prim):
     unmarked_ids = [s for s in planned if s not in set(marked_ids)]
     return groups, planned, marked_ids, unmarked_ids
 
+def load_inverted_signals(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    df = pd.read_csv(path, dtype={'target_id': str})
+    if 'match_status' in df.columns:
+        df = df[df['match_status'] == 'INVERTED'].copy()
+    return df
+
+def inverted_control_stats(df_inverted, diag_map, processed_ids):
+    counts = {}
+    if df_inverted is not None and len(df_inverted) > 0:
+        counts = {str(k): int(v) for k, v in df_inverted['target_id'].astype(str).value_counts().items()}
+    controlled = set()
+    has_flag = False
+    for sid, row in diag_map.items():
+        val = row.get('inverted_control', None) if hasattr(row, 'get') else None
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            continue
+        has_flag = True
+        if str(row.get('status', 'OK')) == 'OK' and int(float(val)) == 1:
+            controlled.add(str(sid))
+    if not has_flag and df_inverted is not None:
+        controlled = set(str(s) for s in processed_ids)
+    return counts, controlled
+
 def apply_log1p(X):
     return np.log1p(np.maximum(X, 0))
 
@@ -763,6 +788,7 @@ def main():
     parser.add_argument('--min-free-gb', type=float, default=5.0)
     parser.add_argument('--report-only', action='store_true', help='Rebuild the report and tables from existing feature and split files; no extraction, retries or downloads.')
     parser.add_argument('--allow-legacy', action='store_true', help='Resume extraction into a features file whose pipeline_version differs or is missing, with a warning.')
+    parser.add_argument('--inverted-control', action='store_true', help='Pass --inverted-control to the extractor: also search 2 - flux of each processed light curve and write features_demo*_inverted.csv.')
     parser.add_argument('--balance-halves', action='store_true', help='Trim the four star groups to the size of the smallest one (previous behaviour).')
     parser.add_argument('--verbose', action='store_true', help='Print detailed output to the console instead of the progress bar.')
     args = parser.parse_args()
@@ -937,6 +963,8 @@ def main():
             cmd_ext.append('--smoke-test')
         if args.allow_legacy:
             cmd_ext.append('--allow-legacy')
+        if args.inverted_control:
+            cmd_ext.append('--inverted-control')
         emit(f"Запуск извлечения признаков для {len(targets_to_run)} звёзд...")
         phase('extracting features')
         run_child(cmd_ext, check=True)
@@ -1021,6 +1049,9 @@ def main():
 
     diag_rows_csv = []
     diag_rows_md = []
+    inverted_csv = os.path.join(out_dir, f"features_demo{file_suffix}_inverted.csv")
+    df_inverted = load_inverted_signals(inverted_csv)
+    inv_counts, inv_controlled = inverted_control_stats(df_inverted, diag_map, processed_ids)
     group_map = plan_group_map(tr_marked, ctrl_marked, tr_unmarked, ctrl_unmarked)
     for sid in planned_order:
         is_m = (sid in marked_ids)
@@ -1082,6 +1113,7 @@ def main():
             'базлайн в сутках': round(bd, 2),
             'найдено сигналов': nsig,
             'MATCHED/HARMONIC/UNMATCHED': match_summary,
+            'INVERTED-сигналов': int(inv_counts.get(sid, 0)) if sid in inv_controlled else '-',
             'статус': stat_display,
             'максимальный SDE': round(msde, 2),
             'максимальный SNR': round(msnr, 2),
@@ -1102,6 +1134,7 @@ def main():
             'Базлайн (д)': f"{bd:.1f}",
             'Сигналов': nsig,
             'MATCHED/HARM/UNM': match_summary,
+            'INVERTED': int(inv_counts.get(sid, 0)) if sid in inv_controlled else '-',
             'Макс. SDE / SNR': max_sde_snr_str,
             'Статус': stat_display,
             'EB (каталог)': is_eb,
@@ -1642,6 +1675,13 @@ def main():
         ]
         f.write(df_to_markdown(pd.DataFrame(unm_summary_rows)) + "\n\n")
 
+        f.write(f"{h2}2.4. Контроль на перевёрнутой кривой (оценка частоты ложных срабатываний поиска)\n")
+        if inv_controlled:
+            f.write("Тот же поиск (те же параметры и функции) запущен на ряде 2 - flux той же обработанной кривой блеска, из которой предварительно вырезаны сигналы, найденные основным поиском. Настоящие транзиты на перевёрнутом ряде становятся горбами и не ищутся, поэтому найденные там провалы порождены шумом и систематикой. Такие сигналы (INVERTED) хранятся в отдельном файле и не входят в обычные таблицы и метрики.\n\n")
+            f.write(df_to_markdown(inverted_star_rates([('Звёзды KOI (отмеченные)', final_tr_m + final_ctrl_m), ('Звёзды без отметки', final_tr_u + final_ctrl_u)], inv_controlled, inv_counts)) + "\n\n")
+            f.write(f"* Файл INVERTED-сигналов: `{inverted_csv}`; доли даны с 95% интервалом Уилсона.\n\n")
+        else:
+            f.write("Контроль не запускался: нет файла INVERTED-сигналов и отметок контроля в диагностике (флаг `--inverted-control` при извлечении не задан).\n\n")
         f.write(f"{h2}3. Раздел А: Оценка на отмеченных звёздах контрольной части (есть истинные метки)\n")
         f.write(f"*(Примечание: витринная система Kepler-80 исключена из количественных метрик Раздела А и оценивается качественно и независимо в Разделе 5)*\n\n")
         f.write(f"{h3}Восстановление KOI на контрольных отмеченных звёздах (без Kepler-80):\n\n")

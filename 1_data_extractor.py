@@ -162,6 +162,7 @@ REFINE_MAX_POINTS = 4000
 BLS_OVERSAMPLE = 10
 DUR_BIN_D = DUR_GRID_MIN_D / BLS_OVERSAMPLE
 HARMONIC_RATIOS = (0.5, 2.0, 1.0 / 3.0, 3.0)
+INVERTED_MASK_MAIN_SIGNALS = True
 
 def duration_grid(quick_mode):
     n = DUR_GRID_N_QUICK if quick_mode else DUR_GRID_N_FULL
@@ -351,6 +352,20 @@ def match_period_ratio(ratio, tol=ALIAS_TOL):
     if abs(ratio - 0.5) < tol or abs(ratio - 2.0) < tol or abs(ratio * 3.0 - 1.0) < tol or abs(ratio / 3.0 - 1.0) < tol:
         return 'HARMONIC'
     return None
+
+def invert_light_curve(lc):
+    inv = lc.copy()
+    unit = getattr(lc.flux, 'unit', None)
+    vals = 2.0 - np.asarray(lc.flux.value, dtype=float)
+    inv.flux = vals * unit if unit is not None else vals
+    return inv
+
+def inverted_output_path(output):
+    base, ext = os.path.splitext(output)
+    return f"{base}_inverted{ext if ext else '.csv'}"
+
+def diag_inverted_fields(inverted_flag, n_inverted):
+    return {'inverted_control': int(bool(inverted_flag)), 'inverted_count': int(n_inverted) if inverted_flag else 0}
 
 def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=False):
     lc_search = lc_flat.copy()
@@ -558,6 +573,7 @@ def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star
         'alias_factors': alias_factors_list,
         'n_refined': n_refined,
         'n_few_transits': n_few_transits,
+        'lc_residual': lc_search,
     }
 
 def init_worker(sem, clip_upward=None, resolve_aliases=None):
@@ -628,8 +644,8 @@ def find_emergency_expired(active, starts, now, star_timeout, factor=None):
             expired.append((f, tid_str, started))
     return expired
 
-def failed_diag_row(tid_str, err, elapsed, pipeline_ver):
-    return {
+def failed_diag_row(tid_str, err, elapsed, pipeline_ver, inverted_flag=False):
+    row = {
         'target_id': tid_str,
         'pipeline_version': pipeline_ver,
         'n_files': 0,
@@ -650,6 +666,8 @@ def failed_diag_row(tid_str, err, elapsed, pipeline_ver):
         'alias_corrections': 0,
         'alias_factors': ''
     }
+    row.update(diag_inverted_fields(inverted_flag, 0))
+    return row
 
 def update_failed_table(path, recovered, updates):
     rows = {}
@@ -971,7 +989,7 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0, clip_upward=None, resolve_aliases=None):
+def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0, clip_upward=None, resolve_aliases=None, inverted_control=False):
     use_clip_upward = CLIP_UPWARD_ONLY if clip_upward is None else bool(clip_upward)
     use_resolve_aliases = RESOLVE_ALIASES if resolve_aliases is None else bool(resolve_aliases)
     pipeline_ver = build_pipeline_version(quick_mode, flatten_days, max_signals)
@@ -1109,6 +1127,12 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'baseline_d': baseline_d, 'star_teff': star_teff, 'star_radius': star_radius, 'star_logg': star_logg,
         }
         main_res = search_signals(lc_flat, tid, mission, row_dicts, baseline_d, med_diff, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver)
+        inv_res = None
+        if inverted_control:
+            t_inv_start = time.time()
+            inv_source = main_res['lc_residual'] if INVERTED_MASK_MAIN_SIGNALS else lc_flat
+            inv_res = search_signals(invert_light_curve(inv_source), tid, mission, [], baseline_d, med_diff, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=True)
+            inv_res['time'] = time.time() - t_inv_start
         features_list = main_res['features']
         curves_dict = main_res['curves']
         timing_bls = main_res['timing_bls']
@@ -1131,7 +1155,10 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'alias_corrections': alias_corrections,
             'alias_factors': ';'.join(alias_factors_list),
             'n_refined': main_res['n_refined'],
-            'n_few_transits': main_res['n_few_transits']
+            'n_few_transits': main_res['n_few_transits'],
+            'inverted_control': int(bool(inverted_control)),
+            'inverted_features': inv_res['features'] if inv_res is not None else [],
+            'inverted_time': inv_res['time'] if inv_res is not None else 0.0
         }
         return features_list, curves_dict, tid, None, dl_size, timings
     except Exception as e:
@@ -1193,6 +1220,7 @@ def main():
     parser.add_argument('--injection-output', default='outputs/injection_results.csv')
     parser.add_argument('--quick', action='store_true')
     parser.add_argument('--no-resume', action='store_true')
+    parser.add_argument('--inverted-control', action='store_true', help='After the main search, run the same search on 2 - flux of the processed light curve (no second download) and write the signals to <output>_inverted.csv with match_status INVERTED.')
     parser.add_argument('--allow-legacy', action='store_true', help='Resume into a features file whose pipeline_version differs or is missing, with a warning instead of stopping.')
     parser.add_argument('--star-timeout', type=float, default=1800.0)
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
@@ -1263,6 +1291,7 @@ def main():
     base_out, ext_out = os.path.splitext(args.output)
     failed_csv = f"{base_out}_failed{ext_out if ext_out else '.csv'}"
     diag_csv = f"{base_out}_diagnostics{ext_out if ext_out else '.csv'}"
+    inverted_csv = inverted_output_path(args.output)
     resume = not args.no_resume
 
     if resume and os.path.exists(args.output) and os.path.getsize(args.output) > 0:
@@ -1301,6 +1330,8 @@ def main():
             os.remove(failed_csv)
         if os.path.exists(diag_csv):
             os.remove(diag_csv)
+        if os.path.exists(inverted_csv):
+            os.remove(inverted_csv)
         npz_del = os.path.join(os.path.dirname(args.output) or base_outputs, 'folded_curves.npz')
         if os.path.exists(npz_del):
             os.remove(npz_del)
@@ -1529,7 +1560,7 @@ def main():
         if tid_str in failed_attempts and failed_attempts[tid_str] >= MAX_FAILED_ATTEMPTS:
             continue
         rows = labels_df[labels_df['target_id'] == tid_str].to_dict('records')
-        tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout, args.max_sectors, CLIP_UPWARD_ONLY, RESOLVE_ALIASES))
+        tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout, args.max_sectors, CLIP_UPWARD_ONLY, RESOLVE_ALIASES, args.inverted_control))
 
     total_tasks = len(tasks)
     completed_stars = 0
@@ -1589,7 +1620,7 @@ def main():
                     log_failure(failed_csv, tid_str, err, failed_attempts, stage=stage)
                     failure_info[tid_str] = (err, stage)
                     skip_count += 1
-                    append_to_csv_flush(diag_csv, pd.DataFrame([failed_diag_row(tid_str, err, elapsed, pipeline_ver)]))
+                    append_to_csv_flush(diag_csv, pd.DataFrame([failed_diag_row(tid_str, err, elapsed, pipeline_ver, args.inverted_control)]))
                 else:
                     success_count += 1
                     n_f = timings.get('n_files', 0) if timings else 0
@@ -1623,6 +1654,7 @@ def main():
                         'alias_corrections': int(timings.get('alias_corrections', 0)) if timings else 0,
                         'alias_factors': str(timings.get('alias_factors', '')) if timings else ''
                     }
+                    diag_row.update(diag_inverted_fields(args.inverted_control, len(timings.get('inverted_features', [])) if timings else 0))
                     append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     if timings:
                         stage_timings.append(timings)
@@ -1637,6 +1669,8 @@ def main():
                                     print(detail_msg, flush=True)
                     if feats:
                         append_to_csv_flush(args.output, pd.DataFrame(feats))
+                    if timings and timings.get('inverted_features'):
+                        append_to_csv_flush(inverted_csv, pd.DataFrame(timings['inverted_features']))
                         for item in feats:
                             m_st = item.get('match_status', 'UNMATCHED')
                             match_stats[m_st] = match_stats.get(m_st, 0) + 1
@@ -1676,7 +1710,7 @@ def main():
                 failure_info[tid_str] = (err, 'timeout')
                 skip_count += 1
                 emerg_elapsed = now - worker_start
-                append_to_csv_flush(diag_csv, pd.DataFrame([failed_diag_row(tid_str, err, emerg_elapsed, pipeline_ver)]))
+                append_to_csv_flush(diag_csv, pd.DataFrame([failed_diag_row(tid_str, err, emerg_elapsed, pipeline_ver, args.inverted_control)]))
                 completed_stars += 1
                 durations.append(emerg_elapsed)
                 avg_time = sum(durations) / len(durations)
@@ -1713,6 +1747,8 @@ def main():
                         recovered_stars.add(r_tid_str)
                         if feats:
                             append_to_csv_flush(args.output, pd.DataFrame(feats))
+                        if timings and timings.get('inverted_features'):
+                            append_to_csv_flush(inverted_csv, pd.DataFrame(timings['inverted_features']))
                             for item in feats:
                                 m_st = item.get('match_status', 'UNMATCHED')
                                 match_stats[m_st] = match_stats.get(m_st, 0) + 1
@@ -1756,6 +1792,7 @@ def main():
                                 'alias_corrections': int(timings.get('alias_corrections', 0)) if timings else 0,
                                 'alias_factors': str(timings.get('alias_factors', '')) if timings else ''
                             }
+                            diag_row.update(diag_inverted_fields(args.inverted_control, len(timings.get('inverted_features', [])) if timings else 0))
                             append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     else:
                         failure_info[r_tid_str] = (err, classify_failure_stage(err))
