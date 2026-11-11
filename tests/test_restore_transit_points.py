@@ -441,7 +441,7 @@ def test_no_restore_flag_runs_previous_search_path(extractor, monkeypatch, tmp_p
 
 
 @pytest.mark.parametrize("low_run", [1, 2])
-def test_restore_changes_only_depth_when_no_removed_points_in_windows(extractor, monkeypatch, tmp_path, low_run):
+def test_restore_changes_nothing_when_no_removed_points_in_windows(extractor, monkeypatch, tmp_path, low_run):
     coll = star_collection(sigma=1e-3, deep=0.0, box_depth=1.5e-3, box_period=4.0, box_t0=0.9, n_low=4, low_run=low_run, seed=11)
     feats_on, curves_on, timings_on = run_star(extractor, monkeypatch, tmp_path, coll)
     feats_off, curves_off, timings_off = run_star(extractor, monkeypatch, tmp_path, coll, restore_transits=False)
@@ -451,14 +451,12 @@ def test_restore_changes_only_depth_when_no_removed_points_in_windows(extractor,
         assert timings_on['restore_pool_points'] >= 16
     assert len(feats_on) == len(feats_off) >= 1
     assert all(n == 0 for n in timings_on['restored_points'])
+    assert all(n == 0 for n in timings_on['restore_candidates'])
     assert len(near(feats_on, 4.0)) == 1
     for a, b in zip(feats_on, feats_off):
         assert set(a) == set(b)
         for key in a:
-            if key in ('bls_depth_ppm', 'implied_radius_rjup'):
-                continue
             assert same_value(a[key], b[key]), key
-        assert abs(a['bls_depth_ppm'] / b['bls_depth_ppm'] - 1.0) < 0.05
     for key in curves_off:
         assert np.array_equal(curves_on[key], curves_off[key])
 
@@ -481,8 +479,9 @@ def test_restore_pool_is_masked_together_with_search_curve(extractor, monkeypatc
     assert seen[1][1] == 0 and seen[1][2] == 0
     assert [round(x['bls_period_d'], 1) for x in feats[:2]] == [4.0, 5.3]
     assert timings['restored_points'][:2] == [seen[0][2], 0]
+    assert timings['restore_candidates'][:2] == [seen[0][2], 0]
 
 
 def test_pipeline_version_is_bumped_for_restored_features():
-    assert onyx_features.PIPELINE_VERSION == '7'
-    assert onyx_features.build_pipeline_version(False, 3.0, 4).startswith('7|')
+    assert onyx_features.PIPELINE_VERSION == '8'
+    assert onyx_features.build_pipeline_version(False, 3.0, 4).startswith('8|')

@@ -199,12 +199,12 @@ def test_low_restored_fraction_keeps_search_duration_and_epoch_bitwise(extractor
 
     monkeypatch.setattr(extractor, 'box_depth_ppm', spy_box)
     monkeypatch.setattr(extractor, 'reestimate_transit', spy_reest)
-    coll = star_collection(sigma=1e-3, deep=0.0, box_depth=1.5e-3, box_period=4.0, box_t0=0.9, box_low_runs=3, seed=11)
+    coll = star_collection(sigma=1e-3, deep=0.0, box_depth=1.5e-3, box_period=4.0, box_t0=0.9, box_low_runs=8, seed=11)
     feats, curves, timings = run_star(extractor, monkeypatch, tmp_path, coll)
     sig = feats[0]
     assert abs(sig['bls_period_d'] / 4.0 - 1.0) < 0.01
-    assert timings['restored_points'][0] >= 3
-    assert timings['restored_points'][0] <= 12
+    assert timings['restored_points'][0] == 32
+    assert timings['restore_candidates'][0] == 32
     assert timings['reestimated'][0] == 0
     assert timings['n_reestimated'] == 0
     assert reest == []
@@ -254,14 +254,17 @@ def test_transit_edge_point_cut_off_by_upward_outlier_is_treated_as_single(extra
 
 
 def test_diag_restore_fields(extractor):
-    assert extractor.diag_restore_fields(None) == {'restore_pool_points': 0, 'restored_points': ''}
-    assert extractor.diag_restore_fields({}) == {'restore_pool_points': 0, 'restored_points': ''}
-    out = extractor.diag_restore_fields({'restore_pool_points': np.int64(2796), 'restored_points': [2795, 0, np.int64(4)]})
-    assert out == {'restore_pool_points': 2796, 'restored_points': '2795;0;4'}
+    assert extractor.diag_restore_fields(None) == {'restore_pool_points': 0, 'restored_points': '', 'restore_candidates': ''}
+    assert extractor.diag_restore_fields({}) == {'restore_pool_points': 0, 'restored_points': '', 'restore_candidates': ''}
+    out = extractor.diag_restore_fields({'restore_pool_points': np.int64(2796), 'restored_points': [2795, 0, np.int64(4)], 'restore_candidates': [2795, np.int64(8), 4]})
+    assert out == {'restore_pool_points': 2796, 'restored_points': '2795;0;4', 'restore_candidates': '2795;8;4'}
+    assert list(out) == ['restore_pool_points', 'restored_points', 'restore_candidates']
+    old = extractor.diag_restore_fields({'restore_pool_points': 5, 'restored_points': [5]})
+    assert old == {'restore_pool_points': 5, 'restored_points': '5', 'restore_candidates': ''}
     row = extractor.failed_diag_row('1', 'e', 1.0, 'v', True)
-    assert list(row)[-4:] == ['restore_pool_points', 'restored_points', 'inverted_control', 'inverted_count']
-    assert list(row)[-5] == 'alias_factors'
-    assert row['restore_pool_points'] == 0 and row['restored_points'] == ''
+    assert list(row)[-5:] == ['restore_pool_points', 'restored_points', 'restore_candidates', 'inverted_control', 'inverted_count']
+    assert list(row)[-6] == 'alias_factors'
+    assert row['restore_pool_points'] == 0 and row['restored_points'] == '' and row['restore_candidates'] == ''
 
 
 def test_diag_rows_in_main_put_restore_fields_before_inverted_fields(extractor):
@@ -273,5 +276,6 @@ def test_diag_rows_in_main_put_restore_fields_before_inverted_fields(extractor):
         assert chunk.lstrip().startswith("diag_row.update(diag_inverted_fields(")
     assert src.count("'n_reestimated': int(sum(main_res['reestimated']))") == 1
     feat_block = src[src.index("        feat = {"):src.index("        features_list.append(feat)")]
-    for name in ('restore_pool_points', 'restored_points', 'reestimated'):
+    assert src.count("'restore_candidates': list(main_res['restore_candidates'])") == 1
+    for name in ('restore_pool_points', 'restored_points', 'restore_candidates', 'reestimated'):
         assert name not in feat_block

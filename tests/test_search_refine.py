@@ -195,4 +195,4 @@ def test_raw_sde_and_version_columns_excluded_from_features(extractor):
     cols = ['bls_sde', 'bls_sde_raw', 'n_transits_observed', 'single_event_fraction', 'dur_at_grid_edge', 'pipeline_version']
     feats = onyx_features.compute_feature_columns(cols)
     assert feats == ['bls_sde', 'n_transits_observed', 'single_event_fraction', 'dur_at_grid_edge']
-    assert int(onyx_features.PIPELINE_VERSION) >= 7
+    assert int(onyx_features.PIPELINE_VERSION) >= 8

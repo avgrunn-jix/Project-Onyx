@@ -37,6 +37,8 @@ CLIP_UPWARD_ONLY = False
 CLIP_ISOLATED = False
 RESTORE_TRANSIT_POINTS = True
 RESTORE_WINDOW_FACTOR = 1.25
+RESTORE_MIN_FRACTION = 0.05
+RESTORE_MIN_CHANCE_RATIO = 3.0
 REESTIMATE_MIN_RESTORED_FRACTION = 0.2
 CLIP_SIGMA = 5.0
 CLIP_NEIGHBOR_SIGMA = 2.5
@@ -156,6 +158,14 @@ def restored_fraction(lc_search, n_restored, period, epoch, duration):
     phase = ((t_s - epoch + 0.5 * period) % period) - 0.5 * period
     n_search = int(np.sum(np.abs(phase) < duration * RESTORE_WINDOW_FACTOR / 2.0))
     return float(n_restored) / float(n_restored + n_search)
+
+def restore_allowed(lc_search, lc_restore, n_in_pool, period, epoch, duration):
+    if lc_restore is None or n_in_pool <= 0 or not (period > 0 and duration > 0):
+        return False
+    if restored_fraction(lc_search, n_in_pool, period, epoch, duration) < RESTORE_MIN_FRACTION:
+        return False
+    n_chance = float(len(lc_restore)) * min(1.0, duration * RESTORE_WINDOW_FACTOR / period)
+    return bool(n_in_pool >= RESTORE_MIN_CHANCE_RATIO * n_chance)
 
 def reestimate_transit(lc_cand, period, dur_grid):
     if not period > 0:
@@ -652,15 +662,17 @@ def diag_inverted_fields(inverted_flag, n_inverted):
 
 def diag_restore_fields(timings):
     if not timings:
-        return {'restore_pool_points': 0, 'restored_points': ''}
+        return {'restore_pool_points': 0, 'restored_points': '', 'restore_candidates': ''}
     return {
         'restore_pool_points': int(timings.get('restore_pool_points', 0)),
         'restored_points': ';'.join(str(int(n)) for n in timings.get('restored_points', [])),
+        'restore_candidates': ';'.join(str(int(n)) for n in timings.get('restore_candidates', [])),
     }
 
 def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=False, eb_periods=None, lc_restore=None):
     lc_search = lc_flat.copy()
     restored_points = []
+    restore_candidates = []
     reestimated_flags = []
     features_list = []
     curves_dict = {}
@@ -730,7 +742,11 @@ def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star
                 continue
         search_epoch = bls_epoch
         search_duration_d = bls_duration_d
-        lc_cand, n_restored = restore_transit_points(lc_search, lc_restore, bls_period_d, search_epoch, search_duration_d)
+        lc_cand, n_in_pool = restore_transit_points(lc_search, lc_restore, bls_period_d, search_epoch, search_duration_d)
+        n_restored = n_in_pool
+        if not restore_allowed(lc_search, lc_restore, n_in_pool, bls_period_d, search_epoch, search_duration_d):
+            lc_cand = lc_search
+            n_restored = 0
         reestimated = False
         if restored_fraction(lc_search, n_restored, bls_period_d, search_epoch, search_duration_d) >= REESTIMATE_MIN_RESTORED_FRACTION:
             local = reestimate_transit(lc_cand, bls_period_d, dur_grid)
@@ -750,11 +766,12 @@ def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star
             continue
         if use_resolve_aliases:
             found_periods.append(bls_period_d)
-        if lc_restore is not None and not reestimated:
+        if n_restored > 0 and not reestimated:
             depth_cand_ppm = box_depth_ppm(lc_cand, bls_period_d, bls_epoch, bls_duration_d)
             if np.isfinite(depth_cand_ppm):
                 bls_depth_ppm = depth_cand_ppm
         restored_points.append(n_restored)
+        restore_candidates.append(n_in_pool)
         reestimated_flags.append(int(reestimated))
         sef = single_event_fraction(times_cand, flux_cand, bls_period_d, bls_epoch, bls_duration_d, cadence_d)
         dur_edge = duration_at_grid_edge(bls_duration_d, dur_grid, bls_period_d)
@@ -895,6 +912,7 @@ def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star
         'n_refined': n_refined,
         'n_few_transits': n_few_transits,
         'restored_points': restored_points,
+        'restore_candidates': restore_candidates,
         'reestimated': reestimated_flags,
         'lc_residual': lc_search,
     }
@@ -1490,6 +1508,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'n_few_transits': main_res['n_few_transits'],
             'restore_pool_points': int(len(lc_restore)) if lc_restore is not None else 0,
             'restored_points': list(main_res['restored_points']),
+            'restore_candidates': list(main_res['restore_candidates']),
             'n_reestimated': int(sum(main_res['reestimated'])),
             'reestimated': list(main_res['reestimated']),
             'inverted_control': int(bool(inverted_control)),
