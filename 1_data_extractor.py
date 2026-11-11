@@ -34,6 +34,14 @@ logging.getLogger('lightkurve').setLevel(logging.ERROR)
 logging.getLogger('astroquery').setLevel(logging.ERROR)
 
 CLIP_UPWARD_ONLY = False
+CLIP_ISOLATED = False
+RESTORE_TRANSIT_POINTS = True
+RESTORE_WINDOW_FACTOR = 1.25
+REESTIMATE_MIN_RESTORED_FRACTION = 0.2
+CLIP_SIGMA = 5.0
+CLIP_NEIGHBOR_SIGMA = 2.5
+CLIP_NEIGHBOR_GAP_CADENCES = 2.0
+MAD_TO_SIGMA = 1.4826
 RESOLVE_ALIASES = True
 ALIAS_TOL = 0.01
 ALIAS_DEPTH_SHORT = 0.8
@@ -43,12 +51,148 @@ ALIAS_POWER_FRACTION = 0.5
 
 _dl_sem = None
 
-def clip_outliers(lc, upward_only=None):
+def low_neighbor_mask(t, f, level, sigma):
+    n = len(f)
+    mask = np.zeros(n, dtype=bool)
+    if n == 0:
+        return mask
+    order = np.argsort(t, kind='stable')
+    ts = t[order]
+    fs = f[order]
+    near = fs < level - CLIP_NEIGHBOR_SIGMA * sigma
+    dt = np.diff(ts)
+    cad = float(np.median(dt)) if len(dt) > 0 else 0.0
+    max_gap = CLIP_NEIGHBOR_GAP_CADENCES * cad if cad > 0 else 0.0
+    close = dt <= max_gap + 1e-9
+    prev_low = np.zeros(n, dtype=bool)
+    next_low = np.zeros(n, dtype=bool)
+    prev_low[1:] = near[:-1] & close
+    next_low[:-1] = near[1:] & close
+    mask[order] = prev_low | next_low
+    return mask
+
+def isolated_low_mask(t, f, level, sigma):
+    low = f < level - CLIP_SIGMA * sigma
+    return low & ~low_neighbor_mask(t, f, level, sigma)
+
+def robust_level_sigma(f):
+    level = float(np.nanmedian(f))
+    sigma = float(MAD_TO_SIGMA * np.nanmedian(np.abs(f - level)))
+    return level, sigma
+
+def isolated_clip_mask(lc):
+    t = np.asarray(lc.time.value, dtype=float)
+    f = np.asarray(lc.flux.value, dtype=float)
+    if len(f) < 3:
+        return np.zeros(len(f), dtype=bool)
+    level, sigma = robust_level_sigma(f)
+    if not (np.isfinite(sigma) and sigma > 0):
+        return np.zeros(len(f), dtype=bool)
+    return (f > level + CLIP_SIGMA * sigma) | isolated_low_mask(t, f, level, sigma)
+
+def clip_outliers_with_removed(lc, upward_only=None, isolated=None):
     if upward_only is None:
         upward_only = CLIP_UPWARD_ONLY
+    if isolated is None:
+        isolated = CLIP_ISOLATED
     if upward_only:
-        return lc.remove_outliers(sigma_upper=5, sigma_lower=float('inf'))
-    return lc.remove_outliers(sigma=5)
+        kept, drop = lc.remove_outliers(sigma_upper=5, sigma_lower=float('inf'), return_mask=True)
+    elif isolated:
+        drop = isolated_clip_mask(lc)
+        kept = lc[~drop]
+    else:
+        kept, drop = lc.remove_outliers(sigma=5, return_mask=True)
+    drop = np.asarray(drop, dtype=bool)
+    t = np.asarray(lc.time.value, dtype=float)
+    f = np.asarray(lc.flux.value, dtype=float)
+    if not np.any(np.isfinite(f)):
+        return kept, lc[np.zeros(len(f), dtype=bool)]
+    level, sigma = robust_level_sigma(f)
+    removed_low = lc[drop & (f < level) & low_neighbor_mask(t, f, level, sigma)]
+    return kept, removed_low
+
+def clip_outliers(lc, upward_only=None, isolated=None):
+    return clip_outliers_with_removed(lc, upward_only=upward_only, isolated=isolated)[0]
+
+def build_restore_curve(lc_removed, t_kept, trend_kept):
+    out = lc_removed.copy()
+    t_k = np.asarray(t_kept, dtype=float)
+    tr_k = np.asarray(trend_kept, dtype=float)
+    ok = np.isfinite(t_k) & np.isfinite(tr_k)
+    if len(out) == 0 or np.sum(ok) < 2:
+        return out[np.zeros(len(out), dtype=bool)]
+    order = np.argsort(t_k[ok], kind='stable')
+    trend = np.interp(np.asarray(out.time.value, dtype=float), t_k[ok][order], tr_k[ok][order])
+    trend_q = u.Quantity(trend, out.flux.unit)
+    out.flux = out.flux / trend_q
+    if 'flux_err' in out.columns:
+        out.flux_err = out.flux_err / trend_q
+    good = np.isfinite(np.asarray(out.flux.value, dtype=float))
+    return out[good]
+
+def flatten_with_restore(lc, lc_removed, window_length):
+    if lc_removed is None:
+        return lc.flatten(window_length=window_length, polyorder=2, break_tolerance=5), None
+    lc_flat, lc_trend = lc.flatten(window_length=window_length, polyorder=2, break_tolerance=5, return_trend=True)
+    return lc_flat, build_restore_curve(lc_removed, lc.time.value, lc_trend.flux.value)
+
+def restore_transit_points(lc_search, lc_restore, period, epoch, duration):
+    if lc_restore is None or len(lc_restore) == 0 or not (period > 0 and duration > 0):
+        return lc_search, 0
+    t_r = np.asarray(lc_restore.time.value, dtype=float)
+    phase = ((t_r - epoch + 0.5 * period) % period) - 0.5 * period
+    sel = np.abs(phase) < duration * RESTORE_WINDOW_FACTOR / 2.0
+    n_sel = int(np.sum(sel))
+    if n_sel == 0:
+        return lc_search, 0
+    lc_cand = lc_search.append(lc_restore[sel])
+    order = np.argsort(np.asarray(lc_cand.time.value, dtype=float), kind='stable')
+    return lc_cand[order], n_sel
+
+def restored_fraction(lc_search, n_restored, period, epoch, duration):
+    if n_restored <= 0 or not (period > 0 and duration > 0):
+        return 0.0
+    t_s = np.asarray(lc_search.time.value, dtype=float)
+    phase = ((t_s - epoch + 0.5 * period) % period) - 0.5 * period
+    n_search = int(np.sum(np.abs(phase) < duration * RESTORE_WINDOW_FACTOR / 2.0))
+    return float(n_restored) / float(n_restored + n_search)
+
+def reestimate_transit(lc_cand, period, dur_grid):
+    if not period > 0:
+        return None
+    durs = allowed_durations(dur_grid, period)
+    t, f, dy = lc_arrays(lc_cand)
+    if len(durs) == 0 or len(t) < 3:
+        return None
+    try:
+        r = BoxLeastSquares(t, f, dy).power(np.array([float(period)]), durs)
+    except ValueError:
+        return None
+    duration = float(np.asarray(r.duration, dtype=float)[0])
+    epoch = float(np.asarray(r.transit_time, dtype=float)[0])
+    depth = float(np.asarray(r.depth, dtype=float)[0])
+    if not (np.isfinite(duration) and np.isfinite(epoch) and np.isfinite(depth) and duration > 0 and depth > 0):
+        return None
+    return {'duration': duration, 'epoch': epoch, 'depth': depth}
+
+def drop_transit_points(lc, period, epoch, duration):
+    if lc is None or len(lc) == 0:
+        return lc
+    mask = lc.create_transit_mask(period=period, transit_time=epoch, duration=duration)
+    return lc[~mask]
+
+def box_depth_ppm(lc, period, epoch, duration):
+    t = np.asarray(lc.time.value, dtype=float)
+    f = np.asarray(lc.flux.value, dtype=float)
+    e = np.asarray(lc.flux_err.value, dtype=float) if 'flux_err' in lc.columns else np.full(len(t), np.nan)
+    ok = np.isfinite(t) & np.isfinite(f)
+    t, f, e = t[ok], f[ok], e[ok]
+    if len(e) > 0 and np.all(np.isfinite(e)) and np.all(e > 0):
+        w = 1.0 / e ** 2
+    else:
+        w = np.ones(len(t))
+    d = _box_depth(t, f, w, period, epoch, duration)[0]
+    return float(d * 1e6) if np.isfinite(d) else np.nan
 
 def _box_depth(t, f, w, period, epoch, duration):
     if period <= 0 or len(t) == 0:
@@ -506,8 +650,18 @@ def inverted_output_path(output):
 def diag_inverted_fields(inverted_flag, n_inverted):
     return {'inverted_control': int(bool(inverted_flag)), 'inverted_count': int(n_inverted) if inverted_flag else 0}
 
-def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=False, eb_periods=None):
+def diag_restore_fields(timings):
+    if not timings:
+        return {'restore_pool_points': 0, 'restored_points': ''}
+    return {
+        'restore_pool_points': int(timings.get('restore_pool_points', 0)),
+        'restored_points': ';'.join(str(int(n)) for n in timings.get('restored_points', [])),
+    }
+
+def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=False, eb_periods=None, lc_restore=None):
     lc_search = lc_flat.copy()
+    restored_points = []
+    reestimated_flags = []
     features_list = []
     curves_dict = {}
     freq_factor = FREQ_FACTOR_QUICK if quick_mode else FREQ_FACTOR_FULL
@@ -572,25 +726,44 @@ def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star
             if is_alias_duplicate(bls_period_d, found_periods):
                 dup_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=bls_epoch, duration=bls_duration_d * 1.5)
                 lc_search = lc_search[~dup_mask]
+                lc_restore = drop_transit_points(lc_restore, bls_period_d, bls_epoch, bls_duration_d * 1.5)
                 continue
-        times_search = np.asarray(lc_search.time.value, dtype=float)
-        flux_search = np.asarray(lc_search.flux.value, dtype=float)
-        n_transits_observed = count_observed_transits(times_search, bls_period_d, bls_epoch, bls_duration_d, cadence_d)
+        search_epoch = bls_epoch
+        search_duration_d = bls_duration_d
+        lc_cand, n_restored = restore_transit_points(lc_search, lc_restore, bls_period_d, search_epoch, search_duration_d)
+        reestimated = False
+        if restored_fraction(lc_search, n_restored, bls_period_d, search_epoch, search_duration_d) >= REESTIMATE_MIN_RESTORED_FRACTION:
+            local = reestimate_transit(lc_cand, bls_period_d, dur_grid)
+            if local is not None:
+                bls_epoch = float(search_epoch + ((local['epoch'] - search_epoch + 0.5 * bls_period_d) % bls_period_d) - 0.5 * bls_period_d)
+                bls_duration_d = local['duration']
+                bls_depth_ppm = float(local['depth'] * 1e6)
+                reestimated = True
+        times_cand = np.asarray(lc_cand.time.value, dtype=float)
+        flux_cand = np.asarray(lc_cand.flux.value, dtype=float)
+        n_transits_observed = count_observed_transits(times_cand, bls_period_d, bls_epoch, bls_duration_d, cadence_d)
         if n_transits_observed < MIN_TRANSITS_OBSERVED:
             n_few_transits += 1
-            few_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=bls_epoch, duration=bls_duration_d * 1.5)
+            few_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=search_epoch, duration=search_duration_d * 1.5)
             lc_search = lc_search[~few_mask]
+            lc_restore = drop_transit_points(lc_restore, bls_period_d, search_epoch, search_duration_d * 1.5)
             continue
         if use_resolve_aliases:
             found_periods.append(bls_period_d)
-        sef = single_event_fraction(times_search, flux_search, bls_period_d, bls_epoch, bls_duration_d, cadence_d)
+        if lc_restore is not None and not reestimated:
+            depth_cand_ppm = box_depth_ppm(lc_cand, bls_period_d, bls_epoch, bls_duration_d)
+            if np.isfinite(depth_cand_ppm):
+                bls_depth_ppm = depth_cand_ppm
+        restored_points.append(n_restored)
+        reestimated_flags.append(int(reestimated))
+        sef = single_event_fraction(times_cand, flux_cand, bls_period_d, bls_epoch, bls_duration_d, cadence_d)
         dur_edge = duration_at_grid_edge(bls_duration_d, dur_grid, bls_period_d)
         transit_count = int(baseline_d / bls_period_d)
         duty_cycle = float(bls_duration_d / bls_period_d)
         rec_idx = len(features_list)
 
         t_feat_start = time.time()
-        folded = lc_search.fold(period=bls_period_d, epoch_time=bls_epoch, normalize_phase=False)
+        folded = lc_cand.fold(period=bls_period_d, epoch_time=bls_epoch, normalize_phase=False)
         phase_times = np.asarray(folded.time.value, dtype=float)
         fold_flux = np.asarray(folded.flux.value, dtype=float)
         norm_phase = phase_times / bls_period_d
@@ -631,7 +804,7 @@ def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star
                 elif kind == 'HARMONIC':
                     match_status = 'HARMONIC'
                     match_label = 'HARMONIC'
-        folded_double = lc_search.fold(period=bls_period_d * 2, epoch_time=bls_epoch, normalize_phase=False)
+        folded_double = lc_cand.fold(period=bls_period_d * 2, epoch_time=bls_epoch, normalize_phase=False)
         odd_mask = np.abs(folded_double.time.value) < (bls_duration_d / 2)
         even_mask = np.abs(folded_double.time.value - bls_period_d) < (bls_duration_d / 2)
         flux_odd = folded_double.flux.value[odd_mask]
@@ -662,20 +835,20 @@ def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star
         transit_depths = []
         for i in range(transit_count):
             mid = bls_epoch + i * bls_period_d
-            mask = np.abs(times_search - mid) < (bls_duration_d / 2)
+            mask = np.abs(times_cand - mid) < (bls_duration_d / 2)
             if np.any(mask):
-                transit_depths.append(1.0 - np.nanmean(flux_search[mask]))
+                transit_depths.append(1.0 - np.nanmean(flux_cand[mask]))
         depth_scatter_ppm = float(np.nanstd(transit_depths) * 1e6) if len(transit_depths) > 0 else 0.0
 
-        oe_z = odd_even_z(times_search, flux_search, bls_period_d, bls_epoch, bls_duration_d)
-        sec_z, sec_phase = secondary_search(times_search, flux_search, bls_period_d, bls_epoch, bls_duration_d)
+        oe_z = odd_even_z(times_cand, flux_cand, bls_period_d, bls_epoch, bls_duration_d)
+        sec_z, sec_phase = secondary_search(times_cand, flux_cand, bls_period_d, bls_epoch, bls_duration_d)
         imp_rad = implied_radius_rjup(star_feats.get('star_radius', np.nan), bls_depth_ppm)
         dur_ratio = duration_ratio(bls_duration_d, bls_period_d, star_feats.get('star_radius', np.nan), star_feats.get('star_logg', np.nan))
         eb_match = eb_period_match(bls_period_d, eb_periods)
 
-        col_det = np.asarray(lc_search['centroid_col_detrended'].value, dtype=float) if 'centroid_col_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
-        row_det = np.asarray(lc_search['centroid_row_detrended'].value, dtype=float) if 'centroid_row_detrended' in lc_search.columns else np.full(len(lc_search), np.nan)
-        c_shift_col_sig, c_shift_row_sig, c_shift_tot_sig, c_shift_tot_arcsec = compute_centroid_shift(times_search, col_det, row_det, bls_period_d, bls_epoch, bls_duration_d, mission)
+        col_det = np.asarray(lc_cand['centroid_col_detrended'].value, dtype=float) if 'centroid_col_detrended' in lc_cand.columns else np.full(len(lc_cand), np.nan)
+        row_det = np.asarray(lc_cand['centroid_row_detrended'].value, dtype=float) if 'centroid_row_detrended' in lc_cand.columns else np.full(len(lc_cand), np.nan)
+        c_shift_col_sig, c_shift_row_sig, c_shift_tot_sig, c_shift_tot_arcsec = compute_centroid_shift(times_cand, col_det, row_det, bls_period_d, bls_epoch, bls_duration_d, mission)
 
         feat = {
             'signal_id': sig_id, 'target_id': tid, 'signal_index': rec_idx, 'pipeline_version': pipeline_ver,
@@ -705,8 +878,9 @@ def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star
         features_list.append(feat)
         timing_feats.append(time.time() - t_feat_start)
 
-        transit_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=bls_epoch, duration=bls_duration_d * 1.5)
+        transit_mask = lc_search.create_transit_mask(period=bls_period_d, transit_time=search_epoch, duration=search_duration_d * 1.5)
         lc_search = lc_search[~transit_mask]
+        lc_restore = drop_transit_points(lc_restore, bls_period_d, search_epoch, search_duration_d * 1.5)
 
     for f_item in features_list:
         f_item['n_signals_star'] = len(features_list)
@@ -720,16 +894,22 @@ def search_signals(lc_flat, tid, mission, row_dicts, baseline_d, cadence_d, star
         'alias_factors': alias_factors_list,
         'n_refined': n_refined,
         'n_few_transits': n_few_transits,
+        'restored_points': restored_points,
+        'reestimated': reestimated_flags,
         'lc_residual': lc_search,
     }
 
-def init_worker(sem, clip_upward=None, resolve_aliases=None):
-    global _dl_sem, CLIP_UPWARD_ONLY, RESOLVE_ALIASES
+def init_worker(sem, clip_upward=None, resolve_aliases=None, clip_isolated=None, restore_transits=None):
+    global _dl_sem, CLIP_UPWARD_ONLY, RESOLVE_ALIASES, CLIP_ISOLATED, RESTORE_TRANSIT_POINTS
     _dl_sem = sem
     if clip_upward is not None:
         CLIP_UPWARD_ONLY = bool(clip_upward)
     if resolve_aliases is not None:
         RESOLVE_ALIASES = bool(resolve_aliases)
+    if clip_isolated is not None:
+        CLIP_ISOLATED = bool(clip_isolated)
+    if restore_transits is not None:
+        RESTORE_TRANSIT_POINTS = bool(restore_transits)
 
 MAX_FAILED_ATTEMPTS = 3
 DISK_WAIT_MAX_S = 600.0
@@ -813,6 +993,7 @@ def failed_diag_row(tid_str, err, elapsed, pipeline_ver, inverted_flag=False):
         'alias_corrections': 0,
         'alias_factors': ''
     }
+    row.update(diag_restore_fields(None))
     row.update(diag_inverted_fields(inverted_flag, 0))
     return row
 
@@ -1014,8 +1195,10 @@ def compute_centroid_shift(times, col_det, row_det, period, epoch, duration, mis
         return c_shift_col_sig, c_shift_row_sig, c_shift_tot_sig, c_shift_tot_arcsec
     return np.nan, np.nan, np.nan, np.nan
 
-def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0, clip_upward=None, resolve_aliases=None):
+def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0, clip_upward=None, resolve_aliases=None, clip_isolated=None, restore_transits=None):
     use_clip_upward = CLIP_UPWARD_ONLY if clip_upward is None else bool(clip_upward)
+    use_clip_isolated = CLIP_ISOLATED if clip_isolated is None else bool(clip_isolated)
+    use_restore = RESTORE_TRANSIT_POINTS if restore_transits is None else bool(restore_transits)
     free_bytes = shutil.disk_usage(os.path.abspath('.')).free
     if free_bytes < min_free_gb * 1024**3: return None, tid, 'Disk space below threshold'
     start_t = time.time()
@@ -1061,7 +1244,7 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
         if lc_col is None or len(lc_col) == 0: return None, tid, 'No lightcurves found'
         detrend_centroids(lc_col, flatten_days)
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
-        lc = clip_outliers(lc.remove_nans(), upward_only=use_clip_upward)
+        lc = clip_outliers(lc.remove_nans(), upward_only=use_clip_upward, isolated=use_clip_isolated)
         if len(lc) < 500: return None, tid, 'Not enough points'
         times = np.asarray(lc.time.value, dtype=float)
         flux_val = np.asarray(lc.flux.value, dtype=float)
@@ -1122,7 +1305,7 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
             results.append(res)
             if recovered:
                 rem_timeout = max(10.0, deadline - time.time())
-                feat, _, _, _, _, _ = process_single_star(tid, mission, [{'catalog_period': inj_period, 'label': 'INJECTED'}], True, 0, flatten_days, 1, quick_mode=quick_mode, cache_dir=cache_dir, star_timeout=rem_timeout, max_sectors=max_sectors, clip_upward=clip_upward, resolve_aliases=resolve_aliases)
+                feat, _, _, _, _, _ = process_single_star(tid, mission, [{'catalog_period': inj_period, 'label': 'INJECTED'}], True, 0, flatten_days, 1, quick_mode=quick_mode, cache_dir=cache_dir, star_timeout=rem_timeout, max_sectors=max_sectors, clip_upward=clip_upward, resolve_aliases=resolve_aliases, clip_isolated=use_clip_isolated, restore_transits=use_restore)
                 if feat and len(feat) > 0:
                     feat[0]['centroid_shift_col_sigma'] = c_col_sig
                     feat[0]['centroid_shift_row_sigma'] = c_row_sig
@@ -1136,8 +1319,10 @@ def run_injection(tid, mission, injections_per_star, min_free_gb, flatten_days, 
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0, clip_upward=None, resolve_aliases=None, inverted_control=False, eb_periods=None):
+def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_days, max_signals, quick_mode=False, cache_dir=None, star_timeout=1800.0, max_sectors=0, clip_upward=None, resolve_aliases=None, inverted_control=False, eb_periods=None, clip_isolated=None, restore_transits=None):
     use_clip_upward = CLIP_UPWARD_ONLY if clip_upward is None else bool(clip_upward)
+    use_clip_isolated = CLIP_ISOLATED if clip_isolated is None else bool(clip_isolated)
+    use_restore = RESTORE_TRANSIT_POINTS if restore_transits is None else bool(restore_transits)
     use_resolve_aliases = RESOLVE_ALIASES if resolve_aliases is None else bool(resolve_aliases)
     pipeline_ver = build_pipeline_version(quick_mode, flatten_days, max_signals)
     if not wait_for_disk(min_free_gb):
@@ -1227,7 +1412,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         lc = lc_col.stitch(corrector_func=lambda x: x.normalize())
         n_raw_points = len(lc)
         n_finite_points = int(np.sum(np.isfinite(np.asarray(lc.flux.value, dtype=float))))
-        lc = clip_outliers(lc.remove_nans(), upward_only=use_clip_upward)
+        lc, lc_removed = clip_outliers_with_removed(lc.remove_nans(), upward_only=use_clip_upward, isolated=use_clip_isolated)
         if len(lc) < 500:
             return None, None, tid, not_enough_points_message(n_files, n_raw_points, n_finite_points, len(lc), 500), dl_size, None
         times = np.asarray(lc.time.value, dtype=float)
@@ -1245,7 +1430,7 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
         if wl < 3: return None, None, tid, 'Time series too short for flatten', dl_size, None
         if time.time() > deadline:
             return None, None, tid, f'TimeoutError: Exceeded {star_timeout}s', dl_size, None
-        lc_flat = lc.flatten(window_length=wl, polyorder=2, break_tolerance=5)
+        lc_flat, lc_restore = flatten_with_restore(lc, lc_removed if use_restore else None, wl)
         t_stitch_end = time.time()
         timing_stitch = t_stitch_end - t_stitch_start
 
@@ -1273,12 +1458,12 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'autocorr_max': autocorr_max, 'ls_peak_power': ls_peak_power, 'gap_fraction': gap_fraction,
             'baseline_d': baseline_d, 'star_teff': star_teff, 'star_radius': star_radius, 'star_logg': star_logg,
         }
-        main_res = search_signals(lc_flat, tid, mission, row_dicts, baseline_d, med_diff, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, eb_periods=eb_periods)
+        main_res = search_signals(lc_flat, tid, mission, row_dicts, baseline_d, med_diff, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, eb_periods=eb_periods, lc_restore=lc_restore)
         inv_res = None
         if inverted_control:
             t_inv_start = time.time()
             inv_source = main_res['lc_residual'] if INVERTED_MASK_MAIN_SIGNALS else lc_flat
-            inv_res = search_signals(invert_light_curve(inv_source), tid, mission, [], baseline_d, med_diff, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=True, eb_periods=eb_periods)
+            inv_res = search_signals(invert_light_curve(inv_source), tid, mission, [], baseline_d, med_diff, star_feats, quick_mode, max_signals, deadline, use_resolve_aliases, pipeline_ver, inverted=True, eb_periods=eb_periods, lc_restore=None)
             inv_res['time'] = time.time() - t_inv_start
         features_list = main_res['features']
         curves_dict = main_res['curves']
@@ -1303,6 +1488,10 @@ def process_single_star(tid, mission, row_dicts, keep_raw, min_free_gb, flatten_
             'alias_factors': ';'.join(alias_factors_list),
             'n_refined': main_res['n_refined'],
             'n_few_transits': main_res['n_few_transits'],
+            'restore_pool_points': int(len(lc_restore)) if lc_restore is not None else 0,
+            'restored_points': list(main_res['restored_points']),
+            'n_reestimated': int(sum(main_res['reestimated'])),
+            'reestimated': list(main_res['reestimated']),
             'inverted_control': int(bool(inverted_control)),
             'inverted_features': inv_res['features'] if inv_res is not None else [],
             'inverted_time': inv_res['time'] if inv_res is not None else 0.0
@@ -1374,14 +1563,20 @@ def main():
     parser.add_argument('--max-sectors', type=int, default=0, help='[DEBUG ONLY] Limit the number of sectors/quarters downloaded. Warning: alters baseline, features, and detection results; not for production training.')
     parser.add_argument('--smoke-test', action='store_true', help='[TEST ONLY] Run extractor in isolated smoke test mode, writing outputs to outputs/_smoke_test/')
     parser.add_argument('--clip-upward-only', action='store_true', help='[EXPERIMENTAL] Clip only upward outliers (5 sigma) instead of symmetric 5-sigma clipping. Can remove known planets in multi-planet systems.')
+    parser.add_argument('--clip-isolated', action='store_true', help='[EXPERIMENTAL] Robust clipping (median and MAD) that removes upward outliers and isolated downward outliers but keeps dips of two or more consecutive points. Default is symmetric 5-sigma clipping. Can produce false periods from multi-point downward artifacts.')
+    parser.add_argument('--no-restore-transit-points', action='store_true', help='Do not return downward points removed by clipping into the transit windows of each found signal and do not re-estimate duration, epoch and depth on the restored curve. Without restoration the transit count, depth and signal features are measured on the clipped light curve.')
     parser.add_argument('--no-resolve-aliases', action='store_true')
     parser.add_argument('--verbose', action='store_true', help='Print detailed per-star output to the console instead of the progress bar.')
     args = parser.parse_args()
+    if args.clip_upward_only and args.clip_isolated:
+        parser.error('--clip-upward-only and --clip-isolated cannot be used together')
     onyx_console.set_verbose_env(args.verbose)
     verbose = onyx_console.is_verbose(args.verbose)
     console = onyx_console.Console(total=0, workers=args.workers, verbose=verbose)
-    global CLIP_UPWARD_ONLY, RESOLVE_ALIASES
+    global CLIP_UPWARD_ONLY, RESOLVE_ALIASES, CLIP_ISOLATED, RESTORE_TRANSIT_POINTS
     CLIP_UPWARD_ONLY = args.clip_upward_only
+    CLIP_ISOLATED = args.clip_isolated
+    RESTORE_TRANSIT_POINTS = not args.no_restore_transit_points
     RESOLVE_ALIASES = not args.no_resolve_aliases
     if args.smoke_test and args.min_free_gb == 5.0:
         args.min_free_gb = 1.0
@@ -1392,7 +1587,7 @@ def main():
         sys.exit(1)
     logger = setup_logger(verbose)
     console.logger = logger
-    flags_msg = f"Search flags: CLIP_UPWARD_ONLY={CLIP_UPWARD_ONLY}, RESOLVE_ALIASES={RESOLVE_ALIASES}"
+    flags_msg = f"Search flags: CLIP_UPWARD_ONLY={CLIP_UPWARD_ONLY}, CLIP_ISOLATED={CLIP_ISOLATED}, RESTORE_TRANSIT_POINTS={RESTORE_TRANSIT_POINTS}, RESOLVE_ALIASES={RESOLVE_ALIASES}"
     if verbose:
         print(flags_msg, flush=True)
     logger.info(flags_msg)
@@ -1546,7 +1741,7 @@ def main():
             tid_str = str(tid)
             if tid_str in completed_inj_stars:
                 continue
-            tasks.append((tid_str, args.mission, args.injections_per_star, args.min_free_gb, args.flatten_days, args.quick, args.cache_dir, args.star_timeout, args.max_sectors, CLIP_UPWARD_ONLY, RESOLVE_ALIASES))
+            tasks.append((tid_str, args.mission, args.injections_per_star, args.min_free_gb, args.flatten_days, args.quick, args.cache_dir, args.star_timeout, args.max_sectors, CLIP_UPWARD_ONLY, RESOLVE_ALIASES, CLIP_ISOLATED, RESTORE_TRANSIT_POINTS))
 
         total_inj = len(tasks)
         done_inj = 0
@@ -1564,7 +1759,7 @@ def main():
         import multiprocessing
         mgr_inj = multiprocessing.Manager()
         dl_sem_inj = mgr_inj.Semaphore(args.max_download_workers)
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(dl_sem_inj, CLIP_UPWARD_ONLY, RESOLVE_ALIASES)) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(dl_sem_inj, CLIP_UPWARD_ONLY, RESOLVE_ALIASES, CLIP_ISOLATED, RESTORE_TRANSIT_POINTS)) as executor:
             task_iter = iter(tasks)
             active_futures = {}
             for _ in range(min(args.workers * 2, total_inj)):
@@ -1710,7 +1905,7 @@ def main():
         if tid_str in failed_attempts and failed_attempts[tid_str] >= MAX_FAILED_ATTEMPTS:
             continue
         rows = labels_df[labels_df['target_id'] == tid_str].to_dict('records')
-        tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout, args.max_sectors, CLIP_UPWARD_ONLY, RESOLVE_ALIASES, args.inverted_control, eb_periods_for(tid_str, eb_catalog)))
+        tasks.append((tid_str, args.mission, rows, args.keep_raw, args.min_free_gb, args.flatten_days, args.max_signals, args.quick, args.cache_dir, args.star_timeout, args.max_sectors, CLIP_UPWARD_ONLY, RESOLVE_ALIASES, args.inverted_control, eb_periods_for(tid_str, eb_catalog), CLIP_ISOLATED, RESTORE_TRANSIT_POINTS))
 
     total_tasks = len(tasks)
     completed_stars = 0
@@ -1736,7 +1931,7 @@ def main():
     dl_sem = mgr.Semaphore(args.max_download_workers)
     star_starts = mgr.dict()
     failure_info = {}
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(dl_sem, CLIP_UPWARD_ONLY, RESOLVE_ALIASES)) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(dl_sem, CLIP_UPWARD_ONLY, RESOLVE_ALIASES, CLIP_ISOLATED, RESTORE_TRANSIT_POINTS)) as executor:
         task_iter = iter(tasks)
         active_futures = {}
         for _ in range(min(args.workers * 2, total_tasks)):
@@ -1804,6 +1999,7 @@ def main():
                         'alias_corrections': int(timings.get('alias_corrections', 0)) if timings else 0,
                         'alias_factors': str(timings.get('alias_factors', '')) if timings else ''
                     }
+                    diag_row.update(diag_restore_fields(timings))
                     diag_row.update(diag_inverted_fields(args.inverted_control, len(timings.get('inverted_features', [])) if timings else 0))
                     append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     if timings:
@@ -1942,6 +2138,7 @@ def main():
                                 'alias_corrections': int(timings.get('alias_corrections', 0)) if timings else 0,
                                 'alias_factors': str(timings.get('alias_factors', '')) if timings else ''
                             }
+                            diag_row.update(diag_restore_fields(timings))
                             diag_row.update(diag_inverted_fields(args.inverted_control, len(timings.get('inverted_features', [])) if timings else 0))
                             append_to_csv_flush(diag_csv, pd.DataFrame([diag_row]))
                     else:

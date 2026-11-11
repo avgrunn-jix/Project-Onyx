@@ -2,7 +2,7 @@ import os
 
 import pandas as pd
 
-PIPELINE_VERSION = '4'
+PIPELINE_VERSION = '7'
 
 EXCLUDE_COLS = [
     'signal_id',
