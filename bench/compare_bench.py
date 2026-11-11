@@ -5,7 +5,7 @@ import pandas as pd
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FEATURES_NAME = 'extracted_features.csv'
 DIAG_NAME = 'extracted_features_diagnostics.csv'
-RESTORE_FIELDS = ('restore_pool_points', 'restored_points')
+RESTORE_FIELDS = ('restore_pool_points', 'restored_points', 'restore_candidates')
 
 
 def load_run(run_dir):
@@ -16,7 +16,7 @@ def load_run(run_dir):
     if os.path.exists(feats_path) and os.path.getsize(feats_path) > 0:
         feats = pd.read_csv(feats_path, dtype={'target_id': str}, encoding='utf-8')
     if os.path.exists(diag_path) and os.path.getsize(diag_path) > 0:
-        diag = pd.read_csv(diag_path, dtype={'target_id': str, 'restored_points': str}, encoding='utf-8')
+        diag = pd.read_csv(diag_path, dtype={'target_id': str, 'restored_points': str, 'restore_candidates': str}, encoding='utf-8')
     return feats, diag
 
 

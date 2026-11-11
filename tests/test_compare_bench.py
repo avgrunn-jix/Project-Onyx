@@ -81,3 +81,33 @@ def test_report_prints_restore_fields_only_when_present(tmp_path):
     both_old = cb.build_report(str(old_dir), str(old_dir))
     assert 'restore_pool_points' not in both_old
     assert 'restored_points' not in both_old
+
+
+def test_report_prints_restore_candidates_when_present_and_skips_when_absent(tmp_path):
+    cb = load_compare()
+    new_dir = tmp_path / 'new'
+    old_dir = tmp_path / 'old'
+    bare_dir = tmp_path / 'bare'
+    feats = [{'target_id': '11442793', 'bls_period_d': 8.7198, 'bls_depth_ppm': 119.3, 'n_transits_observed': 150}]
+    write_run(new_dir, feats, [
+        {'target_id': '11442793', 'status': 'OK', 'time_total_s': 10.0, 'alias_factors': '', 'restore_pool_points': 216, 'restored_points': '0;0;0', 'restore_candidates': '3;8;0'},
+        {'target_id': '5780885', 'status': 'OK', 'time_total_s': 10.0, 'alias_factors': '', 'restore_pool_points': 2796, 'restored_points': '2795', 'restore_candidates': '2795'},
+        {'target_id': '10006641', 'status': 'OK', 'time_total_s': 10.0, 'alias_factors': '', 'restore_pool_points': 0, 'restored_points': '', 'restore_candidates': ''},
+    ])
+    write_run(old_dir, feats, [{'target_id': '11442793', 'status': 'OK', 'time_total_s': 12.0, 'alias_factors': '', 'restore_pool_points': 216, 'restored_points': '0;8;0'}])
+    write_run(bare_dir, feats, [{'target_id': '11442793', 'status': 'OK', 'time_total_s': 12.0, 'alias_factors': ''}])
+    assert cb.RESTORE_FIELDS == ('restore_pool_points', 'restored_points', 'restore_candidates')
+    lines = cb.build_report(str(new_dir), str(old_dir)).splitlines()
+    i = lines.index('  restored_points: new=0;0;0 | old=0;8;0')
+    assert lines[i - 1] == '  restore_pool_points: new=216 | old=216'
+    assert lines[i + 1] == '  restore_candidates: new=3;8;0 | old=н/д'
+    assert lines[i + 2] == '  alias_factors (new): -'
+    assert '  restore_candidates: new=2795 | old=н/д' in lines
+    assert '  restore_candidates: new=- | old=н/д' in lines
+    swapped = cb.build_report(str(old_dir), str(new_dir)).splitlines()
+    assert '  restore_candidates: new=н/д | old=3;8;0' in swapped
+    no_field = cb.build_report(str(old_dir), str(old_dir))
+    assert 'restored_points' in no_field
+    assert 'restore_candidates' not in no_field
+    bare = cb.build_report(str(bare_dir), str(bare_dir))
+    assert 'restore_candidates' not in bare and 'restored_points' not in bare
