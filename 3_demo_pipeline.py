@@ -27,6 +27,7 @@ from sklearn.model_selection import GroupKFold
 from xgboost import XGBClassifier
 import shap
 from onyx_report import format_share, inverted_star_rates, STAR_FEATURE_COLS, SEARCH_MAX_PERIOD_D, SEARCH_MIN_PERIOD_D, ablation_feature_sets, brier_score, build_koi_recovery, ci_text, oriented_auc, reliability_table, summarize_koi_recovery
+from onyx_report import coverage_precision_table, select_abstention_thresholds, threshold_selection_line
 from onyx_features import COVERAGE_COLS, PipelineVersionError, build_pipeline_version, check_pipeline_version, compute_feature_columns
 from onyx_showcase import render_showcase
 
@@ -475,7 +476,16 @@ def get_ml_pipeline(model=None):
         steps.append(('model', model))
     return Pipeline(steps)
 
-def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, seed, full_features_pool=None, target_precision=0.90):
+def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, seed, full_features_pool=None, target_precision=0.90, info=None, threshold_criterion='point'):
+    if threshold_criterion not in ('point', 'wilson'):
+        raise ValueError(f"unknown threshold criterion: {threshold_criterion}")
+    if info is not None:
+        info.update({
+            'trained': False, 'criterion': threshold_criterion, 'target_precision': float(target_precision), 'branch': 'not_trained',
+            'thresholds': (0.75, 0.25, 0.35), 'n_oof': 0, 'oof_n_accepted': 0, 'oof_n_correct': 0, 'oof_coverage': 0.0,
+            'oof_precision': float('nan'), 'oof_precision_ci': (0.0, 0.0),
+            'oof_mean': np.zeros(0), 'oof_std': np.zeros(0), 'oof_y': np.zeros(0, dtype=int),
+        })
     scale_pipe = get_ml_pipeline()
     if len(df_train_signals) > 0:
         fit_data = df_train_signals[feature_cols].values
@@ -558,44 +568,10 @@ def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, see
         oof_mean = np.full(len(y_tr), float(np.mean(y_tr)))
         oof_std = np.full(len(y_tr), 0.20)
 
-    best_cov = -1.0
-    best_thres = (0.75, 0.25, 0.35)
-    best_acc = 0.0
-    grid_th = np.linspace(0.50, 0.90, 9)
-    grid_tl = np.linspace(0.50, 0.10, 9)
-    grid_sm = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 1.0]
-
-    for s_m in grid_sm:
-        for t_h in grid_th:
-            for t_l in grid_tl:
-                c_mask = (oof_mean >= t_h) & (oof_std <= s_m)
-                f_mask = (oof_mean <= t_l) & (oof_std <= s_m)
-                acc_mask = c_mask | f_mask
-                if np.sum(acc_mask) >= 2:
-                    pred_acc = np.where(c_mask[acc_mask], 1, 0)
-                    acc_val = float(accuracy_score(y_tr[acc_mask], pred_acc))
-                    cov_val = float(np.mean(acc_mask))
-                    if acc_val >= target_precision:
-                        if cov_val > best_cov or (cov_val == best_cov and acc_val > best_acc):
-                            best_cov = cov_val
-                            best_acc = acc_val
-                            best_thres = (float(t_h), float(t_l), float(s_m))
-
-    if best_cov < 0:
-        highest_acc = -1.0
-        for s_m in grid_sm:
-            for t_h in grid_th:
-                for t_l in grid_tl:
-                    c_mask = (oof_mean >= t_h) & (oof_std <= s_m)
-                    f_mask = (oof_mean <= t_l) & (oof_std <= s_m)
-                    acc_mask = c_mask | f_mask
-                    if np.sum(acc_mask) >= 2:
-                        pred_acc = np.where(c_mask[acc_mask], 1, 0)
-                        acc_val = float(accuracy_score(y_tr[acc_mask], pred_acc))
-                        cov_val = float(np.mean(acc_mask))
-                        if acc_val > highest_acc:
-                            highest_acc = acc_val
-                            best_thres = (float(t_h), float(t_l), float(s_m))
+    best_thres, selection = select_abstention_thresholds(y_tr, oof_mean, oof_std, target_precision=target_precision, criterion=threshold_criterion)
+    if info is not None:
+        info.update(selection)
+        info.update({'oof_mean': np.array(oof_mean, dtype=float), 'oof_std': np.array(oof_std, dtype=float), 'oof_y': np.array(y_tr).astype(int)})
 
     t_high, t_low, s_max = best_thres
 
@@ -781,8 +757,8 @@ def bootstrap_star_metrics(df_eval, n_boot=1000, seed=42):
         out[k] = (float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))) if vals else (0.0, 0.0)
     return out
 
-def evaluate_ablation(feats, df_train, df_ctrl_all, ctrl_stars, showcase_id, seed, full_pool, target_precision, n_boot=500):
-    pred, model, _, _, _ = train_and_eval_pipeline(df_train, df_ctrl_all, feats, seed, full_features_pool=full_pool, target_precision=target_precision)
+def evaluate_ablation(feats, df_train, df_ctrl_all, ctrl_stars, showcase_id, seed, full_pool, target_precision, n_boot=500, threshold_criterion='point'):
+    pred, model, _, _, _ = train_and_eval_pipeline(df_train, df_ctrl_all, feats, seed, full_features_pool=full_pool, target_precision=target_precision, threshold_criterion=threshold_criterion)
     if model is None:
         return None
     sub = pred[(pred['target_id'].isin(ctrl_stars)) & (pred['target_id'] != showcase_id) & (pred['match_status'] == 'MATCHED')].copy()
@@ -873,6 +849,7 @@ def main():
     parser.add_argument('--workers', type=int, default=os.cpu_count() or 1)
     parser.add_argument('--max-download-workers', type=int, default=4)
     parser.add_argument('--target-precision', type=float, default=0.90)
+    parser.add_argument('--threshold-criterion', choices=['point', 'wilson'], default='point', help='How abstention thresholds must reach --target-precision on out-of-fold predictions: point (point estimate, default) or wilson (lower bound of the 95%% Wilson interval).')
     parser.add_argument('--min-depth-ppm', type=float, default=30.0)
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
     parser.add_argument('--output-dir', default='outputs/demo')
@@ -1263,12 +1240,15 @@ def main():
 
     phase('training: direction A')
     emit("\n[Направление А] Обучение на обучающей половине -> проверка на контрольной...")
-    ctrl_pred, model_a, expl_a, scaler_a, thres_a = train_and_eval_pipeline(df_tr_m_matched, df_ctrl_all, feature_cols, args.seed, full_features_pool=df_features, target_precision=args.target_precision)
+    info_a = {}
+    ctrl_pred, model_a, expl_a, scaler_a, thres_a = train_and_eval_pipeline(df_tr_m_matched, df_ctrl_all, feature_cols, args.seed, full_features_pool=df_features, target_precision=args.target_precision, info=info_a, threshold_criterion=args.threshold_criterion)
+    if info_a.get('trained'):
+        emit(f"  Подбор порогов (направление А): {threshold_selection_line(info_a)}")
 
     phase('training: direction B')
     emit("\n[Направление Б] Обучение на контрольной половине (без Kepler-80) -> проверка на обучающей...")
     df_ctrl_m_for_b = df_ctrl_m_matched[df_ctrl_m_matched['target_id'] != showcase_id].copy()
-    train_pred, model_b, expl_b, scaler_b, thres_b = train_and_eval_pipeline(df_ctrl_m_for_b, df_train_all, feature_cols, args.seed, full_features_pool=df_features, target_precision=args.target_precision)
+    train_pred, model_b, expl_b, scaler_b, thres_b = train_and_eval_pipeline(df_ctrl_m_for_b, df_train_all, feature_cols, args.seed, full_features_pool=df_features, target_precision=args.target_precision, threshold_criterion=args.threshold_criterion)
 
     noise_gate = {'ran': False, 'reason': ''}
     if df_inverted is None or len(df_inverted) == 0:
@@ -1408,12 +1388,17 @@ def main():
         abl_configs.extend(ablation_feature_sets(feature_cols))
         ctrl_star_set = set(final_ctrl_m)
         for abl_name, abl_feats in abl_configs:
-            abl_res = evaluate_ablation(abl_feats, df_tr_m_matched, df_ctrl_all, ctrl_star_set, showcase_id, args.seed, df_features, args.target_precision)
+            abl_res = evaluate_ablation(abl_feats, df_tr_m_matched, df_ctrl_all, ctrl_star_set, showcase_id, args.seed, df_features, args.target_precision, threshold_criterion=args.threshold_criterion)
             if abl_res is None:
                 continue
             abl_rows.append({'Конфигурация': f"{abl_name} [признаков: {abl_res['n_features']}]", 'Точность': f"{abl_res['acc']:.3f}", 'ROC-AUC': f"{abl_res['auc']:.3f}", '95% ДИ ROC-AUC': ci_text(abl_res['auc_ci']), 'Охват решений': f"{abl_res['coverage']:.1%}", 'Топ-1 признак SHAP': abl_res['top_shap']})
         ablation_table = pd.DataFrame(abl_rows)
+        cov_prec_table = coverage_precision_table([
+            ('OOF обучающей половины', info_a['oof_y'], info_a['oof_mean'], info_a['oof_std']),
+            ('Контрольная половина (без Kepler-80)', y_ctrl_true, y_ctrl_prob, ctrl_m_eval['p_std'].values),
+        ], thres_a[2])
     else:
+        cov_prec_table = pd.DataFrame()
         acc_a = None
         rec_a = None
         prec_a = None
@@ -1850,8 +1835,19 @@ def main():
             f.write(f"{h3}Калибровка оценки модели (p_mean) на контрольных MATCHED-сигналах:\n\n")
             f.write(f"* **Оценка Брайера:** {brier_a:.4f} (для константного прогноза с долей класса 1 = {float(np.mean(y_ctrl_true)):.3f}: {brier_ref:.4f}; меньше значит лучше)\n\n")
             f.write(df_to_markdown(reliab_table) + "\n\n")
+            f.write(f"{h3}Подбор порогов отказа от решения:\n\n")
+            f.write(f"* **Диагностика подбора на предсказаниях вне обучения (OOF, `GroupKFold` по звёздам, обучающая половина):** {threshold_selection_line(info_a)}\n")
+            if info_a.get('branch') == 'fallback':
+                if args.threshold_criterion == 'wilson':
+                    f.write(f"  * **Запасная ветка:** ни одна тройка порогов не дала нижнюю границу 95% ДИ Уилсона OOF-точности на принятых не ниже {args.target_precision:.2f} (`--threshold-criterion wilson`); взяты пороги с максимальной точечной OOF-точностью. Целевая точность на OOF не подтверждена.\n")
+                else:
+                    f.write(f"  * **Запасная ветка:** ни одна тройка порогов не дала OOF-точность на принятых не ниже {args.target_precision:.2f}; взяты пороги с максимальной OOF-точностью. Целевая точность на OOF не достигнута.\n")
+            elif info_a.get('branch') == 'default':
+                f.write("  * **Пороги по умолчанию:** ни одна тройка порогов сетки не принимает хотя бы два OOF-сигнала, подбор не состоялся.\n")
+            f.write(f"* **Таблица «охват-точность» для симметричных порогов** ($t_{{high}} = t$, $t_{{low}} = 1 - t$) при $s_{{max}} = 1.00$ (без ограничения разброса ансамбля) и при выбранном $s_{{max}} = {thres_a[2]:.2f}$. Решения здесь посчитаны только по `p_mean` и `p_std`{', без условия «сигнал или шум» (раздел 4.1)' if noise_gate['ran'] else ''}; ДИ Уилсона считает сигналы независимыми, хотя сигналы одной звезды связаны.\n\n")
+            f.write(df_to_markdown(cov_prec_table) + "\n\n")
             f.write(f"* **Пороги отказа от решения (Abstention Thresholds):**\n")
-            f.write(f"  * Пороги подобраны кросс-валидацией `GroupKFold` (с группировкой по звёздам `target_id`) на обучающей выборке под целевую точность $\\ge {args.target_precision:.2f}$:\n")
+            f.write(f"  * Пороги подобраны кросс-валидацией `GroupKFold` (с группировкой по звёздам `target_id`) на обучающей выборке под целевую точность $\\ge {args.target_precision:.2f}$ (критерий `--threshold-criterion {args.threshold_criterion}`):\n")
             f.write(f"    * $t_{{high}} = {thres_a[0]:.2f}$, $t_{{low}} = {thres_a[1]:.2f}$, $s_{{max}} = {thres_a[2]:.2f}$\n")
             f.write(f"  * **Охват решений (Coverage):** **{coverage_ctrl:.1%}** ({n_accepted_ctrl} из {len(ctrl_m_eval)} сигналов, 95% ДИ: {ci_text(boot_res['cov_ci'])})\n")
             f.write(f"  * **Точность на принятых решениях:** **{acc_accepted:.3f}** (95% ДИ {ci_text(boot_res['acc_accepted_ci'])}; принято сигналов: {n_accepted_ctrl}{', пометка: малая выборка' if n_accepted_ctrl < 20 else ''}); precision на принятых: {prec_accepted:.3f}, recall на принятых: {rec_accepted:.3f}\n")
