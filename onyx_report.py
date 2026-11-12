@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from scipy.stats import ks_2samp
 from sklearn.metrics import roc_auc_score
 
 SEARCH_MIN_PERIOD_D = 0.5
@@ -13,6 +14,25 @@ STAR_FEATURE_COLS = [
     'flux_kurtosis', 'cdpp_ppm', 'pointwise_scatter_ppm', 'autocorr_max', 'ls_peak_power',
 ]
 GEOMETRY_COLS = ['transit_count', 'gap_fraction']
+CENTROID_COLS = ['centroid_shift_col_sigma', 'centroid_shift_row_sigma', 'centroid_shift_total_sigma', 'centroid_shift_total_arcsec']
+SECONDARY_COLS = ['secondary_depth_ppm', 'secondary_snr', 'secondary_z', 'secondary_phase', 'odd_even_depth_diff_ppm', 'odd_even_sigma', 'odd_even_z']
+DIAGNOSTIC_GROUPS = [
+    ('Без центроидных признаков', 'центроидные признаки', CENTROID_COLS),
+    ('Без вторичного затмения и чёт-нечёт', 'признаки вторичного затмения и чёт-нечёт', SECONDARY_COLS),
+]
+BOTH_DIAGNOSTIC_NAME = 'Без центроидных признаков, вторичного затмения и чёт-нечёт'
+SYMMETRIC_T_GRID = (0.50, 0.60, 0.70, 0.80, 0.90)
+FULL_QUARTERS = 17
+BRANCH_LABELS_RU = {
+    'main': 'основная (цель достигнута)',
+    'fallback': 'запасная (максимум OOF-точности, цель не достигнута)',
+    'default': 'пороги по умолчанию (ни одна тройка порогов не даёт двух принятых сигналов)',
+    'not_trained': 'подбор не выполнялся (модель не обучена)',
+}
+CRITERION_LABELS_RU = {
+    'point': 'point (точечная OOF-точность на принятых не ниже цели)',
+    'wilson': 'wilson (нижняя граница 95% ДИ Уилсона OOF-точности на принятых не ниже цели)',
+}
 
 
 def wilson_interval(k, n, z=1.96):
@@ -187,13 +207,252 @@ def oriented_auc(y_true, score, direction):
     return float(roc_auc_score(y, sc))
 
 
+def diagnostic_ablation_sets(feature_cols):
+    configs = []
+    skipped = []
+    present_groups = []
+    for name, title, cols in DIAGNOSTIC_GROUPS:
+        present = [c for c in cols if c in feature_cols]
+        present_groups.append(present)
+        if not present:
+            skipped.append(f"«{name}»: пропущена, {title} не входят в набор признаков модели")
+            continue
+        configs.append((name + ' (' + ', '.join(present) + ')', [c for c in feature_cols if c not in present]))
+    if all(present_groups):
+        both = [c for grp in present_groups for c in grp]
+        configs.append((BOTH_DIAGNOSTIC_NAME, [c for c in feature_cols if c not in both]))
+    else:
+        skipped.append(f"«{BOTH_DIAGNOSTIC_NAME}»: пропущена, так как хотя бы одна из двух групп пуста")
+    return configs, skipped
+
+
 def ablation_feature_sets(feature_cols):
     no_star = [c for c in feature_cols if c not in STAR_FEATURE_COLS]
     no_geom = [c for c in feature_cols if c not in GEOMETRY_COLS]
+    diag_configs, _ = diagnostic_ablation_sets(feature_cols)
     return [
         ('Без звёздных признаков (' + ', '.join(c for c in STAR_FEATURE_COLS if c in feature_cols) + ')', no_star),
         ('Без transit_count и gap_fraction', no_geom),
-    ]
+    ] + diag_configs
+
+
+def ablation_skipped_notes(feature_cols):
+    return diagnostic_ablation_sets(feature_cols)[1]
+
+
+def abstention_masks(p_mean, p_std, t_high, t_low, s_max):
+    pm = np.asarray(p_mean, dtype=float)
+    ps = np.asarray(p_std, dtype=float)
+    cand = (pm >= t_high) & (ps <= s_max)
+    fp = (pm <= t_low) & (ps <= s_max)
+    return cand, cand | fp
+
+
+def abstention_counts(y_true, p_mean, p_std, t_high, t_low, s_max):
+    y = np.asarray(y_true).astype(int)
+    cand, accepted = abstention_masks(p_mean, p_std, t_high, t_low, s_max)
+    n_acc = int(np.sum(accepted))
+    n_ok = int(np.sum(cand[accepted].astype(int) == y[accepted])) if n_acc > 0 else 0
+    return {'n': int(len(y)), 'n_accepted': n_acc, 'n_correct': n_ok}
+
+
+def select_abstention_thresholds(y_true, oof_mean, oof_std, target_precision=0.90, criterion='point', default=(0.75, 0.25, 0.35)):
+    if criterion not in ('point', 'wilson'):
+        raise ValueError(f"unknown threshold criterion: {criterion}")
+    y = np.asarray(y_true).astype(int)
+    pm = np.asarray(oof_mean, dtype=float)
+    ps = np.asarray(oof_std, dtype=float)
+    grid_th = np.linspace(0.50, 0.90, 9)
+    grid_tl = np.linspace(0.50, 0.10, 9)
+    grid_sm = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 1.0]
+    best_cov = -1.0
+    best_acc = 0.0
+    best_thres = tuple(default)
+    highest_acc = -1.0
+    fallback_thres = None
+    for s_m in grid_sm:
+        for t_h in grid_th:
+            for t_l in grid_tl:
+                c_mask = (pm >= t_h) & (ps <= s_m)
+                f_mask = (pm <= t_l) & (ps <= s_m)
+                acc_mask = c_mask | f_mask
+                n_acc = int(np.sum(acc_mask))
+                if n_acc < 2:
+                    continue
+                n_ok = int(np.sum(np.where(c_mask[acc_mask], 1, 0) == y[acc_mask]))
+                acc_val = float(n_ok / n_acc)
+                cov_val = float(np.mean(acc_mask))
+                if acc_val > highest_acc:
+                    highest_acc = acc_val
+                    fallback_thres = (float(t_h), float(t_l), float(s_m))
+                if criterion == 'wilson':
+                    passed = wilson_interval(n_ok, n_acc)[0] >= target_precision
+                else:
+                    passed = acc_val >= target_precision
+                if passed and (cov_val > best_cov or (cov_val == best_cov and acc_val > best_acc)):
+                    best_cov = cov_val
+                    best_acc = acc_val
+                    best_thres = (float(t_h), float(t_l), float(s_m))
+    if best_cov >= 0:
+        branch = 'main'
+    elif fallback_thres is not None:
+        branch = 'fallback'
+        best_thres = fallback_thres
+    else:
+        branch = 'default'
+    cnt = abstention_counts(y, pm, ps, *best_thres)
+    n_acc, n_ok = cnt['n_accepted'], cnt['n_correct']
+    return best_thres, {
+        'trained': True,
+        'criterion': criterion,
+        'target_precision': float(target_precision),
+        'branch': branch,
+        'thresholds': best_thres,
+        'n_oof': int(len(y)),
+        'oof_n_accepted': n_acc,
+        'oof_n_correct': n_ok,
+        'oof_coverage': float(n_acc / len(y)) if len(y) > 0 else 0.0,
+        'oof_precision': float(n_ok / n_acc) if n_acc > 0 else float('nan'),
+        'oof_precision_ci': wilson_interval(n_ok, n_acc),
+    }
+
+
+def coverage_precision_table(samples, s_max_selected, t_grid=SYMMETRIC_T_GRID):
+    s_values = [1.0]
+    if s_max_selected is not None and np.isfinite(s_max_selected) and abs(float(s_max_selected) - 1.0) > 1e-12:
+        s_values.append(float(s_max_selected))
+    rows = []
+    for name, y_true, p_mean, p_std in samples:
+        for s_m in s_values:
+            for t in t_grid:
+                cnt = abstention_counts(y_true, p_mean, p_std, float(t), round(1.0 - float(t), 10), s_m)
+                n, n_acc, n_ok = cnt['n'], cnt['n_accepted'], cnt['n_correct']
+                rows.append({
+                    'Выборка': name,
+                    's_max': f"{s_m:.2f}",
+                    't_high / t_low': f"{t:.2f} / {1.0 - t:.2f}",
+                    'Сигналов': n,
+                    'Принято': n_acc,
+                    'Охват': f"{n_acc / n:.1%}" if n > 0 else '-',
+                    'Точность на принятых': f"{n_ok / n_acc:.3f} ({n_ok}/{n_acc})" if n_acc > 0 else '-',
+                    '95% ДИ Уилсона': ci_text(wilson_interval(n_ok, n_acc)) if n_acc > 0 else '-',
+                })
+    return pd.DataFrame(rows)
+
+
+def threshold_selection_line(info):
+    if not info or not info.get('trained'):
+        return 'Подбор порогов не выполнялся: модель не обучена.'
+    th = info['thresholds']
+    n_acc = info['oof_n_accepted']
+    if n_acc > 0:
+        prec = f"{info['oof_precision']:.3f} ({info['oof_n_correct']}/{n_acc}, 95% ДИ Уилсона {ci_text(info['oof_precision_ci'])})"
+    else:
+        prec = 'не определена (принятых сигналов нет)'
+    return (f"OOF-сигналов: {info['n_oof']}; при выбранных порогах (t_high = {th[0]:.2f}, t_low = {th[1]:.2f}, s_max = {th[2]:.2f}) "
+            f"OOF-охват: {info['oof_coverage']:.1%} ({n_acc} из {info['n_oof']}); OOF-точность на принятых: {prec}; "
+            f"цель: {info['target_precision']:.2f}; критерий: {CRITERION_LABELS_RU.get(info['criterion'], info['criterion'])}; "
+            f"сработавшая ветка: {BRANCH_LABELS_RU.get(info['branch'], info['branch'])}.")
+
+
+def mean_abs_shap_table(shap_values, feature_cols, top=10):
+    cols = list(feature_cols)
+    if shap_values is None or len(cols) == 0:
+        return None
+    sv = np.asarray(shap_values, dtype=float)
+    if sv.ndim == 3:
+        sv = sv[..., -1]
+    if sv.ndim != 2 or sv.shape[0] == 0 or sv.shape[1] != len(cols):
+        return None
+    sv = sv[:, :len(cols)]
+    sv = sv[np.all(np.isfinite(sv), axis=1)]
+    if len(sv) == 0:
+        return None
+    imp = np.mean(np.abs(sv), axis=0)
+    order = np.argsort(-imp, kind='stable')[:top]
+    total = float(np.sum(imp))
+    return pd.DataFrame({
+        'Место': list(range(1, len(order) + 1)),
+        'Признак': [cols[i] for i in order],
+        'Средний |SHAP|': [f"{imp[i]:.4f}" for i in order],
+        'Доля от суммы по всем признакам': [f"{imp[i] / total:.1%}" if total > 0 else '-' for i in order],
+        'mean_abs_shap': [float(imp[i]) for i in order],
+    }), int(len(sv))
+
+
+def top_feature_label(table):
+    if table is None:
+        return '-'
+    tab = table[0]
+    if len(tab) == 0:
+        return '-'
+    return f"{tab['Признак'].iloc[0]} ({tab['mean_abs_shap'].iloc[0]:.3f})"
+
+
+def _five_numbers(vals, digits):
+    if len(vals) == 0:
+        return '-'
+    q = [np.min(vals), np.percentile(vals, 25), np.median(vals), np.percentile(vals, 75), np.max(vals)]
+    return ' / '.join(f"{v:.{digits}f}" for v in q)
+
+
+def actual_balance_tables(diag_df, groups, quarters_col='n_quarters', baseline_col='baseline_d', full_quarters=FULL_QUARTERS):
+    notes = []
+    df = diag_df.copy() if diag_df is not None else pd.DataFrame(columns=['target_id'])
+    if 'target_id' not in df.columns:
+        df = pd.DataFrame(columns=['target_id'])
+    df['target_id'] = df['target_id'].astype(str)
+    df = df.drop_duplicates('target_id', keep='last').set_index('target_id')
+    has = {quarters_col: quarters_col in df.columns, baseline_col: baseline_col in df.columns}
+    if not has[quarters_col]:
+        notes.append(f"В диагностике нет колонки числа уникальных кварталов (`{quarters_col}`): статистика по кварталам и KS-тест по ним не посчитаны.")
+    if not has[baseline_col]:
+        notes.append(f"В диагностике нет колонки базлайна (`{baseline_col}`): статистика по базлайну и KS-тест по нему не посчитаны.")
+    values = {}
+    stat_rows = []
+    for name, ids in groups:
+        ids = [str(s) for s in ids]
+        sub = df.loc[[s for s in ids if s in df.index]]
+        vals = {}
+        for col in (quarters_col, baseline_col):
+            v = pd.to_numeric(sub[col], errors='coerce').values.astype(float) if has[col] else np.zeros(0)
+            vals[col] = v[np.isfinite(v)]
+        values[name] = vals
+        q, b = vals[quarters_col], vals[baseline_col]
+        if len(sub) == 0:
+            notes.append(f"Группа «{name}»: нет обработанных звёзд с записью в диагностике, статистика и KS-тест для неё не посчитаны.")
+        stat_rows.append({
+            'Группа': name,
+            'Обработано звёзд': len(ids),
+            'Из них с диагностикой': int(len(sub)),
+            'Кварталов (среднее)': f"{np.mean(q):.2f}" if len(q) > 0 else '-',
+            'Кварталов (медиана)': f"{np.median(q):.1f}" if len(q) > 0 else '-',
+            f"Доля звёзд с числом кварталов < {full_quarters}": format_share(int(np.sum(q < full_quarters)), int(len(q))),
+            'Базлайн, сут (среднее)': f"{np.mean(b):.1f}" if len(b) > 0 else '-',
+            'Базлайн, сут (медиана)': f"{np.median(b):.1f}" if len(b) > 0 else '-',
+        })
+    ks_rows = []
+    ks_values = {}
+    if len(groups) == 2:
+        name_a, name_b = groups[0][0], groups[1][0]
+        for col, title, digits in ((quarters_col, 'Число уникальных кварталов', 0), (baseline_col, 'Базлайн (сут)', 1)):
+            if not has[col]:
+                continue
+            a, b = values[name_a][col], values[name_b][col]
+            if len(a) > 0 and len(b) > 0:
+                res = ks_2samp(a, b)
+                ks_values[col] = (float(res.statistic), float(res.pvalue))
+                d_txt, p_txt = f"{res.statistic:.3f}", f"{res.pvalue:.4f}"
+            else:
+                d_txt, p_txt = '-', '-'
+            ks_rows.append({
+                'Параметр': title,
+                f"{name_a} (min / Q1 / med / Q3 / max)": _five_numbers(a, digits),
+                f"{name_b} (min / Q1 / med / Q3 / max)": _five_numbers(b, digits),
+                'Статистика KS (D)': d_txt,
+                'p-значение': p_txt,
+            })
+    return {'stats': pd.DataFrame(stat_rows), 'ks': pd.DataFrame(ks_rows), 'ks_values': ks_values, 'notes': notes}
 
 
 def ci_text(ci, digits=3):

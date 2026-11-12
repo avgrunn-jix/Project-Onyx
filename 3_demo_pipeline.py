@@ -27,6 +27,7 @@ from sklearn.model_selection import GroupKFold
 from xgboost import XGBClassifier
 import shap
 from onyx_report import format_share, inverted_star_rates, STAR_FEATURE_COLS, SEARCH_MAX_PERIOD_D, SEARCH_MIN_PERIOD_D, ablation_feature_sets, brier_score, build_koi_recovery, ci_text, oriented_auc, reliability_table, summarize_koi_recovery
+from onyx_report import mean_abs_shap_table, top_feature_label, CENTROID_COLS, SECONDARY_COLS, FULL_QUARTERS, ablation_skipped_notes, actual_balance_tables, coverage_precision_table, select_abstention_thresholds, threshold_selection_line
 from onyx_features import COVERAGE_COLS, PipelineVersionError, build_pipeline_version, check_pipeline_version, compute_feature_columns
 from onyx_showcase import render_showcase
 
@@ -158,6 +159,9 @@ def fetch_stellar_params(star_ids, cache_file):
         except Exception:
             pass
     return cached
+
+def select_stellar_info(info, ids):
+    return {str(s): info[str(s)] for s in ids if str(s) in info}
 
 def get_marked_stars(labels_df, n_stars, seed, showcase_star):
     valid_labels = ['CONFIRMED', 'CANDIDATE', 'FALSE POSITIVE', 'FALSE_POSITIVE']
@@ -475,7 +479,16 @@ def get_ml_pipeline(model=None):
         steps.append(('model', model))
     return Pipeline(steps)
 
-def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, seed, full_features_pool=None, target_precision=0.90):
+def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, seed, full_features_pool=None, target_precision=0.90, info=None, threshold_criterion='point'):
+    if threshold_criterion not in ('point', 'wilson'):
+        raise ValueError(f"unknown threshold criterion: {threshold_criterion}")
+    if info is not None:
+        info.update({
+            'trained': False, 'criterion': threshold_criterion, 'target_precision': float(target_precision), 'branch': 'not_trained',
+            'thresholds': (0.75, 0.25, 0.35), 'n_oof': 0, 'oof_n_accepted': 0, 'oof_n_correct': 0, 'oof_coverage': 0.0,
+            'oof_precision': float('nan'), 'oof_precision_ci': (0.0, 0.0),
+            'oof_mean': np.zeros(0), 'oof_std': np.zeros(0), 'oof_y': np.zeros(0, dtype=int),
+        })
     scale_pipe = get_ml_pipeline()
     if len(df_train_signals) > 0:
         fit_data = df_train_signals[feature_cols].values
@@ -558,44 +571,10 @@ def train_and_eval_pipeline(df_train_signals, df_test_signals, feature_cols, see
         oof_mean = np.full(len(y_tr), float(np.mean(y_tr)))
         oof_std = np.full(len(y_tr), 0.20)
 
-    best_cov = -1.0
-    best_thres = (0.75, 0.25, 0.35)
-    best_acc = 0.0
-    grid_th = np.linspace(0.50, 0.90, 9)
-    grid_tl = np.linspace(0.50, 0.10, 9)
-    grid_sm = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 1.0]
-
-    for s_m in grid_sm:
-        for t_h in grid_th:
-            for t_l in grid_tl:
-                c_mask = (oof_mean >= t_h) & (oof_std <= s_m)
-                f_mask = (oof_mean <= t_l) & (oof_std <= s_m)
-                acc_mask = c_mask | f_mask
-                if np.sum(acc_mask) >= 2:
-                    pred_acc = np.where(c_mask[acc_mask], 1, 0)
-                    acc_val = float(accuracy_score(y_tr[acc_mask], pred_acc))
-                    cov_val = float(np.mean(acc_mask))
-                    if acc_val >= target_precision:
-                        if cov_val > best_cov or (cov_val == best_cov and acc_val > best_acc):
-                            best_cov = cov_val
-                            best_acc = acc_val
-                            best_thres = (float(t_h), float(t_l), float(s_m))
-
-    if best_cov < 0:
-        highest_acc = -1.0
-        for s_m in grid_sm:
-            for t_h in grid_th:
-                for t_l in grid_tl:
-                    c_mask = (oof_mean >= t_h) & (oof_std <= s_m)
-                    f_mask = (oof_mean <= t_l) & (oof_std <= s_m)
-                    acc_mask = c_mask | f_mask
-                    if np.sum(acc_mask) >= 2:
-                        pred_acc = np.where(c_mask[acc_mask], 1, 0)
-                        acc_val = float(accuracy_score(y_tr[acc_mask], pred_acc))
-                        cov_val = float(np.mean(acc_mask))
-                        if acc_val > highest_acc:
-                            highest_acc = acc_val
-                            best_thres = (float(t_h), float(t_l), float(s_m))
+    best_thres, selection = select_abstention_thresholds(y_tr, oof_mean, oof_std, target_precision=target_precision, criterion=threshold_criterion)
+    if info is not None:
+        info.update(selection)
+        info.update({'oof_mean': np.array(oof_mean, dtype=float), 'oof_std': np.array(oof_std, dtype=float), 'oof_y': np.array(y_tr).astype(int)})
 
     t_high, t_low, s_max = best_thres
 
@@ -649,6 +628,15 @@ BOOT_KEYS = ['acc_ci', 'auc_ci', 'cov_ci', 'prec_ci', 'rec_ci', 'acc_accepted_ci
 
 REAL_RECALL_TARGET = 0.95
 NOISE_MIN_PER_CLASS = 5
+
+def shap_importance(explainer, scaler, df, feature_cols, top=10):
+    if explainer is None or scaler is None or df is None or len(df) == 0:
+        return None
+    try:
+        sv = explainer.shap_values(scaler.transform(df[list(feature_cols)].values))
+    except Exception:
+        return None
+    return mean_abs_shap_table(sv, feature_cols, top=top)
 
 def noise_feature_cols(feature_cols):
     return [c for c in feature_cols if c not in STAR_FEATURE_COLS]
@@ -781,8 +769,8 @@ def bootstrap_star_metrics(df_eval, n_boot=1000, seed=42):
         out[k] = (float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))) if vals else (0.0, 0.0)
     return out
 
-def evaluate_ablation(feats, df_train, df_ctrl_all, ctrl_stars, showcase_id, seed, full_pool, target_precision, n_boot=500):
-    pred, model, _, _, _ = train_and_eval_pipeline(df_train, df_ctrl_all, feats, seed, full_features_pool=full_pool, target_precision=target_precision)
+def evaluate_ablation(feats, df_train, df_ctrl_all, ctrl_stars, showcase_id, seed, full_pool, target_precision, n_boot=500, threshold_criterion='point'):
+    pred, model, explainer, scaler, _ = train_and_eval_pipeline(df_train, df_ctrl_all, feats, seed, full_features_pool=full_pool, target_precision=target_precision, threshold_criterion=threshold_criterion)
     if model is None:
         return None
     sub = pred[(pred['target_id'].isin(ctrl_stars)) & (pred['target_id'] != showcase_id) & (pred['match_status'] == 'MATCHED')].copy()
@@ -792,7 +780,7 @@ def evaluate_ablation(feats, df_train, df_ctrl_all, ctrl_stars, showcase_id, see
     p = sub['p_mean'].values
     auc = float(roc_auc_score(y, p)) if len(np.unique(y)) >= 2 else float('nan')
     boot = bootstrap_star_metrics(sub, n_boot=n_boot, seed=seed)
-    top_shap = sub['shap_top3'].iloc[0].split('|')[0].strip() if 'shap_top3' in sub else '-'
+    top_shap = top_feature_label(shap_importance(explainer, scaler, sub, feats))
     return {
         'acc': float(accuracy_score(y, (p >= 0.5).astype(int))),
         'auc': auc,
@@ -873,6 +861,7 @@ def main():
     parser.add_argument('--workers', type=int, default=os.cpu_count() or 1)
     parser.add_argument('--max-download-workers', type=int, default=4)
     parser.add_argument('--target-precision', type=float, default=0.90)
+    parser.add_argument('--threshold-criterion', choices=['point', 'wilson'], default='point', help='How abstention thresholds must reach --target-precision on out-of-fold predictions: point (point estimate, default) or wilson (lower bound of the 95%% Wilson interval).')
     parser.add_argument('--min-depth-ppm', type=float, default=30.0)
     parser.add_argument('--cache-dir', default=tempfile.gettempdir())
     parser.add_argument('--output-dir', default='outputs/demo')
@@ -945,7 +934,7 @@ def main():
     else:
         marked_ids, star_prim = get_marked_stars(labels_df, args.marked_stars, args.seed, args.showcase_star)
         stellar_cache = os.path.join('data', 'labels', 'kepler_stellar_cache.csv')
-        marked_info = fetch_stellar_params(marked_ids, stellar_cache)
+        marked_info = select_stellar_info(fetch_stellar_params(marked_ids, stellar_cache), marked_ids)
 
         unmarked_pool_file = os.path.join('data', 'labels', 'kepler_stellar_unmarked_pool.csv')
         pool_df = get_unmarked_pool(labels_df, unmarked_pool_file, args.unmarked_file)
@@ -1144,6 +1133,12 @@ def main():
         except Exception:
             pass
 
+    diag_actual_df = pd.DataFrame([dict(r) for r in diag_map.values()]) if diag_map else pd.DataFrame(columns=['target_id'])
+    actual_balance = actual_balance_tables(diag_actual_df, [
+        ('Отмеченные (KOI)', succ_tr_m + succ_ctrl_m),
+        ('Неотмеченные (Control)', succ_tr_u + succ_ctrl_u),
+    ])
+
     diag_rows_csv = []
     diag_rows_md = []
     inverted_csv = os.path.join(out_dir, f"features_demo{file_suffix}_inverted.csv")
@@ -1263,12 +1258,15 @@ def main():
 
     phase('training: direction A')
     emit("\n[Направление А] Обучение на обучающей половине -> проверка на контрольной...")
-    ctrl_pred, model_a, expl_a, scaler_a, thres_a = train_and_eval_pipeline(df_tr_m_matched, df_ctrl_all, feature_cols, args.seed, full_features_pool=df_features, target_precision=args.target_precision)
+    info_a = {}
+    ctrl_pred, model_a, expl_a, scaler_a, thres_a = train_and_eval_pipeline(df_tr_m_matched, df_ctrl_all, feature_cols, args.seed, full_features_pool=df_features, target_precision=args.target_precision, info=info_a, threshold_criterion=args.threshold_criterion)
+    if info_a.get('trained'):
+        emit(f"  Подбор порогов (направление А): {threshold_selection_line(info_a)}")
 
     phase('training: direction B')
     emit("\n[Направление Б] Обучение на контрольной половине (без Kepler-80) -> проверка на обучающей...")
     df_ctrl_m_for_b = df_ctrl_m_matched[df_ctrl_m_matched['target_id'] != showcase_id].copy()
-    train_pred, model_b, expl_b, scaler_b, thres_b = train_and_eval_pipeline(df_ctrl_m_for_b, df_train_all, feature_cols, args.seed, full_features_pool=df_features, target_precision=args.target_precision)
+    train_pred, model_b, expl_b, scaler_b, thres_b = train_and_eval_pipeline(df_ctrl_m_for_b, df_train_all, feature_cols, args.seed, full_features_pool=df_features, target_precision=args.target_precision, threshold_criterion=args.threshold_criterion)
 
     noise_gate = {'ran': False, 'reason': ''}
     if df_inverted is None or len(df_inverted) == 0:
@@ -1399,8 +1397,9 @@ def main():
             {'Модель / Эталон': 'Основная модель (только принятые решения)', 'Точность': f"{acc_accepted:.3f}", 'Полнота': f"{rec_accepted:.3f}", 'Precision': f"{prec_accepted:.3f}", 'ROC-AUC': '-', 'Охват (Coverage)': f"{coverage_ctrl:.1%}"}
         ])
 
-        top_shap_clean = ctrl_m_eval['shap_top3'].iloc[0].split('|')[0].strip() if len(ctrl_m_eval) > 0 and 'shap_top3' in ctrl_m_eval else '-'
-        abl_rows = [{'Конфигурация': f"Основная модель (признаков: {len(feature_cols)})", 'Точность': f"{acc_a:.3f}", 'ROC-AUC': f"{auc_a:.3f}", '95% ДИ ROC-AUC': ci_text(boot_res['auc_ci']), 'Охват решений': f"{coverage_ctrl:.1%}", 'Топ-1 признак SHAP': top_shap_clean}]
+        shap_imp = shap_importance(expl_a, scaler_a, ctrl_m_eval, feature_cols)
+        top_shap_clean = top_feature_label(shap_imp)
+        abl_rows = [{'Конфигурация': f"Основная модель (признаков: {len(feature_cols)})", 'Точность': f"{acc_a:.3f}", 'ROC-AUC': f"{auc_a:.3f}", '95% ДИ ROC-AUC': ci_text(boot_res['auc_ci']), 'Охват решений': f"{coverage_ctrl:.1%}", 'Главный признак по среднему |SHAP|': top_shap_clean}]
         cov_present = [c for c in coverage_cols if c in df_features.columns]
         abl_configs = []
         if cov_present:
@@ -1408,12 +1407,19 @@ def main():
         abl_configs.extend(ablation_feature_sets(feature_cols))
         ctrl_star_set = set(final_ctrl_m)
         for abl_name, abl_feats in abl_configs:
-            abl_res = evaluate_ablation(abl_feats, df_tr_m_matched, df_ctrl_all, ctrl_star_set, showcase_id, args.seed, df_features, args.target_precision)
+            abl_res = evaluate_ablation(abl_feats, df_tr_m_matched, df_ctrl_all, ctrl_star_set, showcase_id, args.seed, df_features, args.target_precision, threshold_criterion=args.threshold_criterion)
             if abl_res is None:
                 continue
-            abl_rows.append({'Конфигурация': f"{abl_name} [признаков: {abl_res['n_features']}]", 'Точность': f"{abl_res['acc']:.3f}", 'ROC-AUC': f"{abl_res['auc']:.3f}", '95% ДИ ROC-AUC': ci_text(abl_res['auc_ci']), 'Охват решений': f"{abl_res['coverage']:.1%}", 'Топ-1 признак SHAP': abl_res['top_shap']})
+            abl_rows.append({'Конфигурация': f"{abl_name} [признаков: {abl_res['n_features']}]", 'Точность': f"{abl_res['acc']:.3f}", 'ROC-AUC': f"{abl_res['auc']:.3f}", '95% ДИ ROC-AUC': ci_text(abl_res['auc_ci']), 'Охват решений': f"{abl_res['coverage']:.1%}", 'Главный признак по среднему |SHAP|': abl_res['top_shap']})
         ablation_table = pd.DataFrame(abl_rows)
+        ablation_skipped = ablation_skipped_notes(feature_cols)
+        cov_prec_table = coverage_precision_table([
+            ('OOF обучающей половины', info_a['oof_y'], info_a['oof_mean'], info_a['oof_std']),
+            ('Контрольная половина (без Kepler-80)', y_ctrl_true, y_ctrl_prob, ctrl_m_eval['p_std'].values),
+        ], thres_a[2])
     else:
+        ablation_skipped = []
+        cov_prec_table = pd.DataFrame()
         acc_a = None
         rec_a = None
         prec_a = None
@@ -1432,6 +1438,7 @@ def main():
         reliab_table = pd.DataFrame()
         baselines_table = pd.DataFrame()
         ablation_table = pd.DataFrame()
+        shap_imp = None
 
     tr_m_eval = train_pred[(train_pred['target_id'].isin(set(final_tr_m))) & (train_pred['match_status'] == 'MATCHED')].copy()
     y_tr_true = tr_m_eval['target_bin'].values
@@ -1747,14 +1754,25 @@ def main():
             f.write(df_to_markdown(pd.DataFrame(failed_table_rows)) + "\n\n")
 
         if comp_table is not None and ks_table is not None:
-            f.write(f"{h3}Сравнение распределений яркости и наблюдаемости:\n\n")
+            f.write(f"{h3}Сравнение распределений яркости и наблюдаемости по справочному кэшу (план):\n\n")
+            f.write("Число кварталов в этой и следующей таблице взято из справочного кэша звёздных параметров (`quarters`) и описывает план наблюдений, а не скачанные данные.\n\n")
             f.write(df_to_markdown(comp_table) + "\n\n")
 
-            f.write(f"{h3}Результаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):\n\n")
+            f.write(f"{h3}Результаты двухвыборочного критерия Колмогорова-Смирнова (KS-test) по справочному кэшу (план):\n\n")
             f.write(df_to_markdown(ks_table) + "\n\n")
 
         else:
-            f.write("Таблицы сравнения распределений и критерия Колмогорова-Смирнова пропущены: режим `--report-only` не повторяет выбор звёзд и не обращается к сети.\n\n")
+            f.write("Таблицы сравнения распределений и критерия Колмогорова-Смирнова по справочному кэшу (план) пропущены: режим `--report-only` не повторяет выбор звёзд и не обращается к сети.\n\n")
+        f.write(f"{h3}Баланс выборки по фактически скачанным данным:\n\n")
+        f.write(f"Таблицы построены по диагностике извлечения (`{diag_source_csv}`: число уникальных кварталов `n_quarters` и базлайн в сутках `baseline_d`) только для обработанных звёзд групп KOI и Control. Доля звёзд с числом кварталов меньше {FULL_QUARTERS} дана с 95% интервалом Уилсона.\n\n")
+        f.write(df_to_markdown(actual_balance['stats']) + "\n\n")
+        if len(actual_balance['ks']) > 0:
+            f.write("**KS-тест по фактически скачанным данным (KOI против Control):**\n\n")
+            f.write(df_to_markdown(actual_balance['ks']) + "\n\n")
+        for bal_note in actual_balance['notes']:
+            f.write(f"* {bal_note}\n")
+        if actual_balance['notes']:
+            f.write("\n")
         f.write(f"{h2}2.1. Диагностика обнаружения периодических сигналов по каждой звезде\n")
         f.write(f"В таблице ниже приведены детальные результаты фотометрической обработки и поиска сигналов алгоритмом Box Least Squares (BLS) для каждой звезды выборки.\n\n")
         f.write(df_to_markdown(df_diag_md) + "\n\n")
@@ -1850,8 +1868,19 @@ def main():
             f.write(f"{h3}Калибровка оценки модели (p_mean) на контрольных MATCHED-сигналах:\n\n")
             f.write(f"* **Оценка Брайера:** {brier_a:.4f} (для константного прогноза с долей класса 1 = {float(np.mean(y_ctrl_true)):.3f}: {brier_ref:.4f}; меньше значит лучше)\n\n")
             f.write(df_to_markdown(reliab_table) + "\n\n")
+            f.write(f"{h3}Подбор порогов отказа от решения:\n\n")
+            f.write(f"* **Диагностика подбора на предсказаниях вне обучения (OOF, `GroupKFold` по звёздам, обучающая половина):** {threshold_selection_line(info_a)}\n")
+            if info_a.get('branch') == 'fallback':
+                if args.threshold_criterion == 'wilson':
+                    f.write(f"  * **Запасная ветка:** ни одна тройка порогов не дала нижнюю границу 95% ДИ Уилсона OOF-точности на принятых не ниже {args.target_precision:.2f} (`--threshold-criterion wilson`); взяты пороги с максимальной точечной OOF-точностью. Целевая точность на OOF не подтверждена.\n")
+                else:
+                    f.write(f"  * **Запасная ветка:** ни одна тройка порогов не дала OOF-точность на принятых не ниже {args.target_precision:.2f}; взяты пороги с максимальной OOF-точностью. Целевая точность на OOF не достигнута.\n")
+            elif info_a.get('branch') == 'default':
+                f.write("  * **Пороги по умолчанию:** ни одна тройка порогов сетки не принимает хотя бы два OOF-сигнала, подбор не состоялся.\n")
+            f.write(f"* **Таблица «охват-точность» для симметричных порогов** ($t_{{high}} = t$, $t_{{low}} = 1 - t$) при $s_{{max}} = 1.00$ (без ограничения разброса ансамбля) и при выбранном $s_{{max}} = {thres_a[2]:.2f}$. Решения здесь посчитаны только по `p_mean` и `p_std`{', без условия «сигнал или шум» (раздел 4.1)' if noise_gate['ran'] else ''}; ДИ Уилсона считает сигналы независимыми, хотя сигналы одной звезды связаны.\n\n")
+            f.write(df_to_markdown(cov_prec_table) + "\n\n")
             f.write(f"* **Пороги отказа от решения (Abstention Thresholds):**\n")
-            f.write(f"  * Пороги подобраны кросс-валидацией `GroupKFold` (с группировкой по звёздам `target_id`) на обучающей выборке под целевую точность $\\ge {args.target_precision:.2f}$:\n")
+            f.write(f"  * Пороги подобраны кросс-валидацией `GroupKFold` (с группировкой по звёздам `target_id`) на обучающей выборке под целевую точность $\\ge {args.target_precision:.2f}$ (критерий `--threshold-criterion {args.threshold_criterion}`):\n")
             f.write(f"    * $t_{{high}} = {thres_a[0]:.2f}$, $t_{{low}} = {thres_a[1]:.2f}$, $s_{{max}} = {thres_a[2]:.2f}$\n")
             f.write(f"  * **Охват решений (Coverage):** **{coverage_ctrl:.1%}** ({n_accepted_ctrl} из {len(ctrl_m_eval)} сигналов, 95% ДИ: {ci_text(boot_res['cov_ci'])})\n")
             f.write(f"  * **Точность на принятых решениях:** **{acc_accepted:.3f}** (95% ДИ {ci_text(boot_res['acc_accepted_ci'])}; принято сигналов: {n_accepted_ctrl}{', пометка: малая выборка' if n_accepted_ctrl < 20 else ''}); precision на принятых: {prec_accepted:.3f}, recall на принятых: {rec_accepted:.3f}\n")
@@ -1861,6 +1890,12 @@ def main():
                 f.write(f"{h3}Абляции признаков (обучение в направлении А, оценка на тех же контрольных MATCHED-сигналах):\n\n")
                 f.write("Признаки покрытия данных (`baseline_d`, `n_quarters`, `n_files`) отражают длительность наблюдений звезды, а не физические свойства транзитного сигнала, поэтому исключены из основной модели. Звёздные признаки (" + ", ".join(STAR_FEATURE_COLS) + ") описывают звезду и её шум, а не сам сигнал; `transit_count` и `gap_fraction` зависят от длительности и заполненности ряда. Строки таблицы показывают, насколько ROC-AUC зависит от каждой группы.\n\n")
                 f.write(df_to_markdown(ablation_table) + "\n\n")
+                f.write("Колонка «Главный признак по среднему |SHAP|» даёт признак с наибольшим средним |SHAP| по всем контрольным MATCHED-сигналам (без Kepler-80) для модели этой конфигурации, в скобках само значение; это важность по выборке, а не по одному сигналу.\n\n")
+                f.write("Последние строки таблицы убирают центроидные признаки (" + ", ".join(c for c in CENTROID_COLS if c in feature_cols) + ") и признаки вторичного затмения и чёт-нечёт (" + ", ".join(c for c in SECONDARY_COLS if c in feature_cols) + "). Это диагностики того же типа, что использует каталог KOI при присвоении метки FALSE_POSITIVE (смещение центроида, значимое вторичное затмение, различие чётных и нечётных транзитов), поэтому качество на этих признаках может частично отражать круговую зависимость от правил каталога, а не независимое распознавание. Строки показывают, сколько качества остаётся без этих групп.\n\n")
+                for abl_note in ablation_skipped:
+                    f.write(f"* Конфигурация {abl_note}.\n")
+                if ablation_skipped:
+                    f.write("\n")
 
             f.write(f"* **Двунаправленная перекрёстная проверка (Two-way train/test):**\n")
             f.write(f"  * Точность A (Train->Ctrl): {acc_a:.3f} | Точность B (Ctrl->Train): {acc_b:.3f} | Средняя: **{mean_acc_two_way:.3f}**\n")
@@ -1930,6 +1965,12 @@ def main():
             f.write(f"  * *Для ненайденных планет:* причина не установлена (требуется дополнительный специализированный анализ периодограммы BLS и фазовой кривой без умозрительных предположений).\n\n")
 
         f.write(f"{h2}6. Примеры классификации и интерпретация признаков (SHAP)\n")
+        f.write(f"{h3}Важность признаков основной модели (среднее |SHAP| по выборке):\n\n")
+        if shap_imp is not None:
+            f.write(f"Среднее абсолютное значение SHAP по {shap_imp[1]} MATCHED-сигналам контрольной половины (без Kepler-80), основная модель направления А, топ-10 из {len(feature_cols)} признаков. Это важность по выборке, а не по одному сигналу; она показывает, на что опирается модель, но не доказывает причинную роль признака.\n\n")
+            f.write(df_to_markdown(shap_imp[0].drop(columns=['mean_abs_shap'])) + "\n\n")
+        else:
+            f.write("Таблица не построена: нет обученной модели, объяснителя SHAP или контрольных MATCHED-сигналов.\n\n")
         if can_eval_a and (len(correct_samples) > 0 or len(wrong_samples) > 0):
             f.write(f"{h3}Примеры верных решений модели:\n")
             if len(correct_samples) == 0:
