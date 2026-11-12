@@ -355,6 +355,40 @@ def threshold_selection_line(info):
             f"сработавшая ветка: {BRANCH_LABELS_RU.get(info['branch'], info['branch'])}.")
 
 
+def mean_abs_shap_table(shap_values, feature_cols, top=10):
+    cols = list(feature_cols)
+    if shap_values is None or len(cols) == 0:
+        return None
+    sv = np.asarray(shap_values, dtype=float)
+    if sv.ndim == 3:
+        sv = sv[..., -1]
+    if sv.ndim != 2 or sv.shape[0] == 0 or sv.shape[1] != len(cols):
+        return None
+    sv = sv[:, :len(cols)]
+    sv = sv[np.all(np.isfinite(sv), axis=1)]
+    if len(sv) == 0:
+        return None
+    imp = np.mean(np.abs(sv), axis=0)
+    order = np.argsort(-imp, kind='stable')[:top]
+    total = float(np.sum(imp))
+    return pd.DataFrame({
+        'Место': list(range(1, len(order) + 1)),
+        'Признак': [cols[i] for i in order],
+        'Средний |SHAP|': [f"{imp[i]:.4f}" for i in order],
+        'Доля от суммы по всем признакам': [f"{imp[i] / total:.1%}" if total > 0 else '-' for i in order],
+        'mean_abs_shap': [float(imp[i]) for i in order],
+    }), int(len(sv))
+
+
+def top_feature_label(table):
+    if table is None:
+        return '-'
+    tab = table[0]
+    if len(tab) == 0:
+        return '-'
+    return f"{tab['Признак'].iloc[0]} ({tab['mean_abs_shap'].iloc[0]:.3f})"
+
+
 def _five_numbers(vals, digits):
     if len(vals) == 0:
         return '-'

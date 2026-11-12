@@ -27,7 +27,7 @@ from sklearn.model_selection import GroupKFold
 from xgboost import XGBClassifier
 import shap
 from onyx_report import format_share, inverted_star_rates, STAR_FEATURE_COLS, SEARCH_MAX_PERIOD_D, SEARCH_MIN_PERIOD_D, ablation_feature_sets, brier_score, build_koi_recovery, ci_text, oriented_auc, reliability_table, summarize_koi_recovery
-from onyx_report import CENTROID_COLS, SECONDARY_COLS, FULL_QUARTERS, ablation_skipped_notes, actual_balance_tables, coverage_precision_table, select_abstention_thresholds, threshold_selection_line
+from onyx_report import mean_abs_shap_table, top_feature_label, CENTROID_COLS, SECONDARY_COLS, FULL_QUARTERS, ablation_skipped_notes, actual_balance_tables, coverage_precision_table, select_abstention_thresholds, threshold_selection_line
 from onyx_features import COVERAGE_COLS, PipelineVersionError, build_pipeline_version, check_pipeline_version, compute_feature_columns
 from onyx_showcase import render_showcase
 
@@ -159,6 +159,9 @@ def fetch_stellar_params(star_ids, cache_file):
         except Exception:
             pass
     return cached
+
+def select_stellar_info(info, ids):
+    return {str(s): info[str(s)] for s in ids if str(s) in info}
 
 def get_marked_stars(labels_df, n_stars, seed, showcase_star):
     valid_labels = ['CONFIRMED', 'CANDIDATE', 'FALSE POSITIVE', 'FALSE_POSITIVE']
@@ -626,6 +629,15 @@ BOOT_KEYS = ['acc_ci', 'auc_ci', 'cov_ci', 'prec_ci', 'rec_ci', 'acc_accepted_ci
 REAL_RECALL_TARGET = 0.95
 NOISE_MIN_PER_CLASS = 5
 
+def shap_importance(explainer, scaler, df, feature_cols, top=10):
+    if explainer is None or scaler is None or df is None or len(df) == 0:
+        return None
+    try:
+        sv = explainer.shap_values(scaler.transform(df[list(feature_cols)].values))
+    except Exception:
+        return None
+    return mean_abs_shap_table(sv, feature_cols, top=top)
+
 def noise_feature_cols(feature_cols):
     return [c for c in feature_cols if c not in STAR_FEATURE_COLS]
 
@@ -758,7 +770,7 @@ def bootstrap_star_metrics(df_eval, n_boot=1000, seed=42):
     return out
 
 def evaluate_ablation(feats, df_train, df_ctrl_all, ctrl_stars, showcase_id, seed, full_pool, target_precision, n_boot=500, threshold_criterion='point'):
-    pred, model, _, _, _ = train_and_eval_pipeline(df_train, df_ctrl_all, feats, seed, full_features_pool=full_pool, target_precision=target_precision, threshold_criterion=threshold_criterion)
+    pred, model, explainer, scaler, _ = train_and_eval_pipeline(df_train, df_ctrl_all, feats, seed, full_features_pool=full_pool, target_precision=target_precision, threshold_criterion=threshold_criterion)
     if model is None:
         return None
     sub = pred[(pred['target_id'].isin(ctrl_stars)) & (pred['target_id'] != showcase_id) & (pred['match_status'] == 'MATCHED')].copy()
@@ -768,7 +780,7 @@ def evaluate_ablation(feats, df_train, df_ctrl_all, ctrl_stars, showcase_id, see
     p = sub['p_mean'].values
     auc = float(roc_auc_score(y, p)) if len(np.unique(y)) >= 2 else float('nan')
     boot = bootstrap_star_metrics(sub, n_boot=n_boot, seed=seed)
-    top_shap = sub['shap_top3'].iloc[0].split('|')[0].strip() if 'shap_top3' in sub else '-'
+    top_shap = top_feature_label(shap_importance(explainer, scaler, sub, feats))
     return {
         'acc': float(accuracy_score(y, (p >= 0.5).astype(int))),
         'auc': auc,
@@ -922,7 +934,7 @@ def main():
     else:
         marked_ids, star_prim = get_marked_stars(labels_df, args.marked_stars, args.seed, args.showcase_star)
         stellar_cache = os.path.join('data', 'labels', 'kepler_stellar_cache.csv')
-        marked_info = fetch_stellar_params(marked_ids, stellar_cache)
+        marked_info = select_stellar_info(fetch_stellar_params(marked_ids, stellar_cache), marked_ids)
 
         unmarked_pool_file = os.path.join('data', 'labels', 'kepler_stellar_unmarked_pool.csv')
         pool_df = get_unmarked_pool(labels_df, unmarked_pool_file, args.unmarked_file)
@@ -1385,8 +1397,9 @@ def main():
             {'Модель / Эталон': 'Основная модель (только принятые решения)', 'Точность': f"{acc_accepted:.3f}", 'Полнота': f"{rec_accepted:.3f}", 'Precision': f"{prec_accepted:.3f}", 'ROC-AUC': '-', 'Охват (Coverage)': f"{coverage_ctrl:.1%}"}
         ])
 
-        top_shap_clean = ctrl_m_eval['shap_top3'].iloc[0].split('|')[0].strip() if len(ctrl_m_eval) > 0 and 'shap_top3' in ctrl_m_eval else '-'
-        abl_rows = [{'Конфигурация': f"Основная модель (признаков: {len(feature_cols)})", 'Точность': f"{acc_a:.3f}", 'ROC-AUC': f"{auc_a:.3f}", '95% ДИ ROC-AUC': ci_text(boot_res['auc_ci']), 'Охват решений': f"{coverage_ctrl:.1%}", 'Топ-1 признак SHAP': top_shap_clean}]
+        shap_imp = shap_importance(expl_a, scaler_a, ctrl_m_eval, feature_cols)
+        top_shap_clean = top_feature_label(shap_imp)
+        abl_rows = [{'Конфигурация': f"Основная модель (признаков: {len(feature_cols)})", 'Точность': f"{acc_a:.3f}", 'ROC-AUC': f"{auc_a:.3f}", '95% ДИ ROC-AUC': ci_text(boot_res['auc_ci']), 'Охват решений': f"{coverage_ctrl:.1%}", 'Главный признак по среднему |SHAP|': top_shap_clean}]
         cov_present = [c for c in coverage_cols if c in df_features.columns]
         abl_configs = []
         if cov_present:
@@ -1397,7 +1410,7 @@ def main():
             abl_res = evaluate_ablation(abl_feats, df_tr_m_matched, df_ctrl_all, ctrl_star_set, showcase_id, args.seed, df_features, args.target_precision, threshold_criterion=args.threshold_criterion)
             if abl_res is None:
                 continue
-            abl_rows.append({'Конфигурация': f"{abl_name} [признаков: {abl_res['n_features']}]", 'Точность': f"{abl_res['acc']:.3f}", 'ROC-AUC': f"{abl_res['auc']:.3f}", '95% ДИ ROC-AUC': ci_text(abl_res['auc_ci']), 'Охват решений': f"{abl_res['coverage']:.1%}", 'Топ-1 признак SHAP': abl_res['top_shap']})
+            abl_rows.append({'Конфигурация': f"{abl_name} [признаков: {abl_res['n_features']}]", 'Точность': f"{abl_res['acc']:.3f}", 'ROC-AUC': f"{abl_res['auc']:.3f}", '95% ДИ ROC-AUC': ci_text(abl_res['auc_ci']), 'Охват решений': f"{abl_res['coverage']:.1%}", 'Главный признак по среднему |SHAP|': abl_res['top_shap']})
         ablation_table = pd.DataFrame(abl_rows)
         ablation_skipped = ablation_skipped_notes(feature_cols)
         cov_prec_table = coverage_precision_table([
@@ -1425,6 +1438,7 @@ def main():
         reliab_table = pd.DataFrame()
         baselines_table = pd.DataFrame()
         ablation_table = pd.DataFrame()
+        shap_imp = None
 
     tr_m_eval = train_pred[(train_pred['target_id'].isin(set(final_tr_m))) & (train_pred['match_status'] == 'MATCHED')].copy()
     y_tr_true = tr_m_eval['target_bin'].values
@@ -1876,6 +1890,7 @@ def main():
                 f.write(f"{h3}Абляции признаков (обучение в направлении А, оценка на тех же контрольных MATCHED-сигналах):\n\n")
                 f.write("Признаки покрытия данных (`baseline_d`, `n_quarters`, `n_files`) отражают длительность наблюдений звезды, а не физические свойства транзитного сигнала, поэтому исключены из основной модели. Звёздные признаки (" + ", ".join(STAR_FEATURE_COLS) + ") описывают звезду и её шум, а не сам сигнал; `transit_count` и `gap_fraction` зависят от длительности и заполненности ряда. Строки таблицы показывают, насколько ROC-AUC зависит от каждой группы.\n\n")
                 f.write(df_to_markdown(ablation_table) + "\n\n")
+                f.write("Колонка «Главный признак по среднему |SHAP|» даёт признак с наибольшим средним |SHAP| по всем контрольным MATCHED-сигналам (без Kepler-80) для модели этой конфигурации, в скобках само значение; это важность по выборке, а не по одному сигналу.\n\n")
                 f.write("Последние строки таблицы убирают центроидные признаки (" + ", ".join(c for c in CENTROID_COLS if c in feature_cols) + ") и признаки вторичного затмения и чёт-нечёт (" + ", ".join(c for c in SECONDARY_COLS if c in feature_cols) + "). Это диагностики того же типа, что использует каталог KOI при присвоении метки FALSE_POSITIVE (смещение центроида, значимое вторичное затмение, различие чётных и нечётных транзитов), поэтому качество на этих признаках может частично отражать круговую зависимость от правил каталога, а не независимое распознавание. Строки показывают, сколько качества остаётся без этих групп.\n\n")
                 for abl_note in ablation_skipped:
                     f.write(f"* Конфигурация {abl_note}.\n")
@@ -1950,6 +1965,12 @@ def main():
             f.write(f"  * *Для ненайденных планет:* причина не установлена (требуется дополнительный специализированный анализ периодограммы BLS и фазовой кривой без умозрительных предположений).\n\n")
 
         f.write(f"{h2}6. Примеры классификации и интерпретация признаков (SHAP)\n")
+        f.write(f"{h3}Важность признаков основной модели (среднее |SHAP| по выборке):\n\n")
+        if shap_imp is not None:
+            f.write(f"Среднее абсолютное значение SHAP по {shap_imp[1]} MATCHED-сигналам контрольной половины (без Kepler-80), основная модель направления А, топ-10 из {len(feature_cols)} признаков. Это важность по выборке, а не по одному сигналу; она показывает, на что опирается модель, но не доказывает причинную роль признака.\n\n")
+            f.write(df_to_markdown(shap_imp[0].drop(columns=['mean_abs_shap'])) + "\n\n")
+        else:
+            f.write("Таблица не построена: нет обученной модели, объяснителя SHAP или контрольных MATCHED-сигналов.\n\n")
         if can_eval_a and (len(correct_samples) > 0 or len(wrong_samples) > 0):
             f.write(f"{h3}Примеры верных решений модели:\n")
             if len(correct_samples) == 0:
