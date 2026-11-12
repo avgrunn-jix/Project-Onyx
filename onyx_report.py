@@ -13,6 +13,13 @@ STAR_FEATURE_COLS = [
     'flux_kurtosis', 'cdpp_ppm', 'pointwise_scatter_ppm', 'autocorr_max', 'ls_peak_power',
 ]
 GEOMETRY_COLS = ['transit_count', 'gap_fraction']
+CENTROID_COLS = ['centroid_shift_col_sigma', 'centroid_shift_row_sigma', 'centroid_shift_total_sigma', 'centroid_shift_total_arcsec']
+SECONDARY_COLS = ['secondary_depth_ppm', 'secondary_snr', 'secondary_z', 'secondary_phase', 'odd_even_depth_diff_ppm', 'odd_even_sigma', 'odd_even_z']
+DIAGNOSTIC_GROUPS = [
+    ('Без центроидных признаков', 'центроидные признаки', CENTROID_COLS),
+    ('Без вторичного затмения и чёт-нечёт', 'признаки вторичного затмения и чёт-нечёт', SECONDARY_COLS),
+]
+BOTH_DIAGNOSTIC_NAME = 'Без центроидных признаков, вторичного затмения и чёт-нечёт'
 SYMMETRIC_T_GRID = (0.50, 0.60, 0.70, 0.80, 0.90)
 BRANCH_LABELS_RU = {
     'main': 'основная (цель достигнута)',
@@ -198,13 +205,37 @@ def oriented_auc(y_true, score, direction):
     return float(roc_auc_score(y, sc))
 
 
+def diagnostic_ablation_sets(feature_cols):
+    configs = []
+    skipped = []
+    present_groups = []
+    for name, title, cols in DIAGNOSTIC_GROUPS:
+        present = [c for c in cols if c in feature_cols]
+        present_groups.append(present)
+        if not present:
+            skipped.append(f"«{name}»: пропущена, {title} не входят в набор признаков модели")
+            continue
+        configs.append((name + ' (' + ', '.join(present) + ')', [c for c in feature_cols if c not in present]))
+    if all(present_groups):
+        both = [c for grp in present_groups for c in grp]
+        configs.append((BOTH_DIAGNOSTIC_NAME, [c for c in feature_cols if c not in both]))
+    else:
+        skipped.append(f"«{BOTH_DIAGNOSTIC_NAME}»: пропущена, так как хотя бы одна из двух групп пуста")
+    return configs, skipped
+
+
 def ablation_feature_sets(feature_cols):
     no_star = [c for c in feature_cols if c not in STAR_FEATURE_COLS]
     no_geom = [c for c in feature_cols if c not in GEOMETRY_COLS]
+    diag_configs, _ = diagnostic_ablation_sets(feature_cols)
     return [
         ('Без звёздных признаков (' + ', '.join(c for c in STAR_FEATURE_COLS if c in feature_cols) + ')', no_star),
         ('Без transit_count и gap_fraction', no_geom),
-    ]
+    ] + diag_configs
+
+
+def ablation_skipped_notes(feature_cols):
+    return diagnostic_ablation_sets(feature_cols)[1]
 
 
 def abstention_masks(p_mean, p_std, t_high, t_low, s_max):

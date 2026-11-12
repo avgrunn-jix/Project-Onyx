@@ -27,7 +27,7 @@ from sklearn.model_selection import GroupKFold
 from xgboost import XGBClassifier
 import shap
 from onyx_report import format_share, inverted_star_rates, STAR_FEATURE_COLS, SEARCH_MAX_PERIOD_D, SEARCH_MIN_PERIOD_D, ablation_feature_sets, brier_score, build_koi_recovery, ci_text, oriented_auc, reliability_table, summarize_koi_recovery
-from onyx_report import coverage_precision_table, select_abstention_thresholds, threshold_selection_line
+from onyx_report import CENTROID_COLS, SECONDARY_COLS, ablation_skipped_notes, coverage_precision_table, select_abstention_thresholds, threshold_selection_line
 from onyx_features import COVERAGE_COLS, PipelineVersionError, build_pipeline_version, check_pipeline_version, compute_feature_columns
 from onyx_showcase import render_showcase
 
@@ -1393,11 +1393,13 @@ def main():
                 continue
             abl_rows.append({'Конфигурация': f"{abl_name} [признаков: {abl_res['n_features']}]", 'Точность': f"{abl_res['acc']:.3f}", 'ROC-AUC': f"{abl_res['auc']:.3f}", '95% ДИ ROC-AUC': ci_text(abl_res['auc_ci']), 'Охват решений': f"{abl_res['coverage']:.1%}", 'Топ-1 признак SHAP': abl_res['top_shap']})
         ablation_table = pd.DataFrame(abl_rows)
+        ablation_skipped = ablation_skipped_notes(feature_cols)
         cov_prec_table = coverage_precision_table([
             ('OOF обучающей половины', info_a['oof_y'], info_a['oof_mean'], info_a['oof_std']),
             ('Контрольная половина (без Kepler-80)', y_ctrl_true, y_ctrl_prob, ctrl_m_eval['p_std'].values),
         ], thres_a[2])
     else:
+        ablation_skipped = []
         cov_prec_table = pd.DataFrame()
         acc_a = None
         rec_a = None
@@ -1857,6 +1859,11 @@ def main():
                 f.write(f"{h3}Абляции признаков (обучение в направлении А, оценка на тех же контрольных MATCHED-сигналах):\n\n")
                 f.write("Признаки покрытия данных (`baseline_d`, `n_quarters`, `n_files`) отражают длительность наблюдений звезды, а не физические свойства транзитного сигнала, поэтому исключены из основной модели. Звёздные признаки (" + ", ".join(STAR_FEATURE_COLS) + ") описывают звезду и её шум, а не сам сигнал; `transit_count` и `gap_fraction` зависят от длительности и заполненности ряда. Строки таблицы показывают, насколько ROC-AUC зависит от каждой группы.\n\n")
                 f.write(df_to_markdown(ablation_table) + "\n\n")
+                f.write("Последние строки таблицы убирают центроидные признаки (" + ", ".join(c for c in CENTROID_COLS if c in feature_cols) + ") и признаки вторичного затмения и чёт-нечёт (" + ", ".join(c for c in SECONDARY_COLS if c in feature_cols) + "). Это диагностики того же типа, что использует каталог KOI при присвоении метки FALSE_POSITIVE (смещение центроида, значимое вторичное затмение, различие чётных и нечётных транзитов), поэтому качество на этих признаках может частично отражать круговую зависимость от правил каталога, а не независимое распознавание. Строки показывают, сколько качества остаётся без этих групп.\n\n")
+                for abl_note in ablation_skipped:
+                    f.write(f"* Конфигурация {abl_note}.\n")
+                if ablation_skipped:
+                    f.write("\n")
 
             f.write(f"* **Двунаправленная перекрёстная проверка (Two-way train/test):**\n")
             f.write(f"  * Точность A (Train->Ctrl): {acc_a:.3f} | Точность B (Ctrl->Train): {acc_b:.3f} | Средняя: **{mean_acc_two_way:.3f}**\n")
