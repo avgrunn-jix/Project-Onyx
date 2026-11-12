@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from scipy.stats import ks_2samp
 from sklearn.metrics import roc_auc_score
 
 SEARCH_MIN_PERIOD_D = 0.5
@@ -21,6 +22,7 @@ DIAGNOSTIC_GROUPS = [
 ]
 BOTH_DIAGNOSTIC_NAME = 'Без центроидных признаков, вторичного затмения и чёт-нечёт'
 SYMMETRIC_T_GRID = (0.50, 0.60, 0.70, 0.80, 0.90)
+FULL_QUARTERS = 17
 BRANCH_LABELS_RU = {
     'main': 'основная (цель достигнута)',
     'fallback': 'запасная (максимум OOF-точности, цель не достигнута)',
@@ -351,6 +353,72 @@ def threshold_selection_line(info):
             f"OOF-охват: {info['oof_coverage']:.1%} ({n_acc} из {info['n_oof']}); OOF-точность на принятых: {prec}; "
             f"цель: {info['target_precision']:.2f}; критерий: {CRITERION_LABELS_RU.get(info['criterion'], info['criterion'])}; "
             f"сработавшая ветка: {BRANCH_LABELS_RU.get(info['branch'], info['branch'])}.")
+
+
+def _five_numbers(vals, digits):
+    if len(vals) == 0:
+        return '-'
+    q = [np.min(vals), np.percentile(vals, 25), np.median(vals), np.percentile(vals, 75), np.max(vals)]
+    return ' / '.join(f"{v:.{digits}f}" for v in q)
+
+
+def actual_balance_tables(diag_df, groups, quarters_col='n_quarters', baseline_col='baseline_d', full_quarters=FULL_QUARTERS):
+    notes = []
+    df = diag_df.copy() if diag_df is not None else pd.DataFrame(columns=['target_id'])
+    if 'target_id' not in df.columns:
+        df = pd.DataFrame(columns=['target_id'])
+    df['target_id'] = df['target_id'].astype(str)
+    df = df.drop_duplicates('target_id', keep='last').set_index('target_id')
+    has = {quarters_col: quarters_col in df.columns, baseline_col: baseline_col in df.columns}
+    if not has[quarters_col]:
+        notes.append(f"В диагностике нет колонки числа уникальных кварталов (`{quarters_col}`): статистика по кварталам и KS-тест по ним не посчитаны.")
+    if not has[baseline_col]:
+        notes.append(f"В диагностике нет колонки базлайна (`{baseline_col}`): статистика по базлайну и KS-тест по нему не посчитаны.")
+    values = {}
+    stat_rows = []
+    for name, ids in groups:
+        ids = [str(s) for s in ids]
+        sub = df.loc[[s for s in ids if s in df.index]]
+        vals = {}
+        for col in (quarters_col, baseline_col):
+            v = pd.to_numeric(sub[col], errors='coerce').values.astype(float) if has[col] else np.zeros(0)
+            vals[col] = v[np.isfinite(v)]
+        values[name] = vals
+        q, b = vals[quarters_col], vals[baseline_col]
+        if len(sub) == 0:
+            notes.append(f"Группа «{name}»: нет обработанных звёзд с записью в диагностике, статистика и KS-тест для неё не посчитаны.")
+        stat_rows.append({
+            'Группа': name,
+            'Обработано звёзд': len(ids),
+            'Из них с диагностикой': int(len(sub)),
+            'Кварталов (среднее)': f"{np.mean(q):.2f}" if len(q) > 0 else '-',
+            'Кварталов (медиана)': f"{np.median(q):.1f}" if len(q) > 0 else '-',
+            f"Доля звёзд с числом кварталов < {full_quarters}": format_share(int(np.sum(q < full_quarters)), int(len(q))),
+            'Базлайн, сут (среднее)': f"{np.mean(b):.1f}" if len(b) > 0 else '-',
+            'Базлайн, сут (медиана)': f"{np.median(b):.1f}" if len(b) > 0 else '-',
+        })
+    ks_rows = []
+    ks_values = {}
+    if len(groups) == 2:
+        name_a, name_b = groups[0][0], groups[1][0]
+        for col, title, digits in ((quarters_col, 'Число уникальных кварталов', 0), (baseline_col, 'Базлайн (сут)', 1)):
+            if not has[col]:
+                continue
+            a, b = values[name_a][col], values[name_b][col]
+            if len(a) > 0 and len(b) > 0:
+                res = ks_2samp(a, b)
+                ks_values[col] = (float(res.statistic), float(res.pvalue))
+                d_txt, p_txt = f"{res.statistic:.3f}", f"{res.pvalue:.4f}"
+            else:
+                d_txt, p_txt = '-', '-'
+            ks_rows.append({
+                'Параметр': title,
+                f"{name_a} (min / Q1 / med / Q3 / max)": _five_numbers(a, digits),
+                f"{name_b} (min / Q1 / med / Q3 / max)": _five_numbers(b, digits),
+                'Статистика KS (D)': d_txt,
+                'p-значение': p_txt,
+            })
+    return {'stats': pd.DataFrame(stat_rows), 'ks': pd.DataFrame(ks_rows), 'ks_values': ks_values, 'notes': notes}
 
 
 def ci_text(ci, digits=3):

@@ -27,7 +27,7 @@ from sklearn.model_selection import GroupKFold
 from xgboost import XGBClassifier
 import shap
 from onyx_report import format_share, inverted_star_rates, STAR_FEATURE_COLS, SEARCH_MAX_PERIOD_D, SEARCH_MIN_PERIOD_D, ablation_feature_sets, brier_score, build_koi_recovery, ci_text, oriented_auc, reliability_table, summarize_koi_recovery
-from onyx_report import CENTROID_COLS, SECONDARY_COLS, ablation_skipped_notes, coverage_precision_table, select_abstention_thresholds, threshold_selection_line
+from onyx_report import CENTROID_COLS, SECONDARY_COLS, FULL_QUARTERS, ablation_skipped_notes, actual_balance_tables, coverage_precision_table, select_abstention_thresholds, threshold_selection_line
 from onyx_features import COVERAGE_COLS, PipelineVersionError, build_pipeline_version, check_pipeline_version, compute_feature_columns
 from onyx_showcase import render_showcase
 
@@ -1121,6 +1121,12 @@ def main():
         except Exception:
             pass
 
+    diag_actual_df = pd.DataFrame([dict(r) for r in diag_map.values()]) if diag_map else pd.DataFrame(columns=['target_id'])
+    actual_balance = actual_balance_tables(diag_actual_df, [
+        ('Отмеченные (KOI)', succ_tr_m + succ_ctrl_m),
+        ('Неотмеченные (Control)', succ_tr_u + succ_ctrl_u),
+    ])
+
     diag_rows_csv = []
     diag_rows_md = []
     inverted_csv = os.path.join(out_dir, f"features_demo{file_suffix}_inverted.csv")
@@ -1734,14 +1740,25 @@ def main():
             f.write(df_to_markdown(pd.DataFrame(failed_table_rows)) + "\n\n")
 
         if comp_table is not None and ks_table is not None:
-            f.write(f"{h3}Сравнение распределений яркости и наблюдаемости:\n\n")
+            f.write(f"{h3}Сравнение распределений яркости и наблюдаемости по справочному кэшу (план):\n\n")
+            f.write("Число кварталов в этой и следующей таблице взято из справочного кэша звёздных параметров (`quarters`) и описывает план наблюдений, а не скачанные данные.\n\n")
             f.write(df_to_markdown(comp_table) + "\n\n")
 
-            f.write(f"{h3}Результаты двухвыборочного критерия Колмогорова-Смирнова (KS-test):\n\n")
+            f.write(f"{h3}Результаты двухвыборочного критерия Колмогорова-Смирнова (KS-test) по справочному кэшу (план):\n\n")
             f.write(df_to_markdown(ks_table) + "\n\n")
 
         else:
-            f.write("Таблицы сравнения распределений и критерия Колмогорова-Смирнова пропущены: режим `--report-only` не повторяет выбор звёзд и не обращается к сети.\n\n")
+            f.write("Таблицы сравнения распределений и критерия Колмогорова-Смирнова по справочному кэшу (план) пропущены: режим `--report-only` не повторяет выбор звёзд и не обращается к сети.\n\n")
+        f.write(f"{h3}Баланс выборки по фактически скачанным данным:\n\n")
+        f.write(f"Таблицы построены по диагностике извлечения (`{diag_source_csv}`: число уникальных кварталов `n_quarters` и базлайн в сутках `baseline_d`) только для обработанных звёзд групп KOI и Control. Доля звёзд с числом кварталов меньше {FULL_QUARTERS} дана с 95% интервалом Уилсона.\n\n")
+        f.write(df_to_markdown(actual_balance['stats']) + "\n\n")
+        if len(actual_balance['ks']) > 0:
+            f.write("**KS-тест по фактически скачанным данным (KOI против Control):**\n\n")
+            f.write(df_to_markdown(actual_balance['ks']) + "\n\n")
+        for bal_note in actual_balance['notes']:
+            f.write(f"* {bal_note}\n")
+        if actual_balance['notes']:
+            f.write("\n")
         f.write(f"{h2}2.1. Диагностика обнаружения периодических сигналов по каждой звезде\n")
         f.write(f"В таблице ниже приведены детальные результаты фотометрической обработки и поиска сигналов алгоритмом Box Least Squares (BLS) для каждой звезды выборки.\n\n")
         f.write(df_to_markdown(df_diag_md) + "\n\n")
