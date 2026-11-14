@@ -1,0 +1,112 @@
+{
+  "created_utc": "2026-11-14T08:08:36Z",
+  "seed": 42,
+  "fractions": {
+    "обучение": 0.5,
+    "валидация": 0.15,
+    "калибровка": 0.15,
+    "тест": 0.2
+  },
+  "run_dir": "outputs/demo_aws_2000_cloud",
+  "run_commit": "b1f1130fceb9dc252a55c760a286e71cc52606cc",
+  "repo_commit": "6575a04b470c8447a7b4fb32baf2571288dcb242",
+  "repo_branch": "experiments-e1-e2",
+  "pipeline_version": [
+    "8|quick=0|flatten_days=3|max_signals=4"
+  ],
+  "input_files": {
+    "outputs/demo_aws_2000_cloud/demo_aws_2000/features_demo.csv": {
+      "sha256": "e902502771b53eb5a2400d5000c9d285fe6960e9240ca31e6124f52d9c83d734",
+      "lines": 3220,
+      "bytes": 2626241
+    },
+    "outputs/demo_aws_2000_cloud/demo_aws_2000/features_demo_inverted.csv": {
+      "sha256": "afaf7d3e490057a1834c230a932d20ced263438cff0189b1d6e0516c0955e077",
+      "lines": 2503,
+      "bytes": 2035154
+    },
+    "outputs/demo_aws_2000_cloud/demo_aws_2000/features_demo_failed.csv": {
+      "sha256": "76c4330a5f5efcb435e39caa09a89d70b79b77da183a4adbfcacbdf471688927",
+      "lines": 25,
+      "bytes": 2752
+    },
+    "outputs/demo_aws_2000_cloud/demo_aws_2000/diagnostics_stars.csv": {
+      "sha256": "0cae08ea3357e4735c8a3d76087388dcc621e488ffc1fad0d3ae13a8a8efd5fb",
+      "lines": 2001,
+      "bytes": 493438
+    },
+    "outputs/demo_aws_2000_cloud/demo_aws_2000/summary.md": {
+      "sha256": "44ae47617d0ef140596ce324fc5acdb38e30b8e96c3d7e8ecee004650fae3612",
+      "lines": 2942,
+      "bytes": 478669
+    },
+    "outputs/demo_aws_2000_cloud/demo_aws_2000/demo_stars_split.csv": {
+      "sha256": "62cfedf61a40cec0045de80788dfbec6e616873132f25d51b41decb51a5626b6",
+      "lines": 1977,
+      "bytes": 63499
+    },
+    "outputs/demo_aws_2000_cloud/run_commit.txt": {
+      "sha256": "5cde1b89ba18b06c6083fba9cbfa544278bd7ae2fd0769d73dc48417b23b8fa6",
+      "lines": 1,
+      "bytes": 41
+    },
+    "outputs/demo_aws_2000_cloud/versions.txt": {
+      "sha256": "d5701b57ae7acf11f4849b4ec70078d5446633f1cc006a3a19decced1e58e21a",
+      "lines": 81,
+      "bytes": 1410
+    }
+  },
+  "labels_file": {
+    "path": "data/labels/kepler_labels.csv",
+    "source": "NASA Exoplanet Archive, таблица cumulative (KOI)",
+    "access_date_note": "дата последнего коммита файла в git; архив не запрашивался",
+    "last_commit": "4ca767cff8fcfbfbf8dc07836a5e31db5ef1bf83",
+    "last_commit_date": "2026-11-12T17:26:50+05:00",
+    "sha256_working_copy": "405e7393e43dfdc199221abdb642ec5edbb5ab2f3717bd02ab1967133a3f6c84",
+    "rows": 9564,
+    "columns": [
+      "target_id",
+      "label",
+      "catalog_period",
+      "koi_depth",
+      "koi_fpflag_nt",
+      "koi_fpflag_ss",
+      "koi_fpflag_co",
+      "koi_fpflag_ec"
+    ],
+    "dispositions": {
+      "FALSE POSITIVE": 4839,
+      "CONFIRMED": 2748,
+      "CANDIDATE": 1977
+    }
+  },
+  "flow": {
+    "labeled_signals": 599,
+    "labeled_pos": 278,
+    "labeled_neg": 321,
+    "labeled_stars": 526
+  },
+  "outputs_sha256": {
+    "e1_split_stars.csv": "33ffc0daabee1953ce52b7238619eb242b27284eb686bed9f4b8271ef856f2bc",
+    "split_test_ids.csv": "6b57a5caae6ce9096b40a6d038ab0229dfd94434bbae13ced5ddd53592b50679",
+    "split_calib_ids.csv": "98080278172eee88c5fbf579eeec7c5602a306073899d41263ca07755bfdf889",
+    "e1_signal_registry.csv": "35b8a34020cf3f55bd49a04fbcd02a07f633f5b39fc053228d0d7f8dabf99655",
+    "e1_feature_columns.json": "1fa73a69de78385bcb500a7a18baee5874119399521e381ddeeeae8facdcbb7f"
+  },
+  "packages": {
+    "python": "3.12.10",
+    "numpy": "2.5.4",
+    "pandas": "2.3.3",
+    "scipy": "1.18.1",
+    "sklearn": "1.9.1",
+    "xgboost": "3.4.1",
+    "lightgbm": "4.7.0",
+    "matplotlib": "3.11.2",
+    "shap": "0.54.1",
+    "psutil": "не установлен"
+  },
+  "showcase_excluded": {
+    "target_id": "4852528",
+    "reason": "витринная система"
+  }
+}
